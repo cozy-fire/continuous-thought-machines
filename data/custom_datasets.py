@@ -6,6 +6,8 @@ import numpy as np
 from tqdm.auto import tqdm
 from PIL import Image
 from datasets import load_dataset
+from collections.abc import Callable, Sequence
+from typing import Any
 
 class SortDataset(Dataset):
     def __init__(self, N):
@@ -115,26 +117,50 @@ class QAMNISTDataset(Dataset):
         return observations, question, question_readable, target
 
 class ImageNet(Dataset):
-    def __init__(self, which_split, transform):
-        """
-        Most simple form of the custom dataset structure. 
-        Args:
-            base_dataset (Dataset): The base dataset to sample from.
-            N (int): The number of images to construct into an observable sequence.
-            R (int): number of repeats
-            operators (list): list of operators from which to sample
-            action to take on observations (str): can be 'global' to compute operator over full observations, or 'select_K', where K=integer.
-        """
-        dataset = load_dataset('imagenet-1k', split=which_split, trust_remote_code=True)
-
+    def __init__(
+        self,
+        which_split: str,
+        transform: Callable,
+        data_indices: Sequence[int] | None = None,
+    ):
+        """Load an ImageNet split or a streamed subset of its indexed samples."""
         self.transform = transform
-        self.base_dataset = dataset
+        self.data_indices = None if data_indices is None else [int(index) for index in data_indices]
+        self.selected_items: dict[int, dict[str, Any]] | None = None
+
+        if self.data_indices is None:
+            self.base_dataset = load_dataset('ILSVRC/imagenet-1k', split=which_split)
+            return
+
+        if any(index < 0 for index in self.data_indices):
+            raise ValueError('ImageNet data indices must be non-negative.')
+
+        self.base_dataset = None
+        requested_indices = set(self.data_indices)
+        self.selected_items = {}
+        if not requested_indices:
+            return
+
+        dataset = load_dataset('ILSVRC/imagenet-1k', split=which_split, streaming=True)
+        for dataset_index in sorted(requested_indices):
+            try:
+                self.selected_items[dataset_index] = next(iter(dataset.skip(dataset_index).take(1)))
+            except StopIteration as error:
+                raise IndexError(
+                    f'ImageNet index is outside the {which_split} split: {dataset_index}'
+                ) from error
 
     def __len__(self):
+        if self.data_indices is not None:
+            return len(self.data_indices)
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
-        data_item = self.base_dataset[idx]
+        if self.data_indices is None:
+            data_item = self.base_dataset[idx]
+        else:
+            dataset_index = self.data_indices[idx]
+            data_item = self.selected_items[dataset_index]
         image = self.transform(data_item['image'].convert('RGB'))
         target = data_item['label']
         return image, target

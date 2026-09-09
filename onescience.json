@@ -1,0 +1,58 @@
+{
+  "runtime": {
+    "execution_profile": {
+      "run_site": "remote",
+      "execution_mode": null,
+      "access_mode": "ssh"
+    },
+    "conda": {
+      "enabled": true,
+      "env_name": "/home/featurize/work/envs/ctm",
+      "activate_script": "source /environment/miniconda3/etc/profile.d/conda.sh && conda activate /home/featurize/work/envs/ctm"
+    },
+    "target": {
+      "scheduler_type": null,
+      "platform_type": "cluster",
+      "cpu_arch": "x86_64",
+      "cpu_vendor": "intel",
+      "accelerator_kind": "gpu",
+      "accelerator_vendor": "nvidia",
+      "node_scope": "single_node"
+    },
+    "environment": {
+      "cpu": {
+        "arch": "x86_64",
+        "vendor": "intel"
+      },
+      "accelerator_defaults": {
+        "kind": "gpu",
+        "vendor": "nvidia",
+        "visibility_env": "CUDA_VISIBLE_DEVICES",
+        "distributed_backend": "nccl",
+        "launch_mode": "python",
+        "distributed_mode": "single"
+      }
+    },
+    "cluster": null,
+    "modules": [],
+    "resources": {
+      "gpu_type": "gpu",
+      "cpu_memory_ratio": 8,
+      "disk_space": "100GB"
+    },
+    "env_vars": {
+      "ONESCIENCE_DATASETS_DIR": "/public/share/sugonhpcapp01/onestore/onedatasets/",
+      "ONESCIENCE_MODELS_DIR": "/public/share/sugonhpcapp01/onestore/onemodels/"
+    },
+    "ssh": {
+      "host": "ctm-featurize",
+      "hostname": "workspace.featurize.cn",
+      "port": 49030,
+      "user": "featurize",
+      "identity_file": "C:\\Users\\56966\\.ssh\\id_ed25519",
+      "remote_work_dir": "/home/featurize/work",
+      "strict_host_key_checking": "no",
+      "password_authentication": "no"
+    }
+  }
+}

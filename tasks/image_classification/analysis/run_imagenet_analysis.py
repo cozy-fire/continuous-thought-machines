@@ -3,8 +3,11 @@ import torch
 import numpy as np
 import os
 import argparse
+from collections.abc import Callable
+from pathlib import Path
 from tqdm.auto import tqdm
 import torch.nn.functional as F # Used for interpolate
+from PIL import Image
 
 # --- Plotting & Visualization ---
 import matplotlib.pyplot as plt
@@ -59,6 +62,26 @@ def find_island_centers(array_2d, threshold):
             areas.append(np.sum(island_mask)) # Area is the count of pixels in the island
     return centers, areas
 
+
+def load_local_images(
+    image_paths: list[Path],
+    transform: Callable[[Image.Image], torch.Tensor],
+) -> tuple[list[torch.Tensor], list[Path]]:
+    """Read and transform local images without loading a dataset."""
+    images = []
+    resolved_paths = []
+    for image_path in image_paths:
+        resolved_path = image_path.expanduser().resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f'Local image does not exist: {resolved_path}')
+        try:
+            with Image.open(resolved_path) as image:
+                images.append(transform(image.convert('RGB')))
+        except OSError as error:
+            raise ValueError(f'Unable to read local image: {resolved_path}') from error
+        resolved_paths.append(resolved_path)
+    return images, resolved_paths
+
 def parse_args():
     """Parses command-line arguments."""
     # Note: Original had two ArgumentParser instances, using the second one.
@@ -72,7 +95,9 @@ def parse_args():
     parser.add_argument('--plot_every', type=int, default=10, help="How often to plot.")
     
     parser.add_argument('--inference_iterations', type=int, default=50, help="Iterations to use during inference.")
-    parser.add_argument('--data_indices', type=int, nargs='+', default=[], help="Use specific indices in validation data for demos, otherwise random.")
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument('--data_indices', type=int, nargs='+', default=[], help="Validation indices to visualize. Required for ImageNet videos/demo unless plots are also requested.")
+    input_group.add_argument('--image_paths', type=Path, nargs='+', default=[], help="Local image files to visualize instead of loading ImageNet.")
     parser.add_argument('--N_to_viz', type=int, default=5, help="When not supplying data_indices.")
     
     return parser.parse_args()
@@ -83,6 +108,15 @@ if __name__=='__main__':
 
     # --- Setup ---
     args = parse_args()
+    uses_local_images = bool(args.image_paths)
+    if uses_local_images and 'plots' in args.actions:
+        raise ValueError('--image_paths supports only the videos and demo actions.')
+    uses_indexed_imagenet_subset = not uses_local_images and not args.debug and 'plots' not in args.actions
+    if uses_indexed_imagenet_subset and not args.data_indices:
+        raise ValueError('--data_indices or --image_paths is required for ImageNet videos/demo without --actions plots.')
+    if any(index < 0 for index in args.data_indices):
+        raise ValueError('--data_indices values must be non-negative.')
+
     if args.device[0] != -1 and torch.cuda.is_available():
         device = f'cuda:{args.device[0]}'
     else:
@@ -130,7 +164,22 @@ if __name__=='__main__':
     model.eval() # Set model to evaluation mode
 
     # --- Prepare Dataset ---
-    if args.debug:
+    validation_dataset = None
+    validation_dataset_centercrop = None
+    local_images = []
+    local_image_paths = []
+    if uses_local_images:
+        print("Using local images with ImageNet preprocessing")
+        dataset_mean = [0.485, 0.456, 0.406]
+        dataset_std = [0.229, 0.224, 0.225]
+        img_size = 256
+        transform = transforms.Compose([
+            transforms.Resize(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=dataset_mean, std=dataset_std)
+        ])
+        local_images, local_image_paths = load_local_images(args.image_paths, transform)
+    elif args.debug:
         print("Debug mode: Using CIFAR100")
         # CIFAR100 specific normalization constants
         dataset_mean = [0.5070751592371341, 0.48654887331495067, 0.4409178433670344]
@@ -142,7 +191,8 @@ if __name__=='__main__':
             transforms.Normalize(mean=dataset_mean, std=dataset_std), # Normalize
         ])
         validation_dataset = datasets.CIFAR100('data/', train=False, transform=transform, download=True)
-        validation_dataset_centercrop = datasets.CIFAR100('data/', train=True, transform=transform, download=True)
+        if 'plots' in args.actions:
+            validation_dataset_centercrop = datasets.CIFAR100('data/', train=True, transform=transform, download=True)
     else:
         print("Using ImageNet")
         # ImageNet specific normalization constants
@@ -155,21 +205,43 @@ if __name__=='__main__':
             transforms.ToTensor(),
             transforms.Normalize(mean=dataset_mean, std=dataset_std) # Normalize
         ])
-        validation_dataset = ImageNet(which_split='validation', transform=transform)
-        validation_dataset_centercrop = ImageNet(which_split='train', transform=transforms.Compose([
-            transforms.Resize(img_size),
-            transforms.RandomCrop(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=dataset_mean, std=dataset_std) # Normalize
-        ]))
+        subset_indices = args.data_indices if uses_indexed_imagenet_subset else None
+        validation_dataset = ImageNet(
+            which_split='validation',
+            transform=transform,
+            data_indices=subset_indices,
+        )
+        if 'plots' in args.actions:
+            validation_dataset_centercrop = ImageNet(which_split='train', transform=transforms.Compose([
+                transforms.Resize(img_size),
+                transforms.RandomCrop(img_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=dataset_mean, std=dataset_std) # Normalize
+            ]))
     class_labels = list(IMAGENET2012_CLASSES.values()) # Load actual class names
 
     os.makedirs(f'{args.output_dir}', exist_ok=True)
 
     interp_mode = 'nearest'
     cmap_calib = sns.color_palette('viridis', as_cmap=True)
-    loader = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=False)
-    loader_crop = torch.utils.data.DataLoader(validation_dataset_centercrop, batch_size=64, shuffle=True, num_workers=0, drop_last=True)
+    loader = None
+    loader_crop = None
+    if 'plots' in args.actions:
+        loader = torch.utils.data.DataLoader(validation_dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=False)
+        loader_crop = torch.utils.data.DataLoader(validation_dataset_centercrop, batch_size=64, shuffle=True, num_workers=0, drop_last=True)
+
+    def get_visualization_input(
+        data_position: int,
+        data_index: int,
+    ) -> tuple[torch.Tensor, int | None, str, str]:
+        if uses_local_images:
+            image_path = local_image_paths[data_position]
+            output_id = f'local_{data_position}_{image_path.stem}'
+            return local_images[data_position], None, output_id, f'local image {image_path}'
+
+        lookup_index = data_position if uses_indexed_imagenet_subset else data_index
+        inputs, target = validation_dataset.__getitem__(lookup_index)
+        return inputs, int(target), str(data_index), f'dataset index {data_index}'
 
     model.eval()
 
@@ -404,7 +476,10 @@ if __name__=='__main__':
                         fig.savefig(f'{args.output_dir}/imagenet_calibration.pdf', dpi=200)
                         plt.close(fig)
     if 'videos' in args.actions:
-        if not args.data_indices: # If list is empty
+        if uses_local_images:
+            data_indices = list(range(len(local_images)))
+            print(f"Using local images: {[str(path) for path in local_image_paths]}")
+        elif not args.data_indices: # If list is empty
             n_samples = len(validation_dataset)
             num_to_sample = min(args.N_to_viz, n_samples)
             replace = n_samples < num_to_sample
@@ -415,12 +490,12 @@ if __name__=='__main__':
             print(f"Using specified indices: {data_indices}")
 
 
-        for di in data_indices:
-            print(f'\nBuilding viz for dataset index {di}.')
+        for data_position, di in enumerate(data_indices):
+            inputs, ground_truth_target, output_id, input_description = get_visualization_input(data_position, int(di))
+            print(f'\nBuilding viz for {input_description}.')
 
             # --- Get Data & Run Inference ---
             # inputs_norm is already normalized by the transform
-            inputs, ground_truth_target = validation_dataset.__getitem__(int(di))
 
             # Add batch dimension and send to device
             inputs = inputs.to(device).unsqueeze(0)
@@ -445,7 +520,7 @@ if __name__=='__main__':
             cmap_attention = sns.color_palette('viridis', as_cmap=True)
 
             # Create output directory for this index
-            index_output_dir = os.path.join(args.output_dir, str(di))
+            index_output_dir = os.path.join(args.output_dir, output_id)
             os.makedirs(index_output_dir, exist_ok=True)
 
             frames = [] # Store frames for GIF
@@ -545,10 +620,11 @@ if __name__=='__main__':
                 ax_cert = axes['certainty']
                 ax_cert.plot(np.arange(len(certainties_now)), certainties_now, 'k-', linewidth=figscale*1)
                 # Add background color based on prediction correctness at each step
-                for ii in range(len(certainties_now)):
-                    is_correct = predictions[0, :, ii].argmax(-1).item() == ground_truth_target # .item() for scalar tensor
-                    facecolor = 'limegreen' if is_correct else 'orchid'
-                    ax_cert.axvspan(ii, ii + 1, facecolor=facecolor, edgecolor=None, lw=0, alpha=0.3)
+                if ground_truth_target is not None:
+                    for ii in range(len(certainties_now)):
+                        is_correct = predictions[0, :, ii].argmax(-1).item() == ground_truth_target # .item() for scalar tensor
+                        facecolor = 'limegreen' if is_correct else 'orchid'
+                        ax_cert.axvspan(ii, ii + 1, facecolor=facecolor, edgecolor=None, lw=0, alpha=0.3)
                 # Mark the last point
                 ax_cert.plot(len(certainties_now)-1, certainties_now[-1], 'k.', markersize=figscale*4)
                 ax_cert.axis('off')
@@ -568,7 +644,7 @@ if __name__=='__main__':
                 true_class_idx = ground_truth_target # Ground truth index
 
                 # Determine bar colors (green if correct, blue otherwise - consistent with original)
-                colours = ['g' if idx == true_class_idx else 'b' for idx in topk_indices]
+                colours = ['g' if true_class_idx is not None and idx == true_class_idx else 'b' for idx in topk_indices]
 
                 # Plot horizontal bars (inverted range for top-down display)
                 ax_prob.barh(np.arange(k)[::-1], topk_probs, color=colours, alpha=1) # Use barh and inverted range
@@ -578,8 +654,8 @@ if __name__=='__main__':
                 # Add text labels for top classes
                 for i, name_idx in enumerate(topk_indices):
                     name = class_labels[name_idx] # Get name from index
-                    is_correct = name_idx == true_class_idx
-                    fg_color = 'darkgreen' if is_correct else 'crimson' # Text colors from original
+                    is_correct = true_class_idx is not None and name_idx == true_class_idx
+                    fg_color = 'navy' if true_class_idx is None else ('darkgreen' if is_correct else 'crimson')
                     text_str = f'{name[:40]}' # Truncate long names
                     # Position text on the left side of the horizontal bars
                     ax_prob.text(
@@ -699,16 +775,19 @@ if __name__=='__main__':
                 plt.close(fig) # Close figure to free memory
 
             # --- Save GIF ---
-            gif_path = os.path.join(index_output_dir, f'{str(di)}_viz.gif')
+            gif_path = os.path.join(index_output_dir, f'{output_id}_viz.gif')
             print(f"Saving GIF to {gif_path}...")
             imageio.mimsave(gif_path, frames, fps=15, loop=0) # loop=0 means infinite loop
-            save_frames_to_mp4([fm[:,:,::-1] for fm in frames], os.path.join(index_output_dir, f'{str(di)}_viz.mp4'), fps=15, gop_size=1, preset='veryslow')
+            save_frames_to_mp4([fm[:,:,::-1] for fm in frames], os.path.join(index_output_dir, f'{output_id}_viz.mp4'), fps=15, gop_size=1, preset='veryslow')
     if 'demo' in args.actions:
 
 
         
         # --- Select Data Indices ---
-        if not args.data_indices: # If list is empty
+        if uses_local_images:
+            data_indices = list(range(len(local_images)))
+            print(f"Using local images: {[str(path) for path in local_image_paths]}")
+        elif not args.data_indices: # If list is empty
             n_samples = len(validation_dataset)
             num_to_sample = min(args.N_to_viz, n_samples)
             replace = n_samples < num_to_sample
@@ -719,14 +798,13 @@ if __name__=='__main__':
             print(f"Using specified indices: {data_indices}")
 
 
-        for di in data_indices:
-            
-            index_output_dir = os.path.join(args.output_dir, str(di))
+        for data_position, di in enumerate(data_indices):
+            inputs, ground_truth_target, output_id, input_description = get_visualization_input(data_position, int(di))
+
+            index_output_dir = os.path.join(args.output_dir, output_id)
             os.makedirs(index_output_dir, exist_ok=True)
 
-            print(f'\nBuilding viz for dataset index {di}.')
-
-            inputs, ground_truth_target = validation_dataset.__getitem__(int(di))
+            print(f'\nBuilding viz for {input_description}.')
 
             # Add batch dimension and send to device
             inputs = inputs.to(device).unsqueeze(0)
@@ -819,10 +897,11 @@ if __name__=='__main__':
                 ax_cert = axes['certainty']
                 ax_cert.plot(np.arange(len(certainties_now)), certainties_now, 'k-', linewidth=figscale*1)
                 # Add background color based on prediction correctness at each step
-                for ii in range(len(certainties_now)):
-                    is_correct = predictions[0, :, ii].argmax(-1).item() == ground_truth_target # .item() for scalar tensor
-                    facecolor = 'limegreen' if is_correct else 'orchid'
-                    ax_cert.axvspan(ii, ii + 1, facecolor=facecolor, edgecolor=None, lw=0, alpha=0.3)
+                if ground_truth_target is not None:
+                    for ii in range(len(certainties_now)):
+                        is_correct = predictions[0, :, ii].argmax(-1).item() == ground_truth_target # .item() for scalar tensor
+                        facecolor = 'limegreen' if is_correct else 'orchid'
+                        ax_cert.axvspan(ii, ii + 1, facecolor=facecolor, edgecolor=None, lw=0, alpha=0.3)
                 # Mark the last point
                 ax_cert.plot(len(certainties_now)-1, certainties_now[-1], 'k.', markersize=figscale*4)
                 ax_cert.axis('off')
@@ -842,7 +921,7 @@ if __name__=='__main__':
                 true_class_idx = ground_truth_target # Ground truth index
 
                 # Determine bar colors (green if correct, blue otherwise - consistent with original)
-                colours = ['g' if idx == true_class_idx else 'b' for idx in topk_indices]
+                colours = ['g' if true_class_idx is not None and idx == true_class_idx else 'b' for idx in topk_indices]
 
                 # Plot horizontal bars (inverted range for top-down display)
                 ax_prob.barh(np.arange(k)[::-1], topk_probs, color=colours, alpha=1) # Use barh and inverted range
@@ -852,8 +931,8 @@ if __name__=='__main__':
                 # Add text labels for top classes
                 for i, name_idx in enumerate(topk_indices):
                     name = class_labels[name_idx] # Get name from index
-                    is_correct = name_idx == true_class_idx
-                    fg_color = 'darkgreen' if is_correct else 'crimson' # Text colors from original
+                    is_correct = true_class_idx is not None and name_idx == true_class_idx
+                    fg_color = 'navy' if true_class_idx is None else ('darkgreen' if is_correct else 'crimson')
                     text_str = f'{name[:40]}' # Truncate long names
                     # Position text on the left side of the horizontal bars
                     ax_prob.text(
@@ -966,7 +1045,5 @@ if __name__=='__main__':
                     fig.savefig(os.path.join(index_output_dir, f'frame_{step_i}.png'), dpi=200)
 
                 plt.close(fig) # Close figure to free memory
-            outfilename = os.path.join(index_output_dir, f'{di}_demo.mp4')
+            outfilename = os.path.join(index_output_dir, f'{output_id}_demo.mp4')
             save_frames_to_mp4([fm[:,:,::-1] for fm in frames], outfilename, fps=15, gop_size=1, preset='veryslow')
-        
-                        
