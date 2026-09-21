@@ -1,6 +1,6 @@
-# Continual navigation — deliveries 1–3
+# Continual navigation — deliveries 1–4
 
-本目录当前交付配置、公共数据类、数据划分、环境、CTM模型、世界模型/SIGReg及原始图像回放；PPO、蒸馏与全局阶段调度尚未实现。关键 Python 逻辑采用英文注释。
+本目录已实现配置、数据契约、环境、CTM、世界模型/SIGReg、原始图像回放、循环PPO、循环蒸馏与Fisher/EWC。全局阶段调度、checkpoint和评估入口仍待交付5。关键 Python 逻辑采用英文注释。
 
 ## 运行与验证
 
@@ -84,7 +84,7 @@ teacher = frozen_copy(policy)  # Copies parameters/buffers, including the old KB
 - `StandalonePolicy.step`返回`(logits,CTMState)`；单列Actor–Critic与双列的`step`返回`PolicyOutput`。`sequence`统一返回`PolicySequenceOutput`，其`logits`为`[L,B,5]`，`value`仅Actor–Critic有`[L,B]`，KB为None。
 - 每观察推进2ticks；两个独立同步向量各528维，M=20。序列内部不自动detach；rollout边界由调用者使用`detach_state`。padding输出置零、state保持原值，不能当有效策略目标。
 - `DualPolicy`持有冻结KB、随机Active和Adapter；KB先推进每tick，Active再使用同tick的KB激活。`kb_ready=False`强制禁用侧连，首次压缩完成后由阶段控制器调用`policy.kb_ready.fill_(True)`。
-- `VisionEncoder.set_world_training(True)`只由未来W.fit调用。结束后`freeze()`锁定参数、梯度与BN；TA结束调用`freeze(permanent=True)`，之后禁止重新开启视觉训练。单纯父模块`train()`不会打开冻结BN。
+- `VisionEncoder.set_world_training(True)`只由W.fit调用。结束后`freeze()`锁定参数、梯度与BN；TA结束调用`freeze(permanent=True)`，之后禁止重新开启视觉训练。单纯父模块`train()`不会打开冻结BN。
 - 构造新的DualPolicy即新建Active/Adapter，不复制KB控制器；优化器清空属于未来阶段状态机的责任。
 - `frozen_copy(module)`使用deepcopy隔离参数与buffers。快照采样state需调用快照自身`initial_state`创建；运行trace不存于模型内部。裸`state_dict`序列化可用，阶段边界checkpoint尚未实现。
 - `Controller.tick`只返回当前tick的新state与激活；`SpatialAttention(...,return_weights=True)`可用于诊断，默认不保存历史Attention权重。
@@ -127,4 +127,61 @@ teacher = frozen_copy(policy)  # Copies parameters/buffers, including the old KB
 
 ## 后续衔接
 
-交付4实现PPO、蒸馏与Fisher/EWC；交付5实现阶段状态机、完整checkpoint、恢复及评估衔接。`PhaseKey`只是阶段身份数据类，不会执行任何训练。交付3没有启动完整训练。
+交付5实现阶段状态机、完整checkpoint、恢复及评估衔接。`PhaseKey`只是阶段身份数据类，不会执行任何训练。当前没有启动完整训练。
+
+## 交付4：循环学习接口
+
+这些接口执行单个阶段或单个batch，不实现跨任务调度和恢复。图像batch与目标默认存CPU，运行state和模型在同一设备；动作、minibatch、Fisher抽样各使用独立CPU `torch.Generator`。当前验证设备为CPU，GPU尚未运行验证。
+
+### X/P：PPO
+
+```python
+from tasks.continual_nav.learning.ppo import run_ppo_stage
+
+# Caller creates a fresh random Active for each X/P; the helper does not reset weights.
+policy = DualPolicy(config, kb, kb_ready=kb_ready)
+result = run_ppo_stage(
+    envs, policy, encoder, config, phase="X",
+    steps=config.exploration.steps_per_round, world=world,
+    high_error=builder, action_rng=action_rng, minibatch_rng=minibatch_rng,
+    start_transition_id=next_transition_id,
+)
+next_transition_id = result["next_transition_id"]
+```
+
+- `PPOCollector(envs,policy,encoder,config,phase=...,world=None,high_error=None,start_transition_id=0)`在阶段入口重置环境/trace。X强制共享同一个world.encoder，冻结E/g/F；P不允许world或high_error，永久冻结E。单列P可传`SingleActorCritic`。
+- `collect(steps,action_rng=...)`返回PPOBatch，steps必须为num_envs的正整数倍且不超过一个rollout。保存真实`transition_next_obs`。尾rollout直接缩短时间维；学习器也支持valid_mask。
+- 每个动作后用真实next frame和动作后的trace做独立bootstrap前向，丢弃其新trace，正式collect state只推进当前观察。成功不bootstrap，超时bootstrap但截断GAE；该额外前向不计环境交互。X只存当时算出的log1p(L2)奖励，不访问reward_ext；原始L2交给builder。P仅使用reward_ext。
+- `compute_gae(reward,value,bootstrap,terminated,truncated,valid,gamma,gae_lambda)`返回原始advantages和returns；padding不传播GAE。policy loss仅使用归一化优势副本，不改变returns。
+- `make_ppo_optimizer(policy,encoder,config)`每阶段新建Adam，仅含Active/Adapter/Critic，或单列Controller/Actor/Critic。
+- `train_ppo(batch,policy,encoder,optimizer,config,rng=...)`按环境随机分组，时间顺序不变；起点state detach，序列内部反传，episode reset截断。验证optimizer所有权，返回最后minibatch的loss/entropy/KL/梯度范数及总updates。
+- `set_stage_learning_rate(...,completed_rollouts,total_rollouts)`以已完成rollout比例设置学习率。stage helper在每轮更新前设置，阶段完成后设0；两个rollout的更新学习率为1e-4、5e-5，结束为0。
+- 每次更新后继续使用采集末尾的detached trace；不改用新参数重新计算的trace。这是计划规定的截断近似。
+- `run_ppo_stage`精确消耗steps，重建optimizer但不初始化policy，成功后发布完整X池，返回transitions/updates/rollouts/next_transition_id/pool_manifest/last等字段。builder失败清理由调用者在finally执行abort；失败阶段不允许直接继续，应由未来checkpoint恢复。
+
+### C：冻结教师与序列蒸馏
+
+`SequenceCollector(envs,teacher,encoder,config,mode="C",start_transition_id=...)`立即深拷贝双列teacher，包括旧KB、Active、Adapter；之后学生KB更新不能改变该快照。共享E固定版本并冻结，teacher采集trace跨窗口持续运行。
+
+`collect(steps,action_rng=...)`每次收集至多`num_envs*learning_steps`条新转移，返回SequenceBatch。obs/masks为`[U+L,B,...]`，U=10，L=配置learning_steps；前缀从上个窗口已有观察取得，不足左padding，尾窗口右padding。全动作teacher_log_probs为`[L,B,5]`，在采集时保存；前缀不新增交互、不重复计目标。
+
+`make_distill_optimizer(kb,encoder,config)`每C新建仅包含学生KB的Adam。`train_distill(batch,kb,encoder,ewc,optimizer,config,rng=...)`按环境分组，从学生自己的initial_state开始，以no_grad推进10个观察（20ticks），detach后对learning步反传。loss为`KL(teacher||student)+lambda/2*sum(F*(theta-center)^2)`。无value、entropy或hidden-state loss。首次ewc=None时惩罚为0，后续立即启用。
+
+`run_compress_stage(envs,teacher,kb,encoder,config,ewc,steps=...,action_rng=...,minibatch_rng=...,start_transition_id=...)`先创建teacher快照，再启用学生训练；每收集一个窗口即训练一次，不在C结束后批量重复。返回transitions/updates/windows/next_transition_id/teacher_snapshot_id/last/kb_ready=True。返回的readiness须由未来调度器保存并用于下一次DualPolicy构造，helper不修改其他policy对象的buffer。
+
+### F：无奖励Fisher与EWC状态
+
+1. `collect_fisher(envs,kb,encoder,config,action_rng=...,fisher_rng=...,start_transition_id=...)`只接受无Critic的StandalonePolicy。固定快照采集配置规定的4096条自身策略转移，以独立Fisher RNG无放回抽取1024个ID；smoke为20/8。返回FisherSequenceBatch列表，不访问或保存reward。F数据仅保留本阶段CPU窗口，不上GPU堆叠完整轨迹。
+2. `estimate_fisher(kb,encoder,sequences,config)`检查选中ID唯一且满足预算，按原序列重放，每次只保留一个环境窗口的计算图。burn-in与C一致；对每个选中log-prob分别autograd.grad，将梯度平方累加后除以计分点数。返回CPU float32 `dict[name,Tensor]`，无梯度参数保留全零键。结束冻结KB，不执行optimizer.step，不改变E/KB权重或BN。
+3. `update_online_fisher(kb,current,previous,decay=...,sample_count=...,stage_key=...,encoder_version=...)`返回FisherState；首次直接用current，后续`decay*previous+current`，center始终替换为当前KB的独立副本。调用者按TA/P&C明确传入0.1/0.3，不由函数猜阶段。
+4. `ewc_penalty(kb,state,coefficient)`严格核验参数名、shape、float32、有限性和非负Fisher，保护范围仅KB Controller+Actor。sample_count记录本次估计数；completed_compressions累计。
+
+Fisher是在截断序列上的策略梯度平方均值，不是精确全轨迹Fisher；不做张量min–max归一化或epsilon floor。C/F的左padding不推进state，10帧burn-in不意味着精确恢复无限历史。
+
+真实两环境验证（新输出目录）：
+
+```powershell
+& 'D:/conda/envs/ctm/python.exe' -m tasks.continual_nav.verify_learning --config tasks/continual_nav/configs/smoke.yaml --maze-manifest scientific-evidence/continual_nav/delivery_01_20260921/maze_splits.json --output-dir scientific-evidence/continual_nav/learning_check_new_run
+```
+
+每任务X40/C40/F20，再单列P40，共240次交互、6次PPO更新、4次蒸馏更新、16个Fisher计分点。此验证的世界模型为随机初始化后冻结，用于检验奖励/梯度/回放接口，未先执行W.fit，不是完整760步smoke或成功率评估。输出learning_report.json。日志中的PPO loss/KL是optimizer.step前的值；单minibatch首epoch的ratio为1、归一化policy loss接近0是正常情况，不代表梯度为0。

@@ -104,6 +104,7 @@ class PPOBatch:
     initial_state: PolicyState
     bootstrap_values: Tensor
     valid_mask: Tensor
+    transition_next_obs: Tensor | None = None  # Raw final frames; collectors always populate this.
 
 
 @dataclass
