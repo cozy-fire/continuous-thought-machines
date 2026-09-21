@@ -23,3 +23,14 @@ examples/*
 !examples/goldfish.jpg
 checkpoints
 utils/hugging_face/
+
+# Local experiment artifacts and editor state
+/.idea/
+/scientific-evidence/
+/runs/
+*.pth
+*.ckpt
+*.safetensors
+*.tar
+*.tar.gz
+*.zip

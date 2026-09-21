@@ -1,0 +1,143 @@
+schema_version: 1
+task_order:
+- maze_medium
+- fourrooms
+observation:
+  shape:
+  - 3
+  - 84
+  - 84
+  scale: uint8_to_float_div255
+  actions: 5
+environment:
+  max_steps: 300
+  reward: success_time_discount
+  maze_root: data/mazes/medium
+  tile_size: 8
+vision:
+  backbone: resnet34-2
+  pretrained: false
+ctm:
+  d_model: 512
+  d_input: 128
+  ticks: 2
+  memory_length: 20
+  synapse: two_linear_glu_blocks
+  nlm_hidden: 16
+  deep_nlm: true
+  nlm_layernorm: false
+  neuron_selection: first-last
+  n_out: 32
+  n_action: 32
+  dropout: 0.0
+attention:
+  heads: 4
+  rope_theta: 10000.0
+  query_position:
+  - 10
+  - 10
+training:
+  seeds:
+  - 0
+  - 1
+  - 2
+  - 3
+  num_envs: 8
+  device: cuda:0
+  precision: float32
+  vector_backend: sync
+  remote_logging: false
+agnostic:
+  visits: 6
+  rounds_per_task: 2
+world:
+  collect_steps_per_round: 100000
+  updates_per_round: 5000
+  batch_size: 256
+  projection_dim: 128
+  projector_hidden: 512
+  predictor_hidden: 512
+  forward_loss: mean_squared_error_over_batch_and_features
+  optimizer:
+    name: AdamW
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-08
+    weight_decay: 0.0001
+  max_grad_norm: 1.0
+  lr_schedule: constant
+sigreg:
+  enabled: true
+  lambda: 0.02
+  directions: 256
+  knots: 17
+  t_max: 3.0
+replay:
+  high_error_capacity_per_task: 50000
+  high_error_fraction: 0.5
+  retention: latest_exploration_topk_per_task
+  shard_size: 2048
+exploration:
+  steps_per_round: 300000
+ppo:
+  rollout_steps: 50
+  num_minibatches: 4
+  update_epochs: 1
+  optimizer:
+    name: Adam
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-05
+    weight_decay: 0.0
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.1
+  vf_coef: 0.25
+  entropy_coef: 0.01
+  clip_value_loss: false
+  normalize_advantage: true
+  max_grad_norm: 0.5
+  target_kl: null
+  lr_schedule: linear_per_stage
+distill:
+  agnostic_steps_per_round: 300000
+  learning_steps: 50
+  burnin_ticks: 20
+  burnin_env_obs: 10
+  minibatches: 4
+  update_epochs: 1
+  temperature: 1.0
+  optimizer:
+    name: Adam
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-05
+    weight_decay: 0.0
+  max_grad_norm: 0.5
+  lr_schedule: constant
+pnc:
+  visits: 3
+  progress_steps: 2500000
+  compress_steps: 1000000
+ewc:
+  lambda: 250.0
+  agnostic_decay: 0.1
+  pnc_decay: 0.3
+fisher:
+  collect_steps: 4096
+  scored_samples: 1024
+evaluation:
+  validation_episodes: 200
+  test_episodes: 200
+  drift_episodes: 32
+  interval_steps: 100000
+  maze_validation_hashes: 512
+  fourrooms_train_seed_stop: 1000000
+  fourrooms_validation_seed_start: 2000000
+  fourrooms_test_seed_start: 3000000

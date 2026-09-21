@@ -1,0 +1,34 @@
+# Only budgets and parallelism change; the model contract is identical.
+extends: full.yaml
+training:
+  seeds: [0]
+  num_envs: 2
+  device: cpu
+agnostic:
+  visits: 1
+world:
+  collect_steps_per_round: 40
+  updates_per_round: 2
+  batch_size: 8
+exploration:
+  steps_per_round: 40
+distill:
+  agnostic_steps_per_round: 40
+  learning_steps: 10
+  minibatches: 1
+ppo:
+  rollout_steps: 10
+  num_minibatches: 1
+pnc:
+  visits: 1
+  progress_steps: 40
+  compress_steps: 40
+fisher:
+  collect_steps: 20
+  scored_samples: 8
+replay:
+  high_error_capacity_per_task: 20
+evaluation:
+  validation_episodes: 2
+  test_episodes: 2
+  drift_episodes: 2
