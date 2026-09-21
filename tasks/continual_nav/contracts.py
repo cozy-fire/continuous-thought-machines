@@ -19,6 +19,14 @@ OBS_SHAPE = (3, 84, 84)
 NUM_ACTIONS = 5
 
 
+@dataclass(frozen=True)
+class CollectionResult:
+    transitions: int
+    next_transition_id: int
+    manifest: str
+    snapshot_id: str
+
+
 @dataclass
 class CTMState:
     """pre/post: float32 [B,D,M], oldest tick first."""
@@ -42,6 +50,14 @@ class PolicyOutput:
     logits: Tensor  # [B,5]
     value: Tensor  # [B]; standalone KB has a separate logits/state interface.
     state: PolicyState
+
+
+@dataclass
+class PolicySequenceOutput:
+    """Time-major policy output; standalone KB has no value prediction."""
+    logits: Tensor  # [L,B,5]; padding positions are zero, not valid policy targets.
+    value: Tensor | None  # [L,B] for actor-critic, None for standalone KB.
+    state: PolicyState  # State after the last valid observation of each slot.
 
 
 @dataclass
@@ -126,6 +142,24 @@ class FisherState:
     sample_count: int
     stage_key: str
     encoder_version: int
+
+
+@dataclass
+class WorldPrediction:
+    z: Tensor  # [B,128], current observation projection.
+    z_next: Tensor  # [B,128], real next observation; differentiable in W.fit.
+    z_pred: Tensor  # [B,128], action-conditioned prediction.
+    error: Tensor  # [B], un-squared L2, not the MSE training loss.
+
+
+@dataclass
+class WorldBatch:
+    obs: Tensor  # uint8 [B,3,84,84].
+    next_obs: Tensor  # Real transition target, never an autoreset observation.
+    actions: Tensor  # int64 [B], policy indices 0..4.
+    transition_ids: Tensor  # int64 [B].
+    from_high_error: Tensor  # bool [B], sampling provenance only.
+    task_key: TaskKey
 
 
 @dataclass(frozen=True)

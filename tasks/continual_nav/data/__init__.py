@@ -1,1 +1,1 @@
-"""Dataset identity and split manifests. Replay is implemented in delivery 3."""
+"""Dataset identities, split manifests and bounded raw-pixel world-model replay."""
