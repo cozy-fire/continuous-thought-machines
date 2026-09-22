@@ -381,6 +381,13 @@ def save_config(config: Config, path: str | Path) -> None:
     path.write_text(yaml.safe_dump(resolved_dict(config), sort_keys=False), encoding="utf-8")
 
 
+def config_from_dict(value: dict) -> Config:
+    """Reconstruct the same strict, fully resolved configuration from a checkpoint."""
+    config = _parse(Config, value, "config")
+    validate_config(config)
+    return config
+
+
 def budget_summary(c: Config) -> dict[str, int]:
     """Count real transitions, not ticks, replays or optimizer updates."""
     rounds = c.agnostic.visits * len(c.task_order) * c.agnostic.rounds_per_task

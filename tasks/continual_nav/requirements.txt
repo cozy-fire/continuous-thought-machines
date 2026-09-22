@@ -1,3 +1,4 @@
 # Install alongside the repository requirements; tests use standard-library unittest.
 PyYAML>=6.0,<7
 Pillow>=9.1
+tensorboard>=2.14,<3

@@ -1,6 +1,6 @@
-# Continual navigation — deliveries 1–4
+# Continual navigation — deliveries 1–5
 
-本目录已实现配置、数据契约、环境、CTM、世界模型/SIGReg、原始图像回放、循环PPO、循环蒸馏与Fisher/EWC。全局阶段调度、checkpoint和评估入口仍待交付5。关键 Python 逻辑采用英文注释。
+本目录已实现配置、数据契约、环境、CTM、世界模型/SIGReg、原始图像回放、循环PPO、循环蒸馏与Fisher/EWC。交付5新增全局阶段调度、阶段边界checkpoint、固定面板评估及三类共享视觉条件基线入口。关键 Python 逻辑采用英文注释。
 
 ## 运行与验证
 
@@ -52,7 +52,7 @@ env.close()
 - 单环境结束后必须显式reset；`VectorEnvAdapter`在同一步自动reset，`EnvStep.transition_next_obs`保留真实终止帧，`next_obs`返回新episode首帧。终止槽位的`info`保留旧episode字段，另含`reset_info`。
 - 训练`seed`为采样流种子。Maze逐episode均匀抽取当前split文件；FourRooms从`[0,1000000)`采样原生episode seed。显式`reset(seed=s)`重建流；自动reset传None以继续流。
 - FourRooms评估构造后从固定panel首项开始，后续reset依次循环；`reset(seed=2000005)`可直接选择validation panel内的布局。构造参数seed不改变固定评估面板。
-- Maze评估factory只从固定panel抽样；后续评估器需以每个panel entry创建单图`MazeEnv(root,(entry,))`，实现每图恰评估一次。当前交付不实现评估器。
+- Maze评估factory只从固定panel抽样；评估器以每个panel entry创建单图`MazeEnv(root,(entry,))`，实现每图恰评估一次。对应实现为`evaluate.panel_envs`。
 - manifest的`sha256`是原始PNG文件字节哈希。validation选择train排序后前512个不同hash，所有同hash副本同时移出train；排序键为`(sha256,relative_path)`。仅扫描`train/0`和`test/0`。manifest保存相对路径；载入校验文件存在、内容及split隔离。
 - 世界模型回放和Fisher接口没有reward字段；CTM/双列state为显式类型。所有batch的时间维在batch维之前，具体shape见`contracts.py`英文docstring。
 
@@ -85,8 +85,8 @@ teacher = frozen_copy(policy)  # Copies parameters/buffers, including the old KB
 - 每观察推进2ticks；两个独立同步向量各528维，M=20。序列内部不自动detach；rollout边界由调用者使用`detach_state`。padding输出置零、state保持原值，不能当有效策略目标。
 - `DualPolicy`持有冻结KB、随机Active和Adapter；KB先推进每tick，Active再使用同tick的KB激活。`kb_ready=False`强制禁用侧连，首次压缩完成后由阶段控制器调用`policy.kb_ready.fill_(True)`。
 - `VisionEncoder.set_world_training(True)`只由W.fit调用。结束后`freeze()`锁定参数、梯度与BN；TA结束调用`freeze(permanent=True)`，之后禁止重新开启视觉训练。单纯父模块`train()`不会打开冻结BN。
-- 构造新的DualPolicy即新建Active/Adapter，不复制KB控制器；优化器清空属于未来阶段状态机的责任。
-- `frozen_copy(module)`使用deepcopy隔离参数与buffers。快照采样state需调用快照自身`initial_state`创建；运行trace不存于模型内部。裸`state_dict`序列化可用，阶段边界checkpoint尚未实现。
+- 构造新的DualPolicy即新建Active/Adapter，不复制KB控制器；阶段调度器在每次X/P开始时重建对应优化器。
+- `frozen_copy(module)`使用deepcopy隔离参数与buffers。快照采样state需调用快照自身`initial_state`创建；运行trace不存于模型内部。裸`state_dict`序列化及交付5的阶段边界checkpoint均可用。
 - `Controller.tick`只返回当前tick的新state与激活；`SpatialAttention(...,return_weights=True)`可用于诊断，默认不保存历史Attention权重。
 
 真实环境像素验证（无优化器训练循环，需新输出目录或尚无`model_report.json`的目录）：
@@ -127,11 +127,11 @@ teacher = frozen_copy(policy)  # Copies parameters/buffers, including the old KB
 
 ## 后续衔接
 
-交付5实现阶段状态机、完整checkpoint、恢复及评估衔接。`PhaseKey`只是阶段身份数据类，不会执行任何训练。当前没有启动完整训练。
+交付5已实现阶段状态机、完整checkpoint、恢复及评估衔接；交付6的完整760步smoke待单独执行。`PhaseKey`只是阶段身份数据类，不会执行任何训练。当前没有启动完整训练。
 
 ## 交付4：循环学习接口
 
-这些接口执行单个阶段或单个batch，不实现跨任务调度和恢复。图像batch与目标默认存CPU，运行state和模型在同一设备；动作、minibatch、Fisher抽样各使用独立CPU `torch.Generator`。当前验证设备为CPU，GPU尚未运行验证。
+这些接口执行单个阶段或单个batch，不实现跨任务调度和恢复。图像batch与目标默认存CPU，运行state和模型在同一设备；动作、minibatch、Fisher抽样各使用独立CPU `torch.Generator`。交付4最初验证设备为CPU；后续已通过RTX 4060 Laptop上的有限GPU验证。
 
 ### X/P：PPO
 
@@ -157,7 +157,7 @@ next_transition_id = result["next_transition_id"]
 - `train_ppo(batch,policy,encoder,optimizer,config,rng=...)`按环境随机分组，时间顺序不变；起点state detach，序列内部反传，episode reset截断。验证optimizer所有权，返回最后minibatch的loss/entropy/KL/梯度范数及总updates。
 - `set_stage_learning_rate(...,completed_rollouts,total_rollouts)`以已完成rollout比例设置学习率。stage helper在每轮更新前设置，阶段完成后设0；两个rollout的更新学习率为1e-4、5e-5，结束为0。
 - 每次更新后继续使用采集末尾的detached trace；不改用新参数重新计算的trace。这是计划规定的截断近似。
-- `run_ppo_stage`精确消耗steps，重建optimizer但不初始化policy，成功后发布完整X池，返回transitions/updates/rollouts/next_transition_id/pool_manifest/last等字段。builder失败清理由调用者在finally执行abort；失败阶段不允许直接继续，应由未来checkpoint恢复。
+- `run_ppo_stage`精确消耗steps，重建optimizer但不初始化policy，成功后发布完整X池，返回transitions/updates/rollouts/next_transition_id/pool_manifest/last等字段。builder失败清理由调用者在finally执行abort；失败阶段不允许直接继续，应由最近已提交checkpoint恢复。
 
 ### C：冻结教师与序列蒸馏
 
@@ -167,7 +167,7 @@ next_transition_id = result["next_transition_id"]
 
 `make_distill_optimizer(kb,encoder,config)`每C新建仅包含学生KB的Adam。`train_distill(batch,kb,encoder,ewc,optimizer,config,rng=...)`按环境分组，从学生自己的initial_state开始，以no_grad推进10个观察（20ticks），detach后对learning步反传。loss为`KL(teacher||student)+lambda/2*sum(F*(theta-center)^2)`。无value、entropy或hidden-state loss。首次ewc=None时惩罚为0，后续立即启用。
 
-`run_compress_stage(envs,teacher,kb,encoder,config,ewc,steps=...,action_rng=...,minibatch_rng=...,start_transition_id=...)`先创建teacher快照，再启用学生训练；每收集一个窗口即训练一次，不在C结束后批量重复。返回transitions/updates/windows/next_transition_id/teacher_snapshot_id/last/kb_ready=True。返回的readiness须由未来调度器保存并用于下一次DualPolicy构造，helper不修改其他policy对象的buffer。
+`run_compress_stage(envs,teacher,kb,encoder,config,ewc,steps=...,action_rng=...,minibatch_rng=...,start_transition_id=...)`先创建teacher快照，再启用学生训练；每收集一个窗口即训练一次，不在C结束后批量重复。返回transitions/updates/windows/next_transition_id/teacher_snapshot_id/last/kb_ready=True。返回的readiness须由调度器保存并用于下一次DualPolicy构造，helper不修改其他policy对象的buffer。
 
 ### F：无奖励Fisher与EWC状态
 
@@ -185,3 +185,72 @@ Fisher是在截断序列上的策略梯度平方均值，不是精确全轨迹Fi
 ```
 
 每任务X40/C40/F20，再单列P40，共240次交互、6次PPO更新、4次蒸馏更新、16个Fisher计分点。此验证的世界模型为随机初始化后冻结，用于检验奖励/梯度/回放接口，未先执行W.fit，不是完整760步smoke或成功率评估。输出learning_report.json。日志中的PPO loss/KL是optimizer.step前的值；单minibatch首epoch的ratio为1、归一化policy loss接近0是正常情况，不代表梯度为0。
+
+## 交付5：运行、恢复与评估
+
+`schedule.expand_stages`生成完整有序阶段表；`train.Runner`每次`run_next()`提交一个阶段。W.collect和W.fit分别占一个阶段，init不计入`--max-stages`。阶段入口检查可训练参数所有权；每个X/P新建随机Active及Adapter，C使用独立旧KB教师快照，F更新在线Fisher。单列基线跨P保留权重、重建优化器。TA最后一次F后永久冻结并导出E。
+
+从仓库根目录执行以下命令。训练命令必须显式提供seed与新run目录；不自动启动配置中的其他seed。`--max-stages`只在完整阶段后停止。
+
+```powershell
+# Inspect data/configuration/schedule without constructing or training models.
+& 'D:/conda/envs/ctm/python.exe' -m tasks.continual_nav.train --config tasks/continual_nav/configs/smoke.yaml --dry-run
+
+# Only W.collect and W.fit; this is not the complete 760-transition smoke.
+& 'D:/conda/envs/ctm/python.exe' -m tasks.continual_nav.train --config tasks/continual_nav/configs/smoke.yaml --method tapd_ctm --seed 0 --run-dir runs/continual_nav/example --max-stages 2
+
+# Continue from the committed boundary for one additional stage (X here).
+& 'D:/conda/envs/ctm/python.exe' -m tasks.continual_nav.train --config tasks/continual_nav/configs/smoke.yaml --method tapd_ctm --seed 0 --run-dir runs/continual_nav/example --resume --max-stages 1
+
+# Evaluate a complete checkpoint on CPU; output must not already exist.
+& 'D:/conda/envs/ctm/python.exe' -m tasks.continual_nav.evaluate --checkpoint runs/continual_nav/example/checkpoints/latest.json --policy kb --split validation --output runs/continual_nav/example/evaluation/manual_validation.json
+```
+
+`--maze-manifest <path>`可复用固定split；加载仍核验原图SHA-256、split隔离、validation独立hash数量和面板大小。训练首次运行保存所用面板，恢复使用run内的副本。dry-run只验证配置/数据/预算，**不验证基线视觉artifact可用性或设备可训练性**。
+
+### 四种方法与视觉来源
+
+| `--method` | 实例及流程 | 新运行额外参数 |
+|---|---|---|
+| `tapd_ctm` | TA的W.collect/W.fit/X/C/F，随后P/C/F | 禁止传视觉artifact |
+| `single_task_ctm_shared_vision` | 独立SingleActorCritic，同一任务连续P段 | `--task maze_medium`或`fourrooms`；`--vision-checkpoint` |
+| `sequential_ppo_shared_vision` | 一个SingleActorCritic，任务间保留参数 | `--vision-checkpoint` |
+| `pnc_without_exploration_distill_shared_vision` | 随机KB与空Fisher开始P/C/F | `--vision-checkpoint` |
+
+视觉输入必须是**同seed主方法完成TA后**的`exports/vision_final.pt`及同目录的`.pt.sha256.json`侧文件；不是任意ResNet权重。导入验证seed、方法、模型结构、固定数据/面板hash和永久冻结标记，原字节复制到基线run的`exports/shared_vision.pt`。基线不载入主方法控制器、g/F或Fisher；恢复时已保存视觉引用，无需重复传`--vision-checkpoint`。
+
+full每seed共享TA为16,898,304 transitions；主方法总计37,922,880；条件P&C新增21,024,576；顺序PPO新增15,000,000；单任务每个策略新增7,500,000。成本记录同时保存共享TA来源成本、是否本run实付、已提交总步数及Progress步数。评估、中断重跑另计。名称始终保留`shared_vision`，不称完全无预训练对照。
+
+### 保存和恢复契约
+
+- `checkpoints/<stage编码>__<uuid>.pt`保存模型与buffers、世界模型AdamW、Fisher/center、独立RNG、阶段前缀、计数器和依赖hash。E/world版本为模型state_dict中的buffer。单列的KB/dual/world/Fisher字段为null；空replay引用为`{}`。
+- 提交顺序是临时文件→原子替换pt→`.complete.json`→原子切换`latest.json`。只有latest指向的完整边界用于CLI恢复；不依据日志、文件时间或孤立pt猜进度。单run只支持一个writer。
+- 恢复必须使用相同config、method、seed、task、源码manifest及所需数据。缺失/修改的manifest、分片、地图或视觉文件直接报错。stage boundary重置环境/trace，所以不保存Gym运行时；不支持阶段内部逐步续训。
+- W.fit完成提交后清理fresh；X新池提交后清理该任务旧池。保留审计manifest和checkpoint，但**旧checkpoint可能因依赖已清理而不能恢复**。需长期保留某个旧恢复点时，应在下一阶段开始前复制完整run目录。
+- `attempts/*.json`记录每次阶段尝试。`confirmed_env_steps`仅在一次vector step完整返回后递增并落盘，不能保证突然断电或vector内部部分失败时最后若干步的精确计数。`committed`区分正式预算与未提交的额外交互；异常后重新构造Runner并`--resume`，不要在失败对象上原地继续。
+- `--max-stages`不是暂停运行中的阶段。用户中断W.fit/X/P/C/F时，恢复会从上一个边界重执行整个未完成阶段；完整结束后`finalized=True`防止再次执行final-test。
+
+### 评估、日志与导出
+
+`evaluate.py`按固定面板逐episode执行argmax；每episode使用策略自己的learned initial state。模型深拷贝冻结，训练RNG和原模型mode/参数不变。自动评估使用模型当前设备；独立evaluate CLI在CPU加载。主方法/P&C默认评估独立KB，单列自动加载SingleActorCritic。`--policy active`只用于存在双列状态的X/P边界；C之后不再保留Active。
+
+W.fit前后评估KB小面板，并沿旧视觉驱动的**同一条轨迹**计算新旧视觉下策略KL。X/P开始、每配置interval和结束评估Active；C开始/结束评估KB；F不重复评估。interval在PPO rollout完成后检查，full的100,000恰好整除400条rollout；其他兼容配置若不整除，事件会延后至首个越过阈值的rollout边界。
+
+成功率、原始return、全部episode长度、成功episode长度及Maze成功路径/最短路比均保留。无成功时成功长度和路径比是null。`analysis.metrics.forgetting`按after-C矩阵计算历史最好成绩减当前成绩；`seed_summary`保留每seed值、均值和样本标准差，单seed标准差为null。该函数不自动启动或汇集其他seed实验。
+
+| 文件 | 用途 |
+|---|---|
+| `resolved_config.yaml`、`provenance.json` | 完整配置、源码hash、阶段表、RNG派生种子、软件/设备版本 |
+| `manifests/` | Maze/evaluation固定面板及清理前的数据审计manifest |
+| `events.jsonl` | 阶段进入时参数所有权、更新、评估与完成事件 |
+| `metrics.jsonl`、`tensorboard/` | 每PPO rollout末尾指标；W/C最后一次更新；Fisher统计与评估/漂移 |
+| `attempts/` | 包含失败尝试的已确认训练交互记录 |
+| `exports/vision_final.pt` | 主方法TA完成后的冻结视觉及共享成本 |
+| `exports/final.pt` | 全流程结束的E+KB或E+SingleActorCritic、配置、固定manifest、成本 |
+| `evaluation/final_test.json`、`forgetting.json` | 最终测试及after-C原始矩阵/遗忘量 |
+
+JSONL是追加的尝试日志，恢复不会删除失败尝试中已经写出的曲线点；判断正式完成状态以checkpoint为准。`policy_internal_ticks`统计实际控制器样本ticks，包括双列、bootstrap、burn-in、重放；`eval_internal_ticks`独立统计自动评估。两者都不是环境transition数。最终checkpoint的`eval_steps`包含已完成评估；被中断的评估没有逐步成本journal，不应把它当作包含所有失败尝试的总成本。
+
+推理导出附SHA-256侧文件，不含replay/optimizer，可通过evaluate CLI直接加载；仍要求配置指向的Maze原图存在且hash相符。完整运行目录较大，checkpoint未自动裁剪，评估深拷贝也有额外内存开销。交付5已验证CPU有限阶段及恢复接口，后续GPU有限W/X/C/F与单列P也已通过；完整760步smoke和长训练尚未执行。
+
+GPU有限验证使用RTX 4060 Laptop 8 GiB、torch 2.13.0+cu126：两任务模型检查24条转移，W/X/C/F主链140条训练转移及新进程恢复，独立FourRooms单列P40条转移均通过。Attention/Adapter梯度、冻结参数和Fisher检查通过；这不是完整760步smoke或full预算显存验证。

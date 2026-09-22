@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 import math
+from collections.abc import Callable
 from torch import Tensor
 from torch.distributions import Categorical
 
@@ -94,7 +95,7 @@ def train_ppo(batch: PPOBatch, policy: SingleActorCritic | DualPolicy, encoder: 
 def run_ppo_stage(envs: VectorEnvAdapter, policy: SingleActorCritic | DualPolicy, encoder: VisionEncoder, config: Config,
                    *, phase: str, steps: int, action_rng: torch.Generator, minibatch_rng: torch.Generator,
                    world: WorldModel | None = None, high_error: HighErrorBuilder | None = None,
-                   start_transition_id: int = 0) -> dict:
+                   start_transition_id: int = 0, on_rollout: Callable[[int, dict], None] | None = None) -> dict:
     """One uninterrupted X/P stage; global scheduling/checkpointing belongs to delivery 5."""
     from ..data.rollout import PPOCollector
     if steps < 1 or steps % envs.num_envs:
@@ -114,6 +115,8 @@ def run_ppo_stage(envs: VectorEnvAdapter, policy: SingleActorCritic | DualPolicy
         metrics = train_ppo(batch, policy, encoder, optimizer, config, rng=minibatch_rng)
         consumed += size
         updates += metrics["updates"]
+        if on_rollout is not None:
+            on_rollout(consumed, metrics)
         # Keep the detached collect trace, not a trace recomputed with updated weights.
     set_stage_learning_rate(optimizer, config, completed_rollouts=rollouts, total_rollouts=rollouts)
     pool = high_error.finish() if high_error is not None else None
