@@ -243,7 +243,7 @@ W.fit前后评估KB小面板，并沿旧视觉驱动的**同一条轨迹**计算
 | `resolved_config.yaml`、`provenance.json` | 完整配置、源码hash、阶段表、RNG派生种子、软件/设备版本 |
 | `manifests/` | Maze/evaluation固定面板及清理前的数据审计manifest |
 | `events.jsonl` | 阶段进入时参数所有权、更新、评估与完成事件 |
-| `metrics.jsonl`、`tensorboard/` | X/P每PPO rollout、W.fit每50次更新、TA及P&C的C每10个训练窗口记录曲线，阶段末尾另记汇总；Fisher统计与评估/漂移 |
+| `metrics.jsonl`、`wandb_run.json`、`wandb/` | 本地审计指标、W&B运行标识和SDK缓存；X/P每PPO rollout、W.fit每50次更新、TA及P&C的C每10个训练窗口记录曲线，阶段末尾另记汇总；Fisher统计与评估/漂移 |
 | `attempts/` | 包含失败尝试的已确认训练交互记录 |
 | `exports/vision_final.pt` | 主方法TA完成后的冻结视觉及共享成本 |
 | `exports/final.pt` | 全流程结束的E+KB或E+SingleActorCritic、配置、固定manifest、成本 |
@@ -251,9 +251,11 @@ W.fit前后评估KB小面板，并沿旧视觉驱动的**同一条轨迹**计算
 
 JSONL是追加的尝试日志，恢复不会删除失败尝试中已经写出的曲线点；判断正式完成状态以checkpoint为准。`policy_internal_ticks`统计实际控制器样本ticks，包括双列、bootstrap、burn-in、重放；`eval_internal_ticks`独立统计自动评估。两者都不是环境transition数。最终checkpoint的`eval_steps`包含已完成评估；被中断的评估没有逐步成本journal，不应把它当作包含所有失败尝试的总成本。
 
-W和C的间隔由`world.log_interval_updates`、`distill.log_interval_windows`配置，阶段最后一次更新始终记录；smoke将两者设为1。TensorBoard的`*/W/fit/curve/*`使用累计世界模型优化器更新数作横轴，`*/C/curve/*`和X/P使用累计训练环境步作横轴。`W.collect`没有Loss，F只记录Fisher统计。启动查看：`tensorboard --logdir <run-dir>/tensorboard --port 6006`。
+W和C的间隔由`world.log_interval_updates`、`distill.log_interval_windows`配置，阶段最后一次更新始终记录；smoke将两者设为1。full配置的`training.remote_logging: true`在Runner启动时创建W&B在线run；smoke配置为false，保留本地JSONL且不连接W&B。运行前安装`tasks/continual_nav/requirements.txt`并完成`wandb login`；可用`WANDB_PROJECT`和`WANDB_ENTITY`指定目标项目及账号，未指定项目时为`tapd-ctm-continual-nav`。`--wandb-mode offline`可以在不上传的情况下验证W&B日志，`--wandb-mode disabled`仅用于本地测试。
 
-推理导出附SHA-256侧文件，不含replay/optimizer，可通过evaluate CLI直接加载；仍要求配置指向的Maze原图存在且hash相符。完整运行目录较大，checkpoint未自动裁剪，评估深拷贝也有额外内存开销。交付5已验证CPU有限阶段及恢复接口，后续GPU有限W/X/C/F与单列P也已通过；交付6完整760步GPU smoke也已通过；尚未启动正式长训练。
+W&B的`ta_W_<task>/*`使用累计世界模型优化器更新数作横轴；X/C/P及评估以累计训练环境步为横轴，P阶段另有以下游Progress步数为横轴的`progress_<task>/success_rate`。`W.collect`没有Loss，F只记录Fisher统计。`metrics.jsonl`保留完整阶段/尝试事件，W&B曲线也可能包含未提交尝试的点；正式恢复点仍以checkpoint为准。W&B run的ID和URL写入`wandb_run.json`。从旧TensorBoard运行恢复时使用原运行目录中的`resolved_config.yaml`和`--wandb-mode online`；仅精确匹配迁移前源码的checkpoint可跨越这次日志迁移。
+
+推理导出附SHA-256侧文件，不含replay/optimizer，可通过evaluate CLI直接加载；仍要求配置指向的Maze原图存在且hash相符。完整运行目录较大，checkpoint未自动裁剪，评估深拷贝也有额外内存开销。交付5已验证CPU有限阶段及恢复接口，后续GPU有限W/X/C/F与单列P也已通过；交付6完整760步GPU smoke也已通过。首次seed 0正式长训练已在首轮W.collect完成后按用户要求停止，未完成的W.fit没有提交。
 
 GPU有限验证使用RTX 4060 Laptop 8 GiB、torch 2.13.0+cu126：两任务模型检查24条转移，W/X/C/F主链140条训练转移及新进程恢复，独立FourRooms单列P40条转移均通过。Attention/Adapter梯度、冻结参数和Fisher检查通过；这不是完整760步smoke或full预算显存验证。
 

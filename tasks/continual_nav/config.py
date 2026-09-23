@@ -300,8 +300,8 @@ def validate_config(c: Config) -> None:
     require(c.environment.max_steps == 300 and c.environment.tile_size == 8
             and c.environment.reward == "success_time_discount", "unsupported environment semantics")
     require(bool(c.environment.maze_root), "maze_root cannot be empty")
-    require(c.training.precision == "float32" and c.training.vector_backend == "sync"
-            and not c.training.remote_logging, "v1 requires float32, sync, local logging")
+    require(c.training.precision == "float32" and c.training.vector_backend == "sync",
+            "v1 requires float32 and synchronous environments")
     require(c.training.device == "cpu" or (c.training.device.startswith("cuda:")
             and c.training.device[5:].isdigit()), "device must be cpu or an explicit cuda:N")
     require(bool(c.training.seeds) and len(set(c.training.seeds)) == len(c.training.seeds)

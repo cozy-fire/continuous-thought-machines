@@ -46,7 +46,7 @@ training:
   device: cuda:0
   precision: float32
   vector_backend: sync
-  remote_logging: false
+  remote_logging: true
 agnostic:
   visits: 4
   rounds_per_task: 2

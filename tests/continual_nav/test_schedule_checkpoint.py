@@ -9,16 +9,16 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from fixtures import map_file
 from tasks.continual_nav import checkpoint as ck
 from tasks.continual_nav.config import Config, load_config, resolved_dict
 from tasks.continual_nav.data.manifest import build_manifest
 from tasks.continual_nav.schedule import METHODS, RandomStreams, derive_seed, expand_stages
-from tasks.continual_nav.train import Runner
+from tasks.continual_nav.train import Runner, _PRE_WANDB_SOURCES, _validate_resume_sources
 from tasks.continual_nav.evaluate import load_for_evaluation
 from tasks.continual_nav.verify_models import tensor_hash
+from tasks.continual_nav.wandb_logging import WandbLogger, scalar_payload
 
 
 def setUpModule():
@@ -140,9 +140,15 @@ class BoundaryTests(unittest.TestCase):
         distill = next(row for row in logged if row["type"] == "distill_update")
         self.assertEqual(world["world_optimizer_updates"], 1)
         self.assertEqual(distill["consumed"], 4)
-        events = EventAccumulator(str(original.root / "tensorboard")).Reload()
-        self.assertEqual(events.Scalars(world["stage"]+"/curve/loss")[-1].step, 1)
-        self.assertEqual(events.Scalars(distill["stage"]+"/curve/loss")[-1].step, 12)
+        world_row, world_axes = scalar_payload(world, original.counters)
+        before_compress = {**original.counters, "global_env_steps": 8}
+        distill_row, distill_axes = scalar_payload(distill, before_compress)
+        self.assertEqual(world_row["world_optimizer_updates"], 1)
+        self.assertEqual(world_axes["ta_W_maze_medium"], "world_optimizer_updates")
+        self.assertEqual(world_row["ta_W_maze_medium/loss"], world["metrics"]["loss"])
+        self.assertEqual(distill_row["global_env_steps"], 12)
+        self.assertEqual(distill_axes["ta_C_maze_medium"], "global_env_steps")
+        self.assertEqual(distill_row["ta_C_maze_medium/loss"], distill["metrics"]["loss"])
 
     def vision(self):
         origin = self.runner("source")
@@ -200,9 +206,47 @@ class BoundaryTests(unittest.TestCase):
         logged = [json.loads(line) for line in (a.root / "metrics.jsonl").read_text().splitlines()]
         self.assertTrue(any(row["type"] == "ppo_update" and row["stage"].endswith("/P") for row in logged))
         self.assertTrue(any(row["type"] == "distill_update" and row["stage"].endswith("/C") for row in logged))
-        events = EventAccumulator(str(a.root / "tensorboard")).Reload()
-        self.assertEqual(events.Scalars("pnc/v0/maze_medium/P/policy_loss")[-1].step, 4)
-        self.assertEqual(events.Scalars("pnc/v0/maze_medium/C/curve/loss")[-1].step, 8)
+        ppo = next(row for row in logged if row["type"] == "ppo_update" and row["stage"].endswith("/P"))
+        before_progress = {**a.counters, "global_env_steps": 0}
+        ppo_row, ppo_axes = scalar_payload(ppo, before_progress)
+        self.assertEqual(ppo_row["global_env_steps"], 4)
+        self.assertEqual(ppo_axes["pnc_P_maze_medium"], "global_env_steps")
+        self.assertEqual(ppo_row["pnc_P_maze_medium/policy_loss"], ppo["metrics"]["policy_loss"])
+        distill = next(row for row in logged if row["type"] == "distill_update" and row["stage"].endswith("/C"))
+        before_compress = {**a.counters, "global_env_steps": 4}
+        distill_row, _ = scalar_payload(distill, before_compress)
+        self.assertEqual(distill_row["global_env_steps"], 8)
+
+    def test_wandb_offline_run_records_training_and_evaluation(self):
+        root = self.root / "wandb-offline"
+        root.mkdir()
+        local_appdata = root / "appdata"
+        local_appdata.mkdir()
+        with patch.dict("os.environ", {"LOCALAPPDATA": str(local_appdata)}):
+            logger = WandbLogger(root, self.c, METHODS[0], 0, None, mode="offline", resume=False)
+            try:
+                counters = {"global_env_steps": 100, "world_optimizer_updates": 50}
+                logger.log(dict(type="world_update", stage="ta/v0/maze_medium/r0/W/fit",
+                                world_optimizer_updates=50, downstream_progress_steps=0,
+                                metrics=dict(loss=1.25, forward_mse=0.2)), counters)
+                logger.log(dict(type="evaluation", stage="ta/v0/maze_medium/r0/X", event="end",
+                                downstream_progress_steps=0, global_training_steps=120,
+                                report=dict(tasks={"maze_medium": dict(success_rate=0.5, mean_return=1.0)})), counters)
+            finally:
+                logger.finish()
+        metadata = json.loads((root / "wandb_run.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["mode"], "offline")
+        self.assertTrue(any((root / "wandb").rglob("*.wandb")))
+
+    def test_only_exact_pre_wandb_sources_can_resume(self):
+        current = ck.source_manifest()
+        saved = {key: value for key, value in current.items() if key != "tasks/continual_nav/wandb_logging.py"}
+        saved.update(_PRE_WANDB_SOURCES)
+        self.assertTrue(_validate_resume_sources(saved, current))
+        self.assertFalse(_validate_resume_sources(current, current))
+        saved["tasks/continual_nav/models/policy.py"] = "wrong"
+        with self.assertRaisesRegex(ValueError, "source"):
+            _validate_resume_sources(saved, current)
 
     def test_final_TA_boundary_exports_frozen_vision_and_enters_P(self):
         run = self.runner("a")

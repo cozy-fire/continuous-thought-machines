@@ -29,6 +29,25 @@ from .learning.ppo import run_ppo_stage
 from .learning.world import SnapshotCollector, fit_world_model, make_world_optimizer
 from .models import Controller, DualPolicy, SIGReg, SingleActorCritic, StandalonePolicy, VisionEncoder, WorldModel, frozen_copy
 from .schedule import METHODS, RandomStreams, expand_stages
+from .wandb_logging import WandbLogger
+
+
+_PRE_WANDB_SOURCES = {
+    "tasks/continual_nav/config.py": "c56ae3d2da03ae63bffc3f5657be6c7478347afd37c52438d5b25ae0a7d97db3",
+    "tasks/continual_nav/train.py": "0d3e21b7e5340a9567158b8ef81d6d0ba5248b03493938df2300555df2ea1e22",
+}
+
+
+def _validate_resume_sources(saved: dict[str, str], current: dict[str, str]) -> bool:
+    if saved == current:
+        return False
+    # Permit only the exact pre-W&B checkout to cross this logging-only boundary.
+    if (all(saved.get(path) == digest for path, digest in _PRE_WANDB_SOURCES.items())
+            and set(current) - set(saved) == {"tasks/continual_nav/wandb_logging.py"}
+            and set(saved) - set(current) == set()
+            and all(saved[path] == current[path] for path in saved if path not in _PRE_WANDB_SOURCES)):
+        return True
+    raise ValueError("checkpoint source manifest mismatch")
 
 
 class CountedVector(VectorEnvAdapter):
@@ -58,7 +77,8 @@ def prepare_manifest(config: Config, supplied: Path | None) -> MazeManifest:
 
 class Runner:
     def __init__(self, config: Config, method: str, seed: int, root: Path, *, task: str | None = None,
-                 manifest_path: Path | None = None, vision_checkpoint: Path | None = None, resume: bool = False):
+                 manifest_path: Path | None = None, vision_checkpoint: Path | None = None, resume: bool = False,
+                 wandb_mode: str | None = None):
         self.config, self.method, self.seed, self.task, self.root = config, method, seed, task, root.resolve()
         self.stages = expand_stages(config, method, task)
         if seed not in config.training.seeds:
@@ -73,13 +93,15 @@ class Runner:
         self.fisher, self.kb_ready, self.fresh, self.pools = None, False, None, {}
         self.vision_source = self.vision_export = None
         self.completed, self.evaluations, self.next_index = [], [], 1
-        self.finalized, self._writer = False, None
+        self.finalized, self._logger = False, None
         self.counters = {name: 0 for name in ("global_env_steps", "world_collect_steps", "explore_steps", "progress_steps",
             "compress_steps", "fisher_steps", "eval_steps", "world_optimizer_updates", "ppo_optimizer_updates",
             "distill_optimizer_updates", "policy_internal_ticks", "eval_internal_ticks")}
         self._hooked, self._evaluating = WeakSet(), False
+        logging_migration = False
         if resume:
-            payload = ck.load(self.root, expected_config_hash=config_hash(config), expected_sources=self.sources)
+            payload = ck.load(self.root, expected_config_hash=config_hash(config))
+            logging_migration = _validate_resume_sources(payload["sources"], self.sources)
             if (payload["method"], payload["seed"], payload["task"]) != (method, seed, task):
                 raise ValueError("resume method/seed/task mismatch")
             if payload["stages"] != [s.record() for s in self.stages] or payload["policy_kind"] != ("single" if self.single else "dual"):
@@ -115,7 +137,7 @@ class Runner:
                 cuda_runtime=torch.version.cuda,
                 gpu=torch.cuda.get_device_name(self.device) if self.device.type == "cuda" else None,
                 versions={name: importlib.metadata.version(name)
-                for name in ("torch", "torchvision", "numpy", "gymnasium", "minigrid", "PyYAML", "tensorboard")}))
+                for name in ("torch", "torchvision", "numpy", "gymnasium", "minigrid", "PyYAML", "wandb")}))
             self.completed = ["init"]
         self.bank = ReplayBank(self.root / "replay", capacity=config.replay.high_error_capacity_per_task,
                                 shard_size=config.replay.shard_size) if method == METHODS[0] else None
@@ -128,6 +150,10 @@ class Runner:
                     (self.root / "replay" / current_task / "latest.json").unlink(missing_ok=True)
         if not resume:
             self._commit("init")
+        mode = wandb_mode or ("online" if config.training.remote_logging else "disabled")
+        self._logger = WandbLogger(self.root, config, method, seed, task, mode=mode, resume=resume)
+        if logging_migration:
+            self._event(dict(type="logging_migration", stage=self.completed[-1], backend="wandb"))
 
     def _construct(self):
         with self.rng.model_initialization(0):
@@ -242,23 +268,13 @@ class Runner:
                              "evaluation", "visual_drift", "stage_complete"):
             with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(value, allow_nan=False)+"\n")
-            if self._writer is None:
-                from torch.utils.tensorboard import SummaryWriter
-                self._writer = SummaryWriter(str(self.root / "tensorboard"), flush_secs=10)
-            # W.fit has no environment transitions; its curve uses cumulative optimizer updates.
-            step = (value["world_optimizer_updates"] if value["type"] == "world_update" else
-                    self.counters["global_env_steps"]+value.get("consumed", value.get("stage_training_steps", 0)))
-            prefix = value["stage"]+("/curve/" if value["type"] in ("world_update", "distill_update") else "/")
-            for name, metric in value.get("metrics", {}).items():
-                self._writer.add_scalar(prefix+name, metric, step)
-            if value["type"] == "evaluation":
-                for task, metrics in value["report"]["tasks"].items():
-                    self._writer.add_scalar(task+"/"+value["event"]+"/success_rate", metrics["success_rate"], step)
-                    if value["stage"].endswith("/P"):
-                        self._writer.add_scalar(task+"/progress_axis/success_rate", metrics["success_rate"], value["downstream_progress_steps"])
-            if value["type"] == "visual_drift":
-                for task, metrics in value["report"]["tasks"].items():
-                    self._writer.add_scalar(task+"/visual_drift/mean_kl", metrics["mean_kl"], step)
+        if self._logger is not None:
+            self._logger.log(value, self.counters)
+
+    def close_logging(self, *, exit_code: int = 0) -> None:
+        if self._logger is not None:
+            self._logger.finish(exit_code=exit_code)
+            self._logger = None
 
     def _evaluate(self, policy, stage, event, *, drift=False, progress=0):
         self._evaluating = True
@@ -445,8 +461,6 @@ class Runner:
                 envs.close()
             if builder is not None:
                 builder.abort()
-            if self._writer is not None:
-                self._writer.close(); self._writer = None
 
     def _cleanup(self):
         # Only committed dependencies survive; old markers may intentionally become
@@ -505,6 +519,8 @@ def main() -> None:
     parser.add_argument("--maze-manifest", type=Path)
     parser.add_argument("--vision-checkpoint", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
+                        help="Override W&B mode; full runs default to online")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-stages", type=int, help="Stop after N additional complete stages; never truncate a stage")
     args = parser.parse_args()
@@ -520,13 +536,19 @@ def main() -> None:
         parser.error("training requires explicit --seed and --run-dir; --max-stages must be positive")
     torch.set_num_threads(2)
     runner = Runner(config, args.method, args.seed, args.run_dir, task=args.task, manifest_path=args.maze_manifest,
-                    vision_checkpoint=args.vision_checkpoint, resume=args.resume)
-    count = 0
-    while runner.next_index < len(stages) and (args.max_stages is None or count < args.max_stages):
-        runner.run_next(); count += 1
-        print(f"committed {runner.completed[-1]}: {runner.counters['global_env_steps']} training transitions", flush=True)
-    if runner.next_index == len(stages):
-        runner.finalize()
+                    vision_checkpoint=args.vision_checkpoint, resume=args.resume, wandb_mode=args.wandb_mode)
+    try:
+        count = 0
+        while runner.next_index < len(stages) and (args.max_stages is None or count < args.max_stages):
+            runner.run_next(); count += 1
+            print(f"committed {runner.completed[-1]}: {runner.counters['global_env_steps']} training transitions", flush=True)
+        if runner.next_index == len(stages):
+            runner.finalize()
+    except BaseException:
+        runner.close_logging(exit_code=1)
+        raise
+    else:
+        runner.close_logging()
 
 
 if __name__ == "__main__":

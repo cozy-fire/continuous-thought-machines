@@ -15,6 +15,8 @@ class ConfigTests(unittest.TestCase):
         full = load_config(CONFIGS / "full.yaml")
         smoke = load_config(CONFIGS / "smoke.yaml")
         self.assertEqual(full.agnostic.visits, 4)
+        self.assertTrue(full.training.remote_logging)
+        self.assertFalse(smoke.training.remote_logging)
         self.assertEqual((full.world.log_interval_updates, full.distill.log_interval_windows), (50, 10))
         self.assertEqual((smoke.world.log_interval_updates, smoke.distill.log_interval_windows), (1, 1))
         self.assertEqual(budget_summary(full)["main_steps"], 32290112)

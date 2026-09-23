@@ -4,6 +4,7 @@ training:
   seeds: [0]
   num_envs: 2
   device: cpu
+  remote_logging: false
 agnostic:
   visits: 1
 world:
