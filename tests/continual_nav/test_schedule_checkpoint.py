@@ -35,6 +35,25 @@ def fake_evaluate(*args, **kwargs):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_atomic_json_retries_transient_windows_replace_denial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            path.write_text('{"step": 0}', encoding="utf-8")
+            replace = ck.os.replace
+            calls = 0
+
+            def transient_denial(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls < 3:
+                    raise PermissionError("temporarily locked")
+                replace(source, destination)
+
+            with patch.object(ck.os, "name", "nt"), patch.object(ck.os, "replace", side_effect=transient_denial):
+                ck.atomic_json(path, {"step": 1})
+            self.assertEqual(calls, 3)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"step": 1})
+
     def test_all_schedules_and_seed_formula(self):
         full = Config()
         main = expand_stages(full, METHODS[0])

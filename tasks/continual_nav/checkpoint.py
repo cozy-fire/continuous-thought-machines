@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 import uuid
 
 import torch
@@ -30,7 +31,15 @@ def atomic_json(path: Path, value: dict) -> None:
     with temp.open("w", encoding="utf-8") as stream:
         json.dump(value, stream, indent=2, allow_nan=False)
         stream.flush(); os.fsync(stream.fileno())
-    os.replace(temp, path)
+    for attempt in range(8):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if os.name != "nt" or attempt == 7:
+                raise
+            # Windows scanners can briefly hold the destination open after a journal update.
+            time.sleep(min(0.025 * 2**attempt, 0.4))
 
 
 def atomic_torch(path: Path, value: dict) -> None:
