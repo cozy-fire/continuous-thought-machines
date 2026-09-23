@@ -28,9 +28,7 @@ flowchart LR
 
 CTM 每个环境步推进两个内部 tick，维护长度为20 ticks的神经元历史。每个 tick 根据历史 post activation 的同步表示生成 Query，对 ResNet 的 $21\times21=441$ 个空间 token 执行四头 cross-attention：
 
-$$
-c_k=\operatorname{Concat}_{h=1}^{4}\left[\operatorname{softmax}\left(\frac{\widetilde Q_{k,h}\widetilde K_h^{\top}}{\sqrt{32}}\right)V_h\right]W_O.
-$$
+$$c_k=\text{Concat}_{h=1}^{4}\left[\text{softmax}\left(\frac{\widetilde Q_{k,h}\widetilde K_h^{\top}}{\sqrt{32}}\right)V_h\right]W_O.$$
 
 $\widetilde Q,\widetilde K$ 为施加二维轴向 RoPE 后的投影，V不旋转。Query内容由CTM状态决定，位置编码固定在特征图中心。Attention输出与上一tick激活共同进入synapse，再由各神经元独立的时间模型（NLM）生成新激活；另一组同步表示供Actor/Critic读出。KB与Active共享视觉特征，但各自拥有Attention参数与循环状态。世界模型使用的全局平均池化不会作用于CTM输入。
 
@@ -39,12 +37,12 @@ $\widetilde Q,\widetilde K$ 为施加二维轴向 RoPE 后的投影，V不旋转
 每个内部tick $k$ 先更新KB，再将其**当前tick的新激活**传给Active：
 
 $$
-\ell_k=\tanh(\alpha)W_{\mathrm{lat}}\operatorname{LN}\!\left(\operatorname{sg}(h_k^{\mathrm{KB}})\right),
+\ell_k=\tanh(\alpha)W_{\mathrm{lat}}\text{LN}\!\left(\text{sg}(h_k^{\mathrm{KB}})\right),
 \qquad
-u_k^{A}=\operatorname{Synapse}_{A}\!\left([c_k^{A};\ h_{k-1}^{A}+\ell_k]\right).
+u_k^{A}=\text{Synapse}_{A}\!\left([c_k^{A};\ h_{k-1}^{A}+\ell_k]\right).
 $$
 
-$\operatorname{sg}$ 表示停止梯度；横向信息与Active上一tick激活**相加**后，再与Attention输出拼接。Adapter使用零初始化的标量门控，首次压缩前关闭侧连。学习Active时冻结KB，梯度仅更新Active和Adapter；当前tick的横向输入通过新状态影响后续tick的视觉查询。
+$\text{sg}$ 表示停止梯度；横向信息与Active上一tick激活**相加**后，再与Attention输出拼接。Adapter使用零初始化的标量门控，首次压缩前关闭侧连。学习Active时冻结KB，梯度仅更新Active和Adapter；当前tick的横向输入通过新状态影响后续tick的视觉查询。
 
 ## 2. 整体训练流程
 
@@ -70,8 +68,8 @@ W首先使用冻结的旧E与KB快照采集当前任务的图像转移。拟合�
 对当前帧与下一帧定义：
 
 $$
-z_t=g\!\left(\operatorname{GAP}(E(o_t))\right),\qquad
-\widehat z_{t+1}=f\!\left([z_t;\operatorname{onehot}(a_t)]\right).
+z_t=g\!\left(\text{GAP}(E(o_t))\right),\qquad
+\widehat z_{t+1}=f\!\left([z_t;\text{onehot}(a_t)]\right).
 $$
 
 GAP为空间全局平均池化，$z_t\in\mathbb{R}^{128}$。projector为128→512→128，predictor为133→512→128的MLP，隐藏层使用ReLU，输出层为线性层。损失为：
@@ -110,7 +108,7 @@ P使用外在任务奖励：在episode第 $t$ 步成功时奖励为 $1-0.9t/300$
 $$
 \mathcal L_{\mathrm{PPO}}=
 -\mathbb E_t\!\left[\min\left(\rho_t\widehat A_t,
-\operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)\widehat A_t\right)\right]
+\text{clip}(\rho_t,1-\epsilon,1+\epsilon)\widehat A_t\right)\right]
 +\frac{c_v}{2}\mathbb E_t\!\left[(V_\theta(H_t)-\widehat R_t)^2\right]
 -c_H\mathbb E_t\!\left[\mathcal H(\pi_\theta(\cdot\mid H_t))\right].
 $$
