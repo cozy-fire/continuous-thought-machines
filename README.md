@@ -37,9 +37,9 @@ $\widetilde Q,\widetilde K$ 为施加二维轴向 RoPE 后的投影，V不旋转
 每个内部tick $k$ 先更新KB，再将其**当前tick的新激活**传给Active：
 
 $$
-\ell_k=\tanh(\alpha)W_{\mathrm{lat}}\text{LN}\!\left(\text{sg}(h_k^{\mathrm{KB}})\right),
+\ell_k=\tanh(\alpha)W_{\mathrm{lat}}\text{LN}\left(\text{sg}(h_k^{\mathrm{KB}})\right),
 \qquad
-u_k^{A}=\text{Synapse}_{A}\!\left([c_k^{A};\ h_{k-1}^{A}+\ell_k]\right).
+u_k^{A}=\text{Synapse}_{A}\left([c_k^{A};\ h_{k-1}^{A}+\ell_k]\right).
 $$
 
 $\text{sg}$ 表示停止梯度；横向信息与Active上一tick激活**相加**后，再与Attention输出拼接。Adapter使用零初始化的标量门控，首次压缩前关闭侧连。学习Active时冻结KB，梯度仅更新Active和Adapter；当前tick的横向输入通过新状态影响后续tick的视觉查询。
@@ -68,8 +68,8 @@ W首先使用冻结的旧E与KB快照采集当前任务的图像转移。拟合�
 对当前帧与下一帧定义：
 
 $$
-z_t=g\!\left(\text{GAP}(E(o_t))\right),\qquad
-\widehat z_{t+1}=f\!\left([z_t;\text{onehot}(a_t)]\right).
+z_t=g\left(\text{GAP}(E(o_t))\right),\qquad
+\widehat z_{t+1}=f\left([z_t;\text{onehot}(a_t)]\right).
 $$
 
 GAP为空间全局平均池化，$z_t\in\mathbb{R}^{128}$。projector为128→512→128，predictor为133→512→128的MLP，隐藏层使用ReLU，输出层为线性层。损失为：
@@ -96,7 +96,7 @@ $$
 X冻结世界模型，以预测误差定义内在奖励：
 
 $$
-r_t^{\mathrm{int}}=\log\!\left(1+\left\|\widehat z_{t+1}-z_{t+1}\right\|_2\right).
+r_t^{\mathrm{int}}=\log\left(1+\left\|\widehat z_{t+1}-z_{t+1}\right\|_2\right).
 $$
 
 X仅使用此奖励，不混合外在奖励。每个任务保留本轮误差最高的转移，整体替换该任务旧池，供下一轮W使用。
@@ -107,13 +107,13 @@ P使用外在任务奖励：在episode第 $t$ 步成功时奖励为 $1-0.9t/300$
 
 $$
 \mathcal L_{\mathrm{PPO}}=
--\mathbb E_t\!\left[\min\left(\rho_t\widehat A_t,
+-\mathbb E_t\left[\min\left(\rho_t\widehat A_t,
 \text{clip}(\rho_t,1-\epsilon,1+\epsilon)\widehat A_t\right)\right]
-+\frac{c_v}{2}\mathbb E_t\!\left[(V_\theta(H_t)-\widehat R_t)^2\right]
--c_H\mathbb E_t\!\left[\mathcal H(\pi_\theta(\cdot\mid H_t))\right].
++\frac{c_v}{2}\mathbb E_t\left[(V_\theta(H_t)-\widehat R_t)^2\right]
+-c_H\mathbb E_t\left[\mathcal H(\pi_\theta(\cdot\mid H_t))\right].
 $$
 
-默认 $\epsilon=0.1$、$c_v=0.25$、$c_H=0.01$。优势由GAE估计，并在policy loss中标准化；时间序列内部反传，rollout边界截断梯度。成功终止不bootstrap，超时从真实末帧bootstrap，但GAE不跨episode传播。冻结视觉并不阻断Active内部Attention的参数学习。
+默认 $\epsilon=0.1,c_v=0.25,c_H=0.01$。优势由GAE估计，并在policy loss中标准化；时间序列内部反传，rollout边界截断梯度。成功终止不bootstrap，超时从真实末帧bootstrap，但GAE不跨episode传播。冻结视觉并不阻断Active内部Attention的参数学习。
 
 ## 5. C与F：压缩和知识保持
 
@@ -121,7 +121,7 @@ C冻结学习后的完整双列教师，包括旧KB、Active及Adapter，并采�
 
 $$
 \mathcal L_C=
-\mathbb E_t\!\left[D_{\mathrm{KL}}\!\left(\pi_T(\cdot\mid H_t)\,\|\,\pi_{\mathrm{KB}}(\cdot\mid H_t)\right)\right]
+\mathbb E_t\left[D_{\mathrm{KL}}\left(\pi_T(\cdot\mid H_t)\,\|\,\pi_{\mathrm{KB}}(\cdot\mid H_t)\right)\right]
 +\frac{\lambda_{\mathrm{EWC}}}{2}\sum_i\Omega_i(\theta_i-\theta_i^*)^2,
 \qquad \lambda_{\mathrm{EWC}}=250.
 $$
