@@ -238,15 +238,19 @@ class Runner:
         value["downstream_progress_steps"] = self.counters["progress_steps"]+progress
         with (self.root / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(value, allow_nan=False)+"\n")
-        if value["type"] in ("ppo_update", "learner_update", "evaluation", "visual_drift", "stage_complete"):
+        if value["type"] in ("ppo_update", "world_update", "distill_update", "learner_update",
+                             "evaluation", "visual_drift", "stage_complete"):
             with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(value, allow_nan=False)+"\n")
             if self._writer is None:
                 from torch.utils.tensorboard import SummaryWriter
-                self._writer = SummaryWriter(str(self.root / "tensorboard"))
-            step = self.counters["global_env_steps"]+value.get("consumed", value.get("stage_training_steps", 0))
+                self._writer = SummaryWriter(str(self.root / "tensorboard"), flush_secs=10)
+            # W.fit has no environment transitions; its curve uses cumulative optimizer updates.
+            step = (value["world_optimizer_updates"] if value["type"] == "world_update" else
+                    self.counters["global_env_steps"]+value.get("consumed", value.get("stage_training_steps", 0)))
+            prefix = value["stage"]+("/curve/" if value["type"] in ("world_update", "distill_update") else "/")
             for name, metric in value.get("metrics", {}).items():
-                self._writer.add_scalar(value["stage"]+"/"+name, metric, step)
+                self._writer.add_scalar(prefix+name, metric, step)
             if value["type"] == "evaluation":
                 for task, metrics in value["report"]["tasks"].items():
                     self._writer.add_scalar(task+"/"+value["event"]+"/success_rate", metrics["success_rate"], step)
@@ -348,8 +352,12 @@ class Runner:
                 fresh = TransitionStore(ck.verify_reference(self.root, self.fresh, replay=True))
                 high_ref = self.pools.get(stage.key.task)
                 high = TransitionStore(ck.verify_reference(self.root, high_ref, replay=True)) if high_ref else None
+                def world_progress(updates, metrics):
+                    self._event(dict(type="world_update", stage=str(stage.key),
+                        world_optimizer_updates=self.counters["world_optimizer_updates"]+updates, metrics=metrics))
                 metrics = fit_world_model(self.world, SIGReg(self.config.sigreg), fresh, high, self.world_optimizer, self.config,
-                    task=stage.key.task, replay_rng=self.rng.numpy["replay"], sigreg_rng=self.rng.torch["sigreg"])
+                    task=stage.key.task, replay_rng=self.rng.numpy["replay"], sigreg_rng=self.rng.torch["sigreg"],
+                    on_update=world_progress)
                 self.world.commit_fit()
                 self.counters["world_optimizer_updates"] += stage.world_updates
                 self._evaluate(self.kb, stage, "after_W", drift=True)
@@ -386,9 +394,12 @@ class Runner:
                     self.pools[stage.key.task] = ck.reference(self.root, Path(result["pool_manifest"]))
             elif phase == "C":
                 self._evaluate(self.kb, stage, "start")
+                def distill_progress(consumed, updates, metrics):
+                    self._event(dict(type="distill_update", stage=str(stage.key), consumed=consumed,
+                        distill_optimizer_updates=self.counters["distill_optimizer_updates"]+updates, metrics=metrics))
                 result = run_compress_stage(envs, self.policy, self.kb, self.encoder, self.config, self.fisher,
                     steps=stage.transitions, action_rng=self.rng.torch["policy_action"], minibatch_rng=self.rng.torch["ppo_shuffle"],
-                    start_transition_id=self.counters["global_env_steps"])
+                    start_transition_id=self.counters["global_env_steps"], on_window=distill_progress)
                 self.counters["compress_steps"] += stage.transitions
                 self.counters["distill_optimizer_updates"] += result["updates"]
                 metrics = result["last"]

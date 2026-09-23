@@ -9,12 +9,14 @@ agnostic:
 world:
   collect_steps_per_round: 40
   updates_per_round: 2
+  log_interval_updates: 1
   batch_size: 8
 exploration:
   steps_per_round: 40
 distill:
   agnostic_steps_per_round: 40
   learning_steps: 10
+  log_interval_windows: 1
   minibatches: 1
 ppo:
   rollout_steps: 10

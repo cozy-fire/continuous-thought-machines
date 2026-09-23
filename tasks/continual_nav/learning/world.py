@@ -1,6 +1,7 @@
 """Frozen W collection and offline MSE/SIGReg updates, without external rewards."""
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 
 import numpy as np
@@ -94,7 +95,8 @@ def make_world_optimizer(world: WorldModel, config: Config) -> torch.optim.AdamW
 def fit_world_model(world: WorldModel, regularizer: SIGReg, fresh: TransitionStore,
                     high: TransitionStore | None, optimizer: torch.optim.Optimizer, config: Config,
                     *, task: TaskKey, replay_rng: np.random.Generator,
-                    sigreg_rng: torch.Generator) -> dict[str, float | int]:
+                    sigreg_rng: torch.Generator,
+                    on_update: Callable[[int, dict[str, float | int]], None] | None = None) -> dict[str, float | int]:
     if world._fit_complete:
         raise RuntimeError("publish or discard the previous completed fit before starting another")
     if fresh.encoder_version != int(world.encoder.encoder_version) or fresh.world_version != int(world.world_model_version):
@@ -127,6 +129,9 @@ def fit_world_model(world: WorldModel, regularizer: SIGReg, fresh: TransitionSto
             metrics = dict(updates=update+1, loss=loss.item(), forward_mse=mse.item(), sigreg=sigreg.item(),
                            grad_norm=float(grad_norm), high_count=int(batch.from_high_error.sum()),
                            fresh_count=int((~batch.from_high_error).sum()))
+            if on_update is not None and ((update+1) % config.world.log_interval_updates == 0
+                                          or update+1 == config.world.updates_per_round):
+                on_update(update+1, metrics)
         completed = True
     finally:
         # A failure never publishes versions and never leaves BN in training mode.

@@ -1,6 +1,7 @@
 """Teacher-to-student action KL after detached burn-in, with Online EWC."""
 from __future__ import annotations
 
+from collections.abc import Callable
 import torch
 from torch import Tensor
 
@@ -57,7 +58,8 @@ def train_distill(batch: SequenceBatch, kb: StandalonePolicy, encoder: VisionEnc
 def run_compress_stage(envs: VectorEnvAdapter, teacher: DualPolicy, kb: StandalonePolicy,
                         encoder: VisionEncoder, config: Config,
                         ewc: FisherState | None, *, steps: int, action_rng: torch.Generator,
-                        minibatch_rng: torch.Generator, start_transition_id: int = 0) -> dict:
+                        minibatch_rng: torch.Generator, start_transition_id: int = 0,
+                        on_window: Callable[[int, int, dict], None] | None = None) -> dict:
     from ..data.rollout import SequenceCollector
     if steps < 1 or steps % envs.num_envs:
         raise ValueError("compression budget must be a positive multiple of num_envs")
@@ -73,6 +75,8 @@ def run_compress_stage(envs: VectorEnvAdapter, teacher: DualPolicy, kb: Standalo
         consumed += size
         updates += metrics["updates"]
         windows += 1
+        if on_window is not None and (windows % config.distill.log_interval_windows == 0 or consumed == steps):
+            on_window(consumed, updates, metrics)
     return dict(transitions=consumed, updates=updates, windows=windows, last=metrics,
                 teacher_snapshot_id=collector.snapshot_id, next_transition_id=collector.next_transition_id,
                 kb_ready=True)

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from fixtures import map_file
 from tasks.continual_nav import checkpoint as ck
@@ -37,10 +38,10 @@ class ScheduleTests(unittest.TestCase):
     def test_all_schedules_and_seed_formula(self):
         full = Config()
         main = expand_stages(full, METHODS[0])
-        self.assertEqual(sum(s.transitions for s in main), 37922880)
-        self.assertEqual(sum(s.key.phase == "F" for s in main), 30)
-        self.assertEqual(sum(s.key.subphase == "collect" for s in main), 24)
-        self.assertEqual(sum(s.world_updates for s in main), 120000)
+        self.assertEqual(sum(s.transitions for s in main), 32290112)
+        self.assertEqual(sum(s.key.phase == "F" for s in main), 22)
+        self.assertEqual(sum(s.key.subphase == "collect" for s in main), 16)
+        self.assertEqual(sum(s.world_updates for s in main), 80000)
         self.assertEqual([s.ordinal for s in main], list(range(len(main))))
         smoke = load_config("tasks/continual_nav/configs/smoke.yaml")
         self.assertEqual([sum(s.transitions for s in expand_stages(smoke, method, "maze_medium" if method == METHODS[1] else None))
@@ -115,6 +116,14 @@ class BoundaryTests(unittest.TestCase):
         self.assertTrue(restored.kb_ready)
         self.assertIsNone(restored.policy)
         self.assertTrue(all(int(s["step"]) == 1 for s in restored.world_optimizer.state.values()))
+        logged = [json.loads(line) for line in (original.root / "metrics.jsonl").read_text().splitlines()]
+        world = next(row for row in logged if row["type"] == "world_update")
+        distill = next(row for row in logged if row["type"] == "distill_update")
+        self.assertEqual(world["world_optimizer_updates"], 1)
+        self.assertEqual(distill["consumed"], 4)
+        events = EventAccumulator(str(original.root / "tensorboard")).Reload()
+        self.assertEqual(events.Scalars(world["stage"]+"/curve/loss")[-1].step, 1)
+        self.assertEqual(events.Scalars(distill["stage"]+"/curve/loss")[-1].step, 12)
 
     def vision(self):
         origin = self.runner("source")
@@ -169,6 +178,12 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(b.fisher.completed_compressions, 1)
         for name in a.fisher.importance:
             torch.testing.assert_close(a.fisher.importance[name], b.fisher.importance[name], atol=0, rtol=0)
+        logged = [json.loads(line) for line in (a.root / "metrics.jsonl").read_text().splitlines()]
+        self.assertTrue(any(row["type"] == "ppo_update" and row["stage"].endswith("/P") for row in logged))
+        self.assertTrue(any(row["type"] == "distill_update" and row["stage"].endswith("/C") for row in logged))
+        events = EventAccumulator(str(a.root / "tensorboard")).Reload()
+        self.assertEqual(events.Scalars("pnc/v0/maze_medium/P/policy_loss")[-1].step, 4)
+        self.assertEqual(events.Scalars("pnc/v0/maze_medium/C/curve/loss")[-1].step, 8)
 
     def test_final_TA_boundary_exports_frozen_vision_and_enters_P(self):
         run = self.runner("a")

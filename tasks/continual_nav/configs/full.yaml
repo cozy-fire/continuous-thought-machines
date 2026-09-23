@@ -48,11 +48,12 @@ training:
   vector_backend: sync
   remote_logging: false
 agnostic:
-  visits: 6
+  visits: 4
   rounds_per_task: 2
 world:
   collect_steps_per_round: 100000
   updates_per_round: 5000
+  log_interval_updates: 50
   batch_size: 256
   projection_dim: 128
   projector_hidden: 512
@@ -106,6 +107,7 @@ ppo:
 distill:
   agnostic_steps_per_round: 300000
   learning_steps: 50
+  log_interval_windows: 10
   burnin_ticks: 20
   burnin_env_obs: 10
   minibatches: 4

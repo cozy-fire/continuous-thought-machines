@@ -1,4 +1,4 @@
-# Continual navigation — deliveries 1–5
+# Continual navigation — deliveries 1–6
 
 本目录已实现配置、数据契约、环境、CTM、世界模型/SIGReg、原始图像回放、循环PPO、循环蒸馏与Fisher/EWC。交付5新增全局阶段调度、阶段边界checkpoint、固定面板评估及三类共享视觉条件基线入口。关键 Python 逻辑采用英文注释。
 
@@ -24,7 +24,7 @@
 - YAML中的`lambda`在Python中为`lambda_`；其余字段同名。所有相对数据路径相对**调用时工作目录**，`extends`相对**配置文件目录**。
 - full使用`cuda:0`，环境验证不初始化CUDA；smoke默认`cpu`用于本地验证，模型结构/float32/ticks/M/损失不变。
 - v1的图像、动作数和模型结构锁定为计划值；修改结构须同步升级契约。预算、设备与数值超参数受显式校验。
-- `budget_summary`只计算预算，无任务调度副作用。主方法full=37,922,880 transitions/seed，smoke=760；不含评估与重跑。
+- `budget_summary`只计算预算，无任务调度副作用。主方法full=32,290,112 transitions/seed，smoke=760；不含评估与重跑。
 
 ## 数据与环境接口
 
@@ -127,7 +127,7 @@ teacher = frozen_copy(policy)  # Copies parameters/buffers, including the old KB
 
 ## 后续衔接
 
-交付5已实现阶段状态机、完整checkpoint、恢复及评估衔接；交付6的完整760步smoke待单独执行。`PhaseKey`只是阶段身份数据类，不会执行任何训练。当前没有启动完整训练。
+交付5已实现阶段状态机、完整checkpoint、恢复及评估衔接；交付6的完整760步GPU smoke及独立边界恢复已通过。`PhaseKey`只是阶段身份数据类，不会执行任何训练。当前没有启动完整训练。
 
 ## 交付4：循环学习接口
 
@@ -219,7 +219,7 @@ Fisher是在截断序列上的策略梯度平方均值，不是精确全轨迹Fi
 
 视觉输入必须是**同seed主方法完成TA后**的`exports/vision_final.pt`及同目录的`.pt.sha256.json`侧文件；不是任意ResNet权重。导入验证seed、方法、模型结构、固定数据/面板hash和永久冻结标记，原字节复制到基线run的`exports/shared_vision.pt`。基线不载入主方法控制器、g/F或Fisher；恢复时已保存视觉引用，无需重复传`--vision-checkpoint`。
 
-full每seed共享TA为16,898,304 transitions；主方法总计37,922,880；条件P&C新增21,024,576；顺序PPO新增15,000,000；单任务每个策略新增7,500,000。成本记录同时保存共享TA来源成本、是否本run实付、已提交总步数及Progress步数。评估、中断重跑另计。名称始终保留`shared_vision`，不称完全无预训练对照。
+full每seed共享TA为11,265,536 transitions；主方法总计32,290,112；条件P&C新增21,024,576；顺序PPO新增15,000,000；单任务每个策略新增7,500,000。成本记录同时保存共享TA来源成本、是否本run实付、已提交总步数及Progress步数。评估、中断重跑另计。名称始终保留`shared_vision`，不称完全无预训练对照。
 
 ### 保存和恢复契约
 
@@ -243,7 +243,7 @@ W.fit前后评估KB小面板，并沿旧视觉驱动的**同一条轨迹**计算
 | `resolved_config.yaml`、`provenance.json` | 完整配置、源码hash、阶段表、RNG派生种子、软件/设备版本 |
 | `manifests/` | Maze/evaluation固定面板及清理前的数据审计manifest |
 | `events.jsonl` | 阶段进入时参数所有权、更新、评估与完成事件 |
-| `metrics.jsonl`、`tensorboard/` | 每PPO rollout末尾指标；W/C最后一次更新；Fisher统计与评估/漂移 |
+| `metrics.jsonl`、`tensorboard/` | X/P每PPO rollout、W.fit每50次更新、TA及P&C的C每10个训练窗口记录曲线，阶段末尾另记汇总；Fisher统计与评估/漂移 |
 | `attempts/` | 包含失败尝试的已确认训练交互记录 |
 | `exports/vision_final.pt` | 主方法TA完成后的冻结视觉及共享成本 |
 | `exports/final.pt` | 全流程结束的E+KB或E+SingleActorCritic、配置、固定manifest、成本 |
@@ -251,6 +251,37 @@ W.fit前后评估KB小面板，并沿旧视觉驱动的**同一条轨迹**计算
 
 JSONL是追加的尝试日志，恢复不会删除失败尝试中已经写出的曲线点；判断正式完成状态以checkpoint为准。`policy_internal_ticks`统计实际控制器样本ticks，包括双列、bootstrap、burn-in、重放；`eval_internal_ticks`独立统计自动评估。两者都不是环境transition数。最终checkpoint的`eval_steps`包含已完成评估；被中断的评估没有逐步成本journal，不应把它当作包含所有失败尝试的总成本。
 
-推理导出附SHA-256侧文件，不含replay/optimizer，可通过evaluate CLI直接加载；仍要求配置指向的Maze原图存在且hash相符。完整运行目录较大，checkpoint未自动裁剪，评估深拷贝也有额外内存开销。交付5已验证CPU有限阶段及恢复接口，后续GPU有限W/X/C/F与单列P也已通过；完整760步smoke和长训练尚未执行。
+W和C的间隔由`world.log_interval_updates`、`distill.log_interval_windows`配置，阶段最后一次更新始终记录；smoke将两者设为1。TensorBoard的`*/W/fit/curve/*`使用累计世界模型优化器更新数作横轴，`*/C/curve/*`和X/P使用累计训练环境步作横轴。`W.collect`没有Loss，F只记录Fisher统计。启动查看：`tensorboard --logdir <run-dir>/tensorboard --port 6006`。
+
+推理导出附SHA-256侧文件，不含replay/optimizer，可通过evaluate CLI直接加载；仍要求配置指向的Maze原图存在且hash相符。完整运行目录较大，checkpoint未自动裁剪，评估深拷贝也有额外内存开销。交付5已验证CPU有限阶段及恢复接口，后续GPU有限W/X/C/F与单列P也已通过；交付6完整760步GPU smoke也已通过；尚未启动正式长训练。
 
 GPU有限验证使用RTX 4060 Laptop 8 GiB、torch 2.13.0+cu126：两任务模型检查24条转移，W/X/C/F主链140条训练转移及新进程恢复，独立FourRooms单列P40条转移均通过。Attention/Adapter梯度、冻结参数和Fisher检查通过；这不是完整760步smoke或full预算显存验证。
+
+## 交付6：完整集成smoke
+
+`verify_smoke.py`执行标准smoke的全部4轮TA和2个下游P/C/F访问。验证器只允许仓库smoke配置，唯一允许覆盖的是device；使用实际地图和固定面板，不mock评估，不修改奖励或训练算法。必须从仓库根目录执行，并提供尚不存在的输出目录：
+
+```powershell
+& 'D:/conda/envs/ctm/python.exe' -m tasks.continual_nav.verify_smoke --config tasks/continual_nav/configs/smoke.yaml --device cuda:0 --maze-manifest scientific-evidence/continual_nav/delivery_01_20260921/maze_splits.json --output-dir scientific-evidence/continual_nav/smoke_new
+```
+
+没有GPU时可显式改为`--device cpu`；不会自动回退。运行时间还包括固定面板评估、两个恢复子进程和导出复核，不能只用760训练步估算耗时。
+
+验证器使用`AuditedRunner`观察原有事件：记录每阶段参数数量与tensor hash、Active重建、实际PPO梯度组、C教师隔离、Fisher累积与中心，以及各任务回放来源。模块参数数量可能重叠（world包含共享E），不能跨模块求和当作模型总参数量。
+
+首次W.fit后和首次X后分别复制完整run依赖。主run完成后，两个独立Python子进程各恢复并执行下一阶段，将模型/优化器/Fisher、随机流、计数和回放原图/动作/ID与主run对应边界比较。CPU浮点要求精确一致；GPU浮点使用`atol=1e-5, rtol=1e-4`，整数/布尔、RNG、回放内容和计数仍精确比较。输出实际最大误差，不把容差通过称为逐位一致。
+
+主run计760训练转移，world更新8次、PPO更新12次、蒸馏更新12次，Fisher共6次×8计分点。恢复探针额外训练80步，其评估另计。最终推理artifact重新加载并复核固定test结果；两任务各保存至多16步RGB轨迹。三类条件基线（单任务分别构造两份）仅初始化，检查同一主方法视觉artifact的hash、冻结状态和独立控制器，不额外训练基线。
+
+输出目录包含：
+
+- `run/`：主run全部标准产物，另有逐阶段`smoke_audit.json`。
+- `recovery_W/`、`recovery_X/`：保留原依赖的恢复分支；各自`.json`结果与`.log`日志位于输出根目录。
+- `expected_after_X.pt`、`expected_after_C.pt`：比较用状态，不是正式推理或训练入口。
+- `trajectories/{task}.npz`：uint8观察`[T+1,3,84,84]`和int64动作`[T]`；`manifest.json`记录动作、奖励、结束标记及文件hash。内容是真实最终KB执行，不是生成视频或答案路径。
+- `baselines/`：共享视觉基线初始化checkpoint。
+- `smoke_report.json`与`smoke_report.md`：配置、来源、阶段审计、恢复容差和分项成本。报告保留在实验产物内。
+
+只有验证器正常结束且报告`status=passed`才算完成。主run训练结束但恢复比较失败，仍不算整体验收通过。测试不要求成功率门槛，不因小预算成功率低而扩大预算。完整smoke不等于正式训练，也不证明full batch适配本机显存。
+
+2026-09-23验收：76项CPU测试通过；RTX 4060 Laptop完整760步GPU主run、W/X独立恢复（最大张量误差均0）、最终导出复核与共享视觉基线初始化均通过。产物在`scientific-evidence/continual_nav/delivery_06_20260922/full_smoke_verified/`。其中`smoke_report.md/json`为验收报告，`acceptance_summary.json`记录最终checkpoint严格计数及此前失败验证的额外成本。验收JSON中的policy_internal_ticks另含保存末尾RGB轨迹的前向计算；正式主run计数以checkpoint为准。

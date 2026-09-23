@@ -85,10 +85,14 @@ class DistillFisherTests(unittest.TestCase):
 
     def test_compression_exact_tail_budget(self):
         encoder, kb = VisionEncoder(self.c), StandalonePolicy(self.c)
+        logged = []
         result = run_compress_stage(PixelProbe(forbid_reward=True), DualPolicy(self.c, kb), kb, encoder, self.c, None,
             steps=22, action_rng=torch.Generator().manual_seed(1), minibatch_rng=torch.Generator().manual_seed(2),
-            start_transition_id=100)
+            start_transition_id=100, on_window=lambda consumed, updates, metrics:
+                logged.append((consumed, updates, dict(metrics))))
         self.assertEqual((result["transitions"], result["updates"], result["next_transition_id"]), (22, 2, 122))
+        self.assertEqual([(consumed, updates) for consumed, updates, _ in logged], [(20, 1), (22, 2)])
+        self.assertEqual(logged[-1][2], result["last"])
         self.assertTrue(result["kb_ready"])
 
     def test_opposite_sample_gradients_do_not_cancel_Fisher(self):

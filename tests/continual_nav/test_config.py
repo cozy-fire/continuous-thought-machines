@@ -11,16 +11,26 @@ CONFIGS = Path(__file__).resolve().parents[2] / "tasks" / "continual_nav" / "con
 
 class ConfigTests(unittest.TestCase):
     def test_full_and_smoke_budgets(self):
+        self.assertEqual(Config().agnostic.visits, 4)
         full = load_config(CONFIGS / "full.yaml")
         smoke = load_config(CONFIGS / "smoke.yaml")
-        self.assertEqual(budget_summary(full)["main_steps"], 37922880)
-        self.assertEqual(budget_summary(full)["all_methods_steps"], 88947456)
-        self.assertEqual(budget_summary(full)["world_updates"], 120000)
+        self.assertEqual(full.agnostic.visits, 4)
+        self.assertEqual((full.world.log_interval_updates, full.distill.log_interval_windows), (50, 10))
+        self.assertEqual((smoke.world.log_interval_updates, smoke.distill.log_interval_windows), (1, 1))
+        self.assertEqual(budget_summary(full)["main_steps"], 32290112)
+        self.assertEqual(budget_summary(full)["all_methods_steps"], 83314688)
+        self.assertEqual(budget_summary(full)["world_updates"], 80000)
         self.assertEqual(budget_summary(smoke)["main_steps"], 760)
         self.assertEqual(budget_summary(smoke)["world_updates"], 8)
         for name in ("vision", "ctm", "attention", "observation", "sigreg"):
             self.assertEqual(getattr(full, name), getattr(smoke, name))
         self.assertEqual(smoke.distill.burnin_env_obs, 10)
+
+    def test_task_agnostic_visits_are_configurable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "custom.yaml"
+            path.write_text("extends: " + str(CONFIGS / "full.yaml") + "\nagnostic:\n  visits: 7\n")
+            self.assertEqual(load_config(path).agnostic.visits, 7)
 
     def test_resolved_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -59,6 +69,8 @@ class ConfigTests(unittest.TestCase):
                    replace(c, training=replace(c.training, num_envs=3)),
                    replace(c, world=replace(c.world, collect_steps_per_round=100001)),
                    replace(c, world=replace(c.world, batch_size=3)),
+                   replace(c, world=replace(c.world, log_interval_updates=0)),
+                   replace(c, distill=replace(c.distill, log_interval_windows=0)),
                    replace(c, fisher=replace(c.fisher, scored_samples=4097)),
                    replace(c, environment=replace(c.environment, max_steps=301)),
                    replace(c, evaluation=replace(c.evaluation, drift_episodes=201))]

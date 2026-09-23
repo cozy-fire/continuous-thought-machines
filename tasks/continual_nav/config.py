@@ -72,7 +72,7 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class AgnosticConfig:
-    visits: int = 6
+    visits: int = 4
     rounds_per_task: int = 2
 
 
@@ -89,6 +89,7 @@ class OptimizerConfig:
 class WorldConfig:
     collect_steps_per_round: int = 100000
     updates_per_round: int = 5000
+    log_interval_updates: int = 50
     batch_size: int = 256
     projection_dim: int = 128
     projector_hidden: int = 512
@@ -144,6 +145,7 @@ class PPOConfig:
 class DistillConfig:
     agnostic_steps_per_round: int = 300000
     learning_steps: int = 50
+    log_interval_windows: int = 10
     burnin_ticks: int = 20
     burnin_env_obs: int = 10
     minibatches: int = 4
@@ -308,8 +310,10 @@ def validate_config(c: Config) -> None:
         "num_envs": c.training.num_envs, "TA visits": c.agnostic.visits,
         "rounds_per_task": c.agnostic.rounds_per_task, "P&C visits": c.pnc.visits,
         "world batch": c.world.batch_size, "world updates": c.world.updates_per_round,
+        "world log interval": c.world.log_interval_updates,
         "rollout_steps": c.ppo.rollout_steps, "ppo minibatches": c.ppo.num_minibatches,
         "learning_steps": c.distill.learning_steps, "distill minibatches": c.distill.minibatches,
+        "distill log interval": c.distill.log_interval_windows,
         "Fisher samples": c.fisher.scored_samples, "replay capacity": c.replay.high_error_capacity_per_task,
         "shard size": c.replay.shard_size, "eval interval": c.evaluation.interval_steps,
         "validation episodes": c.evaluation.validation_episodes, "test episodes": c.evaluation.test_episodes,
