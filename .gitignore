@@ -28,6 +28,7 @@ utils/hugging_face/
 /.idea/
 /scientific-evidence/
 /runs/
+/plan/
 *.pth
 *.ckpt
 *.safetensors
