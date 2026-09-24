@@ -112,6 +112,9 @@ def load(root: Path, marker: Path | None = None, *, expected_config_hash: str | 
     for ref in (payload["vision_source"], payload["vision_export"]):
         if ref is not None:
             verify_reference(root, ref)
+    for ref in payload.get("pending_active", {}).values():
+        snapshot = load_artifact(verify_reference(root, ref))
+        verify_reference(root, snapshot["vision"])
     return payload
 
 

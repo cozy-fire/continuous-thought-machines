@@ -112,6 +112,7 @@ class SIGRegConfig:
 
 @dataclass(frozen=True)
 class ReplayConfig:
+    fit_cache: str = "memory"
     high_error_capacity_per_task: int = 50000
     high_error_fraction: float = 0.5
     retention: str = "latest_exploration_topk_per_task"
@@ -178,6 +179,8 @@ class FisherConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
+    backend: str = "subprocess"
+    num_envs: int = 16
     validation_episodes: int = 200
     test_episodes: int = 200
     drift_episodes: int = 32
@@ -317,7 +320,7 @@ def validate_config(c: Config) -> None:
         "Fisher samples": c.fisher.scored_samples, "replay capacity": c.replay.high_error_capacity_per_task,
         "shard size": c.replay.shard_size, "eval interval": c.evaluation.interval_steps,
         "validation episodes": c.evaluation.validation_episodes, "test episodes": c.evaluation.test_episodes,
-        "drift episodes": c.evaluation.drift_episodes,
+        "drift episodes": c.evaluation.drift_episodes, "evaluation num_envs": c.evaluation.num_envs,
     }
     for name, value in positives.items():
         require(value > 0, f"{name} must be positive")
@@ -338,6 +341,8 @@ def validate_config(c: Config) -> None:
             and float(c.world.batch_size * c.replay.high_error_fraction).is_integer(),
             "replay fraction must produce an integer batch count and retain fresh data")
     require(c.replay.retention == "latest_exploration_topk_per_task", "unsupported replay retention")
+    require(c.replay.fit_cache in ("memory", "shard"), "unsupported replay fit_cache")
+    require(c.evaluation.backend in ("serial", "subprocess"), "unsupported evaluation backend")
     require(c.world.forward_loss == defaults.world.forward_loss
             and (c.world.projection_dim, c.world.projector_hidden, c.world.predictor_hidden) == (128, 512, 512),
             "unsupported v1 world model")

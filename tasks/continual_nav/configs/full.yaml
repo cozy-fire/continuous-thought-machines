@@ -76,6 +76,7 @@ sigreg:
   knots: 17
   t_max: 3.0
 replay:
+  fit_cache: memory
   high_error_capacity_per_task: 50000
   high_error_fraction: 0.5
   retention: latest_exploration_topk_per_task
@@ -135,10 +136,12 @@ fisher:
   collect_steps: 4096
   scored_samples: 1024
 evaluation:
+  backend: subprocess
+  num_envs: 16
   validation_episodes: 200
   test_episodes: 200
   drift_episodes: 32
-  interval_steps: 100000
+  interval_steps: 100000  # Legacy field; automatic evaluation is visit-end only.
   maze_validation_hashes: 512
   fourrooms_train_seed_stop: 1000000
   fourrooms_validation_seed_start: 2000000

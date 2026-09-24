@@ -112,10 +112,14 @@ teacher = frozen_copy(policy)  # Copies parameters/buffers, including the old KB
 `data/replay.py`的数据流：
 
 1. `ShardedWriter`只接收同task、同encoder/world版本的`Transition`；每片最多2048条，图像复制为uint8。W不存error；X额外存原始L2排序分数，均不存reward或latent。达到精确预算后`finish()`原子发布manifest，记录各分片SHA-256。
-2. `TransitionStore(manifest)`核验分片哈希，`take(indices)`按请求顺序返回记录，支持重复索引；内存只缓存一个解压分片。采样后的图像每次由当前E/g重新编码。
+2. `TransitionStore(manifest)`核验分片哈希，`take(indices)`按请求顺序返回记录，支持重复索引；默认只缓存一个解压分片。W.fit按`replay.fit_cache`选择`memory`或`shard`：memory在阶段入口对当前任务fresh及high调用`preload()`，逐片填充连续uint8双帧数组和metadata；batch通过`take_arrays()`直接索引，不再读取/解压分片或逐条构造Transition。每次由当前E/g重新编码，保持采样RNG及样本顺序不变。W.fit正常结束、预加载失败或训练异常均`release()`；checkpoint只保存磁盘引用，恢复时重建缓存。内存不足直接报错，不静默改为shard。
 3. `ReplayBank.begin(task,encoder_version,world_version,source_stage,expected_count)`创建当前X的builder。逐条`offer(record,error,source="X")`保留top-K；同分时transition_id较小者优先。像素存磁盘memmap，heap只持分数和slot。必须提交本轮全部expected_count条后才能`finish()`，整个新池替换该任务上轮池；另一任务不变。异常时调用`abort()`释放本builder的临时文件。
 4. `sample_world_batch(fresh,high,task,batch_size,high_fraction,rng)`从各池均匀有放回采样。full为128+128，smoke为4+4；空高误差池全部fresh。返回CPU `WorldBatch`，先fresh后high，含来源mask和ID；不能跨任务。
 5. replay的`latest.json`原子切换不等于全局checkpoint。旧版本暂留，生产调度器只能在阶段checkpoint提交后调用`bank.prune(task,protected_manifests=...)`，保留恢复所引用的版本。单一writer，不支持并发写同一task池。
+
+full/rtx5090默认memory。100,000 fresh加50,000 high的双帧像素为6,350,400,000字节，约5.91 GiB；另有metadata、单片解压临时数组和batch，其他任务的池不加载。W日志增加`replay_loaded_records`、`replay_cache_bytes`、`replay_preload_seconds`、累计`replay_sample_seconds`和不含预加载的`fit_seconds`，用于区分磁盘加载与训练计算。
+
+`python -m tasks.continual_nav.verify_performance --checkpoint <final.pt> --fresh <manifest.json> --high <manifest.json> --output <new_report.json> --device cuda:0`进行有界性能对照（high可省略）。默认batch 8、6次W更新、20次采样，比较相同初始模型及RNG下的shard/memory，再对相同策略和面板比较batch 1、批量serial和subprocess。对照进程固定`cudnn.deterministic=True`、`benchmark=False`，以隔离CUDA卷积反向非确定性，不改变正式训练设置。报告包含稳态吞吐、缓存加载、采样耗时、逐episode动作序列及指标一致性、每20ms采样的进程树RSS峰值；RSS可能重复计入共享页。该命令不修改正式训练预算，不启动远端训练。
 
 真实环境小预算验证（CPU；必须使用新的输出目录）：
 
@@ -232,28 +236,31 @@ full每seed共享TA为11,265,536 transitions；主方法总计32,290,112；条�
 
 ### 评估、日志与导出
 
-`evaluate.py`按固定面板逐episode执行argmax；每episode使用策略自己的learned initial state。模型深拷贝冻结，训练RNG和原模型mode/参数不变。自动评估使用模型当前设备；独立evaluate CLI在CPU加载。主方法/P&C默认评估独立KB，单列自动加载SingleActorCritic。`--policy active`只用于存在双列状态的X/P边界；C之后不再保留Active。
+`evaluate.py`按固定面板执行多episode批量argmax。`evaluation.backend`支持`serial`和`subprocess`，`evaluation.num_envs`控制最大推理batch；full/rtx5090为subprocess、16槽，smoke为2槽。子进程使用spawn，只运行CPU环境；主进程运行GPU模型。episode结束即补入下一个面板条目并重置该槽两列CTM状态；尾批只推理有效槽，按面板顺序保存结果。模型深拷贝冻结，训练RNG和原模型mode/参数不变。自动评估使用模型当前设备；独立CLI在CPU加载，可用`--backend serial --num-envs 1`覆盖执行方式。
 
-W.fit前后评估KB小面板，并沿旧视觉驱动的**同一条轨迹**计算新旧视觉下策略KL。X/P开始、每配置interval和结束评估Active；C开始/结束评估KB；F不重复评估。interval在PPO rollout完成后检查，full的100,000恰好整除400条rollout；其他兼容配置若不整除，事件会延后至首个越过阈值的rollout边界。
+一次visit指完成整个task_order及每任务全部TA round。TA每visit最后一个F之后只评估KB；P&C每visit最后一个F之后依次评估最终KB、Maze Active、FourRooms Active，每个策略均测试两个任务。单列基线在完整visit/segment结束评估。所有阶段内评估和自动W视觉漂移诊断已取消；`interval_steps`仅为旧配置兼容字段，`drift_episodes`仅用于手动漂移工具。整体结束仍对最终KB/单列策略跑独立test，不额外测试历史Active。
 
-成功率、原始return、全部episode长度、成功episode长度及Maze成功路径/最短路比均保留。无成功时成功长度和路径比是null。`analysis.metrics.forgetting`按after-C矩阵计算历史最好成绩减当前成绩；`seed_summary`保留每seed值、均值和样本标准差，单seed标准差为null。该函数不自动启动或汇集其他seed实验。
+P&C每个P结束保存`exports/active/v<visit>_<task>.pt`及hash侧文件，包含完整Active、Adapter、训练时的旧KB和冻结视觉artifact引用。checkpoint的`pending_active`保留待评估快照，跨C/F及恢复仍可使用。旧KB使用独立存储重建，不把Active接到visit末的新KB。快照文件在评估后保留，待评估引用在完成visit后清空。`--policy active`仍读取X/P完整边界的当前双列；C之后使用上述历史快照进行自动visit评估。
+
+成功率、原始return、全部episode长度、成功episode长度及Maze成功路径/最短路比均保留。无成功时成功长度和路径比是null。`forgetting.json`分别保存`ta`和`pnc`的visit末KB矩阵、visit编号和历史最好成绩减当前成绩；不混入Active。评估记录还包含唯一evaluation_id、策略及来源任务、split、训练步数、耗时和episodes/s。`seed_summary`保留每seed值、均值和样本标准差，单seed标准差为null。
 
 | 文件 | 用途 |
 |---|---|
 | `resolved_config.yaml`、`provenance.json` | 完整配置、源码hash、阶段表、RNG派生种子、软件/设备版本 |
 | `manifests/` | Maze/evaluation固定面板及清理前的数据审计manifest |
 | `events.jsonl` | 阶段进入时参数所有权、更新、评估与完成事件 |
-| `metrics.jsonl`、`wandb_run.json`、`wandb/` | 本地审计指标、W&B运行标识和SDK缓存；X/P每PPO rollout、W.fit每50次更新、TA及P&C的C每10个训练窗口记录曲线，阶段末尾另记汇总；Fisher统计与评估/漂移 |
+| `metrics.jsonl`、`wandb_run.json`、`wandb/` | 本地审计指标、W&B运行标识和SDK缓存；X/P每PPO rollout、W.fit每50次更新、TA及P&C的C每10个训练窗口记录曲线，阶段末尾另记汇总；Fisher统计与visit/final评估 |
 | `attempts/` | 包含失败尝试的已确认训练交互记录 |
 | `exports/vision_final.pt` | 主方法TA完成后的冻结视觉及共享成本 |
 | `exports/final.pt` | 全流程结束的E+KB或E+SingleActorCritic、配置、固定manifest、成本 |
-| `evaluation/final_test.json`、`forgetting.json` | 最终测试及after-C原始矩阵/遗忘量 |
+| `exports/active/` | 各P结束的独立双列快照及冻结视觉引用 |
+| `evaluation/final_test.json`、`forgetting.json` | 最终测试及分TA/P&C的visit末KB矩阵/遗忘量 |
 
 JSONL是追加的尝试日志，恢复不会删除失败尝试中已经写出的曲线点；判断正式完成状态以checkpoint为准。`policy_internal_ticks`统计实际控制器样本ticks，包括双列、bootstrap、burn-in、重放；`eval_internal_ticks`独立统计自动评估。两者都不是环境transition数。最终checkpoint的`eval_steps`包含已完成评估；被中断的评估没有逐步成本journal，不应把它当作包含所有失败尝试的总成本。
 
 W和C的间隔由`world.log_interval_updates`、`distill.log_interval_windows`配置，阶段最后一次更新始终记录；smoke将两者设为1。full配置的`training.remote_logging: true`在Runner启动时创建W&B在线run；smoke配置为false，保留本地JSONL且不连接W&B。运行前安装`tasks/continual_nav/requirements.txt`并完成`wandb login`；可用`WANDB_PROJECT`和`WANDB_ENTITY`指定目标项目及账号，未指定项目时为`tapd-ctm-continual-nav`。`--wandb-mode offline`可以在不上传的情况下验证W&B日志，`--wandb-mode disabled`仅用于本地测试。
 
-W&B的`ta_W_<task>/*`使用累计世界模型优化器更新数作横轴；X/C/P及评估以累计训练环境步为横轴，P阶段另有以下游Progress步数为横轴的`progress_<task>/success_rate`。`W.collect`没有Loss，F只记录Fisher统计。`metrics.jsonl`保留完整阶段/尝试事件，W&B曲线也可能包含未提交尝试的点；正式恢复点仍以checkpoint为准。W&B run的ID和URL写入`wandb_run.json`。从旧TensorBoard运行恢复时使用原运行目录中的`resolved_config.yaml`和`--wandb-mode online`；仅精确匹配迁移前源码的checkpoint可跨越这次日志迁移。
+W&B的`ta_W_<task>/*`使用累计世界模型优化器更新数作横轴；X/C/P及评估以累计训练环境步为横轴。评估曲线名为`eval_<family>_<split>_<policy>_<evaluated_task>/*`，policy为`kb`、`single`、`active_maze_medium`或`active_fourrooms`；下游另有`progress_<split>_<policy>_<evaluated_task>/success_rate`，使用累计Progress步数。`W.collect`没有Loss，F只记录Fisher统计。`metrics.jsonl`保留完整阶段/尝试事件，W&B曲线也可能包含未提交尝试的点；正式恢复点仍以checkpoint为准。W&B run的ID和URL写入`wandb_run.json`。本次变更不绕过source/config校验恢复旧训练；旧推理artifact仍可读取。
 
 推理导出附SHA-256侧文件，不含replay/optimizer，可通过evaluate CLI直接加载；仍要求配置指向的Maze原图存在且hash相符。完整运行目录较大，checkpoint未自动裁剪，评估深拷贝也有额外内存开销。交付5已验证CPU有限阶段及恢复接口，后续GPU有限W/X/C/F与单列P也已通过；交付6完整760步GPU smoke也已通过。首次seed 0正式长训练已在首轮W.collect完成后按用户要求停止，未完成的W.fit没有提交。
 

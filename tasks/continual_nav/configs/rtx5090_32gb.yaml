@@ -1,6 +1,11 @@
 # RTX 5090 32 GB / 16-core host profile. Stage visits and environment-transition
 # budgets inherit full.yaml unchanged; do not use this file to resume full.yaml runs.
 extends: full.yaml
+replay:
+  fit_cache: memory
+evaluation:
+  backend: subprocess
+  num_envs: 16
 training:
   # Batch more observations per inference call. VectorEnvAdapter still steps
   # environments synchronously, so this does not create CPU parallelism.

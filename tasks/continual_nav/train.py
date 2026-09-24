@@ -21,14 +21,14 @@ from .data.manifest import MazeManifest, build_manifest
 from .data.replay import ReplayBank, ShardedWriter, TransitionStore
 from .data.rollout import collect_fisher
 from .envs import VectorEnvAdapter, build_env
-from .evaluate import evaluate_policy, visual_drift
+from .evaluate import evaluate_policy
 from .learning.common import freeze, prepare_kb, prepare_ppo
 from .learning.distill import run_compress_stage
 from .learning.fisher import estimate_fisher, update_online_fisher
 from .learning.ppo import run_ppo_stage
 from .learning.world import SnapshotCollector, fit_world_model, make_world_optimizer
 from .models import Controller, DualPolicy, SIGReg, SingleActorCritic, StandalonePolicy, VisionEncoder, WorldModel, frozen_copy
-from .schedule import METHODS, RandomStreams, expand_stages
+from .schedule import METHODS, RandomStreams, expand_stages, ends_visit, visit_identity, isolated_rng
 from .wandb_logging import WandbLogger
 
 
@@ -93,6 +93,7 @@ class Runner:
         self.fisher, self.kb_ready, self.fresh, self.pools = None, False, None, {}
         self.vision_source = self.vision_export = None
         self.completed, self.evaluations, self.next_index = [], [], 1
+        self.pending_active = {}
         self.finalized, self._logger = False, None
         self.counters = {name: 0 for name in ("global_env_steps", "world_collect_steps", "explore_steps", "progress_steps",
             "compress_steps", "fisher_steps", "eval_steps", "world_optimizer_updates", "ppo_optimizer_updates",
@@ -216,6 +217,7 @@ class Runner:
                 self.policy.load_state_dict(payload["models"]["dual"])
                 self._track_ticks(self.policy)
         self.fisher = FisherState(**payload["fisher"]) if payload["fisher"] is not None else None
+        self.pending_active = payload.get("pending_active", {})
         if self.fisher is not None:
             from .learning.fisher import validate_fisher
             validate_fisher(self.kb, self.fisher)
@@ -253,7 +255,8 @@ class Runner:
             world_optimizer=self.world_optimizer.state_dict() if self.world_optimizer is not None else None,
             fisher=asdict(self.fisher) if self.fisher is not None else None, kb_ready=self.kb_ready,
             fresh=self.fresh, pools=self.pools, manifests=self.manifests, vision_source=self.vision_source,
-            vision_export=self.vision_export, evaluations=self.evaluations, costs=self.costs(), finalized=self.finalized)
+            vision_export=self.vision_export, pending_active=self.pending_active,
+            evaluations=self.evaluations, costs=self.costs(), finalized=self.finalized)
 
     def _commit(self, key):
         self.marker = ck.commit(self.root, key, self._payload(key))
@@ -276,17 +279,66 @@ class Runner:
             self._logger.finish(exit_code=exit_code)
             self._logger = None
 
-    def _evaluate(self, policy, stage, event, *, drift=False, progress=0):
+    def _evaluate(self, policy, stage, event, *, policy_kind="kb", source_task=None, encoder=None):
         self._evaluating = True
         try:
-            report = evaluate_policy(policy, self.encoder, self.manifest, self.config, drift=drift)
+            report = evaluate_policy(policy, encoder if encoder is not None else self.encoder, self.manifest, self.config)
         finally:
             self._evaluating = False
-        self.counters["eval_steps"] += report["transitions"]
-        item = dict(stage=str(stage.key), event=event, stage_training_steps=progress,
-                    global_training_steps=self.counters["global_env_steps"]+progress, report=report)
-        self.evaluations.append(item)
-        self._event(dict(type="evaluation", **item))
+        family, visit = visit_identity(stage)
+        return dict(stage=str(stage.key), event=event, family=family, visit=visit,
+                    policy_kind=policy_kind, source_task=source_task, split="validation",
+                    evaluation_id=f"{family}/v{visit}/{policy_kind}/{source_task or 'all'}/validation",
+                    stage_training_steps=0, global_training_steps=self.counters["global_env_steps"], report=report)
+
+    def _save_active(self, stage):
+        vision = self.vision_export or self.vision_source
+        if vision is None or not self.encoder.permanently_frozen:
+            raise RuntimeError("P Active snapshot requires the shared frozen vision artifact")
+        path = self.root / "exports/active" / f"v{stage.key.visit}_{stage.key.task}.pt"
+        # The DualPolicy includes its original KB and adapter, not the future C student.
+        ck.save_artifact(path, dict(kind="active_snapshot", family=stage.key.family,
+            visit=stage.key.visit, task=stage.key.task, policy=self.policy.state_dict(),
+            vision=vision, encoder_version=int(self.encoder.encoder_version)))
+        self.pending_active[stage.key.task] = ck.reference(self.root, path)
+
+    def _load_active(self, task, visit):
+        path = ck.verify_reference(self.root, self.pending_active[task])
+        payload = ck.load_artifact(path)
+        if (payload["kind"], payload["family"], payload["visit"], payload["task"]) != (
+                "active_snapshot", "pnc", visit, task):
+            raise ValueError("Active snapshot identity mismatch")
+        # Never reconstruct a historical teacher on self.kb: load_state_dict would
+        # overwrite the live, already compressed KB through shared parameter storage.
+        with isolated_rng():
+            policy = DualPolicy(self.config, StandalonePolicy(self.config))
+            policy.load_state_dict(payload["policy"])
+            encoder = VisionEncoder(self.config)
+            vision = ck.load_artifact(ck.verify_reference(self.root, payload["vision"]))
+            encoder.load_state_dict(vision["encoder"])
+            encoder.freeze(permanent=True)
+        if int(encoder.encoder_version) != payload["encoder_version"]:
+            raise ValueError("Active snapshot encoder version mismatch")
+        self._track_ticks(policy)
+        return policy.to(self.device), encoder.to(self.device)
+
+    def _evaluate_visit(self, stage):
+        rows = [self._evaluate(self.policy if self.single else self.kb, stage, "visit_end",
+                              policy_kind="single" if self.single else "kb")]
+        if stage.key.family == "pnc":
+            for task in self.config.task_order:
+                policy, encoder = self._load_active(task, stage.key.visit)
+                try:
+                    rows.append(self._evaluate(policy, stage, "visit_end", policy_kind="active",
+                                               source_task=task, encoder=encoder))
+                finally:
+                    del policy, encoder
+        # A partial panel/strategy set must not be published as a complete visit.
+        for item in rows:
+            self.counters["eval_steps"] += item["report"]["transitions"]
+            self.evaluations.append(item)
+            self._event(dict(type="evaluation", **item))
+        self.pending_active = {}
 
     def _phase_modes(self):
         return {name: dict(training=module.training, trainable=[n for n, p in module.named_parameters() if p.requires_grad])
@@ -363,8 +415,6 @@ class Runner:
                 self.fresh = ck.reference(self.root, Path(result.manifest))
                 self.counters["world_collect_steps"] += stage.transitions
             elif phase == "W":
-                self._evaluate(self.kb, stage, "before_W", drift=True)
-                old = frozen_copy(self.encoder)
                 fresh = TransitionStore(ck.verify_reference(self.root, self.fresh, replay=True))
                 high_ref = self.pools.get(stage.key.task)
                 high = TransitionStore(ck.verify_reference(self.root, high_ref, replay=True)) if high_ref else None
@@ -376,40 +426,24 @@ class Runner:
                     on_update=world_progress)
                 self.world.commit_fit()
                 self.counters["world_optimizer_updates"] += stage.world_updates
-                self._evaluate(self.kb, stage, "after_W", drift=True)
-                self._evaluating = True
-                try:
-                    drift_result = visual_drift(self.kb, old, self.encoder, self.manifest, self.config)
-                finally:
-                    self._evaluating = False
-                self.counters["eval_steps"] += drift_result["transitions"]
-                drift_item = dict(stage=str(stage.key), event="same_trajectory_KL", report=drift_result)
-                self.evaluations.append(drift_item)
-                self._event(dict(type="visual_drift", **drift_item))
                 self.fresh = None
             elif phase in ("X", "P"):
                 if phase == "X":
                     builder = self.bank.begin(stage.key.task, encoder_version=int(self.encoder.encoder_version),
                         world_version=int(self.world.world_model_version), source_stage=str(stage.key), expected_count=stage.transitions)
-                self._evaluate(self.policy, stage, "start")
-                interval, next_eval = self.config.evaluation.interval_steps, self.config.evaluation.interval_steps
                 def progress(consumed, metrics):
-                    nonlocal next_eval
                     self._event(dict(type="ppo_update", stage=str(stage.key), consumed=consumed, metrics=metrics))
-                    if consumed >= next_eval and consumed < stage.transitions:
-                        self._evaluate(self.policy, stage, "interval", progress=consumed)
-                        next_eval += interval
                 result = run_ppo_stage(envs, self.policy, self.encoder, self.config, phase=phase, steps=stage.transitions,
                     action_rng=self.rng.torch["policy_action"], minibatch_rng=self.rng.torch["ppo_shuffle"],
                     world=self.world if phase == "X" else None, high_error=builder,
                     start_transition_id=self.counters["global_env_steps"], on_rollout=progress)
-                self._evaluate(self.policy, stage, "end", progress=stage.transitions)
+                if phase == "P" and not self.single:
+                    self._save_active(stage)
                 self.counters["ppo_optimizer_updates"] += result["updates"]
                 self.counters["explore_steps" if phase == "X" else "progress_steps"] += stage.transitions
                 if builder is not None:
                     self.pools[stage.key.task] = ck.reference(self.root, Path(result["pool_manifest"]))
             elif phase == "C":
-                self._evaluate(self.kb, stage, "start")
                 def distill_progress(consumed, updates, metrics):
                     self._event(dict(type="distill_update", stage=str(stage.key), consumed=consumed,
                         distill_optimizer_updates=self.counters["distill_optimizer_updates"]+updates, metrics=metrics))
@@ -421,7 +455,6 @@ class Runner:
                 metrics = result["last"]
                 self.kb_ready = True
                 self.policy = None  # The teacher is no longer needed at a C boundary.
-                self._evaluate(self.kb, stage, "end", progress=stage.transitions)
             else:
                 sequences = collect_fisher(envs, self.kb, self.encoder, self.config, action_rng=self.rng.torch["policy_action"],
                     fisher_rng=self.rng.torch["fisher"], start_transition_id=self.counters["global_env_steps"])
@@ -434,6 +467,8 @@ class Runner:
             if attempt["confirmed_env_steps"] != stage.transitions:
                 raise RuntimeError("actual stage interactions do not match its exact budget")
             self.counters["global_env_steps"] += stage.transitions
+            if ends_visit(self.stages, self.next_index):
+                self._evaluate_visit(stage)
             self.completed.append(str(stage.key)); self.next_index += 1
             if metrics:
                 self._event(dict(type="learner_update", stage=str(stage.key), metrics=metrics))
@@ -499,9 +534,21 @@ class Runner:
         self.counters["eval_steps"] += result["transitions"]
         result.update(method=self.method, seed=self.seed, training_task=self.task, costs=self.costs())
         ck.atomic_json(self.root / "evaluation/final_test.json", result)
-        matrix = [{task: item["report"]["tasks"][task]["success_rate"] for task in TASKS}
-                  for item in self.evaluations if item["event"] == "end" and item["stage"].endswith("/C")]
-        ck.atomic_json(self.root / "evaluation/forgetting.json", dict(success_matrix=matrix, forgetting=forgetting(matrix)))
+        family, visit = visit_identity(self.stages[-1])
+        item = dict(stage=self.completed[-1], event="final_test", family=family, visit=visit,
+            policy_kind="single" if self.single else "kb", source_task=None, split="test",
+            evaluation_id=f"{family}/final/{'single' if self.single else 'kb'}/test",
+            global_training_steps=self.counters["global_env_steps"], stage_training_steps=0, report=result)
+        self.evaluations.append(item)
+        self._event(dict(type="evaluation", **item))
+        matrices = {}
+        for family in ("ta", "pnc"):
+            rows = [item for item in self.evaluations if item.get("family") == family
+                    and item.get("policy_kind") == "kb" and item["event"] == "visit_end"]
+            matrix = [{task: item["report"]["tasks"][task]["success_rate"] for task in TASKS} for item in rows]
+            matrices[family] = dict(visits=[row["visit"] for row in rows],
+                                    success_matrix=matrix, forgetting=forgetting(matrix))
+        ck.atomic_json(self.root / "evaluation/forgetting.json", matrices)
         ck.save_artifact(output, dict(kind="inference", method=self.method, seed=self.seed, task=self.task,
             policy_kind="single" if self.single else "dual", config=resolved_dict(self.config),
             encoder=self.encoder.state_dict(), policy=policy.state_dict(), maze_manifest=asdict(self.manifest), costs=self.costs()))

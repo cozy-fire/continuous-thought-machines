@@ -24,6 +24,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(budget_summary(full)["world_updates"], 80000)
         self.assertEqual(budget_summary(smoke)["main_steps"], 760)
         self.assertEqual(budget_summary(smoke)["world_updates"], 8)
+        rtx = load_config(CONFIGS / "rtx5090_32gb.yaml")
+        self.assertEqual(budget_summary(rtx)["main_steps"], budget_summary(full)["main_steps"])
+        self.assertEqual((rtx.world.batch_size, rtx.world.updates_per_round), (512, 2500))
+        self.assertEqual(budget_summary(rtx)["world_updates"], 40000)
+        for config in (full, rtx):
+            self.assertEqual(config.replay.fit_cache, "memory")
+            self.assertEqual((config.evaluation.backend, config.evaluation.num_envs), ("subprocess", 16))
+        self.assertEqual(smoke.evaluation.num_envs, 2)
         for name in ("vision", "ctm", "attention", "observation", "sigreg"):
             self.assertEqual(getattr(full, name), getattr(smoke, name))
         self.assertEqual(smoke.distill.burnin_env_obs, 10)
@@ -74,6 +82,9 @@ class ConfigTests(unittest.TestCase):
                    replace(c, world=replace(c.world, log_interval_updates=0)),
                    replace(c, distill=replace(c.distill, log_interval_windows=0)),
                    replace(c, fisher=replace(c.fisher, scored_samples=4097)),
+                   replace(c, replay=replace(c.replay, fit_cache="unknown")),
+                   replace(c, evaluation=replace(c.evaluation, backend="unknown")),
+                   replace(c, evaluation=replace(c.evaluation, num_envs=0)),
                    replace(c, environment=replace(c.environment, max_steps=301)),
                    replace(c, evaluation=replace(c.evaluation, drift_episodes=201))]
         for item in invalid:

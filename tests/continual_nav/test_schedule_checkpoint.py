@@ -14,7 +14,7 @@ from fixtures import map_file
 from tasks.continual_nav import checkpoint as ck
 from tasks.continual_nav.config import Config, load_config, resolved_dict
 from tasks.continual_nav.data.manifest import build_manifest
-from tasks.continual_nav.schedule import METHODS, RandomStreams, derive_seed, expand_stages
+from tasks.continual_nav.schedule import METHODS, RandomStreams, derive_seed, expand_stages, ends_visit
 from tasks.continual_nav.train import Runner, _PRE_WANDB_SOURCES, _validate_resume_sources
 from tasks.continual_nav.evaluate import load_for_evaluation
 from tasks.continual_nav.verify_models import tensor_hash
@@ -61,6 +61,9 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(sum(s.key.phase == "F" for s in main), 22)
         self.assertEqual(sum(s.key.subphase == "collect" for s in main), 16)
         self.assertEqual(sum(s.world_updates for s in main), 80000)
+        boundaries = [s for i, s in enumerate(main) if ends_visit(main, i)]
+        self.assertEqual([s.key.family for s in boundaries], ["ta"]*4+["pnc"]*3)
+        self.assertTrue(all(s.key.phase == "F" and s.key.task == "fourrooms" for s in boundaries))
         self.assertEqual([s.ordinal for s in main], list(range(len(main))))
         smoke = load_config("tasks/continual_nav/configs/smoke.yaml")
         self.assertEqual([sum(s.transitions for s in expand_stages(smoke, method, "maze_medium" if method == METHODS[1] else None))
@@ -103,8 +106,7 @@ class BoundaryTests(unittest.TestCase):
                          pnc=replace(base.pnc, progress_steps=4, compress_steps=4),
                          fisher=replace(base.fisher, collect_steps=4, scored_samples=2))
         self.patches = [patch("tasks.continual_nav.train.prepare_manifest", return_value=self.manifest),
-                        patch("tasks.continual_nav.train.evaluate_policy", side_effect=fake_evaluate),
-                        patch("tasks.continual_nav.train.visual_drift", return_value=dict(transitions=2, tasks={}))]
+                        patch("tasks.continual_nav.train.evaluate_policy", side_effect=fake_evaluate)]
         for p in self.patches:
             p.start(); self.addCleanup(p.stop)
 
@@ -216,6 +218,79 @@ class BoundaryTests(unittest.TestCase):
         before_compress = {**a.counters, "global_env_steps": 4}
         distill_row, _ = scalar_payload(distill, before_compress)
         self.assertEqual(distill_row["global_env_steps"], 8)
+
+    def test_visit_active_survives_compress_restore_and_is_storage_isolated(self):
+        a = self.runner("visit", method=METHODS[3], vision_checkpoint=self.vision())
+        a.run_next()  # First-task P.
+        expected = tensor_hash(a.policy)
+        ref = dict(a.pending_active["maze_medium"])
+        self.assertEqual(a.evaluations, [])
+        a.run_next()  # First-task C drops the live teacher.
+        a = self.runner("visit", method=METHODS[3], resume=True)
+        snapshot, encoder = a._load_active("maze_medium", 0)
+        self.assertEqual(tensor_hash(snapshot), expected)
+        self.assertEqual(tensor_hash(encoder), tensor_hash(a.encoder))
+        self.assertFalse({p.data_ptr() for p in snapshot.parameters()} & {p.data_ptr() for p in a.kb.parameters()})
+        while a.next_index < len(a.stages):
+            a.run_next()
+        rows = [row for row in a.evaluations if row["event"] == "visit_end"]
+        self.assertEqual([(r["policy_kind"], r["source_task"]) for r in rows],
+                         [("kb", None), ("active", "maze_medium"), ("active", "fourrooms")])
+        self.assertEqual(len({row["evaluation_id"] for row in rows}), 3)
+        self.assertTrue(all(row["global_training_steps"] == 24 for row in rows))
+        payload = ck.load_artifact(ck.verify_reference(a.root, ref))
+        snapshot.load_state_dict(payload["policy"])
+        self.assertEqual(tensor_hash(snapshot), expected)
+        self.assertEqual(a.pending_active, {})
+        before = len(a.evaluations)
+        resumed = self.runner("visit", method=METHODS[3], resume=True)
+        self.assertFalse(resumed.run_next())
+        resumed.finalize()
+        self.assertEqual(len(resumed.evaluations), before)
+        prefixes = []
+        for row in rows:
+            _, axes = scalar_payload(dict(type="evaluation", downstream_progress_steps=8, **row), a.counters)
+            prefixes.append(set(axes))
+        self.assertFalse(prefixes[0] & prefixes[1] or prefixes[1] & prefixes[2])
+        matrices = json.loads((a.root / "evaluation/forgetting.json").read_text())
+        self.assertEqual(matrices["ta"]["success_matrix"], [])
+        self.assertEqual(len(matrices["pnc"]["success_matrix"]), 1)
+
+    def test_failed_visit_does_not_publish_partial_evaluation(self):
+        a = self.runner("failure_visit", method=METHODS[3], vision_checkpoint=self.vision())
+        for _ in range(5):
+            a.run_next()
+        previous = a.marker
+        with patch("tasks.continual_nav.train.evaluate_policy",
+                   side_effect=[fake_evaluate(), RuntimeError("panel failed")]):
+            with self.assertRaisesRegex(RuntimeError, "panel failed"):
+                a.run_next()
+        self.assertEqual(a.evaluations, [])
+        self.assertEqual(a.marker, previous)
+        restored = self.runner("failure_visit", method=METHODS[3], resume=True)
+        self.assertEqual(set(restored.pending_active), {"maze_medium", "fourrooms"})
+        restored.run_next()
+        self.assertTrue(restored.finalized)
+
+    def test_corrupt_pending_active_is_rejected_on_resume(self):
+        a = self.runner("corrupt_active", method=METHODS[3], vision_checkpoint=self.vision())
+        a.run_next()
+        path = ck.contained(a.root, a.pending_active["maze_medium"]["path"])
+        with path.open("ab") as stream:
+            stream.write(b"corrupt")
+        with self.assertRaisesRegex(ValueError, "corrupt"):
+            self.runner("corrupt_active", method=METHODS[3], resume=True)
+
+    def test_multiple_visits_clear_pending_without_overwriting_old_snapshots(self):
+        self.c = replace(self.c, pnc=replace(self.c.pnc, visits=2))
+        run = self.runner("multi_visit", method=METHODS[3], vision_checkpoint=self.vision())
+        while run.next_index < len(run.stages):
+            run.run_next()
+        rows = [r for r in run.evaluations if r["event"] == "visit_end"]
+        self.assertEqual([r["visit"] for r in rows], [0, 0, 0, 1, 1, 1])
+        self.assertEqual(len({r["evaluation_id"] for r in rows}), 6)
+        self.assertEqual(len(list((run.root / "exports/active").glob("*.pt"))), 4)
+        self.assertEqual(run.pending_active, {})
 
     def test_wandb_offline_run_records_training_and_evaluation(self):
         root = self.root / "wandb-offline"

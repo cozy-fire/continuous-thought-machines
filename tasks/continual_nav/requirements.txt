@@ -2,3 +2,4 @@
 PyYAML>=6.0,<7
 Pillow>=9.1
 wandb>=0.21,<1
+psutil>=5.9,<8  # Process-tree RSS sampling in verify_performance.

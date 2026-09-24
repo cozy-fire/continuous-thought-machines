@@ -132,7 +132,7 @@ class ShardedWriter:
 
 
 class TransitionStore:
-    """Read-only store with a single decompressed-shard cache, never a full replay tensor."""
+    """Validated disk store with an optional, explicitly scoped uint8 memory cache."""
     def __init__(self, manifest: str | Path):
         self.manifest = Path(manifest).resolve()
         self.header = json.loads(self.manifest.read_text(encoding="utf-8"))
@@ -155,6 +155,50 @@ class TransitionStore:
             raise ValueError("replay count mismatch")
         self._cache_index = -1
         self._cache: dict[str, np.ndarray] = {}
+        self._memory: dict[str, np.ndarray] | None = None
+
+    def preload(self) -> int:
+        """Decode each shard once without holding a second full-pool copy."""
+        if self._memory is not None:
+            return sum(a.nbytes for a in self._memory.values())
+        arrays = dict(obs=np.empty((self.count, *OBS_SHAPE), dtype=np.uint8),
+                      next_obs=np.empty((self.count, *OBS_SHAPE), dtype=np.uint8),
+                      metadata=np.empty(self.count, dtype=META))
+        start = 0
+        try:
+            for index, end in enumerate(self._ends):
+                data = self._load(index)
+                for name in arrays:
+                    arrays[name][start:end] = data[name]
+                start = end
+            # Publish only a completely loaded cache; failures cannot expose partial data.
+            self._memory = arrays
+        finally:
+            self._cache_index, self._cache = -1, {}
+        return sum(a.nbytes for a in arrays.values())
+
+    def release(self) -> None:
+        self._memory = None
+        self._cache_index, self._cache = -1, {}
+
+    def take_arrays(self, indices: np.ndarray) -> dict[str, np.ndarray]:
+        """Return owning batch arrays in request order, including repeated indices."""
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.ndim != 1 or np.any(indices < 0) or np.any(indices >= self.count):
+            raise IndexError("invalid replay indices")
+        if self._memory is not None:
+            return {name: array[indices] for name, array in self._memory.items()}
+        result = dict(obs=np.empty((len(indices), *OBS_SHAPE), dtype=np.uint8),
+                      next_obs=np.empty((len(indices), *OBS_SHAPE), dtype=np.uint8),
+                      metadata=np.empty(len(indices), dtype=META))
+        shards = np.searchsorted(self._ends, indices, side="right")
+        for shard in np.unique(shards):
+            slots = np.flatnonzero(shards == shard)
+            start = 0 if shard == 0 else self._ends[shard-1]
+            data = self._load(int(shard))
+            for name in result:
+                result[name][slots] = data[name][indices[slots]-start]
+        return result
 
     def __len__(self) -> int:
         return self.count
@@ -338,11 +382,12 @@ def sample_world_batch(fresh: TransitionStore, high: TransitionStore | None, *, 
     high_count = int(batch_size*high_fraction) if high is not None and len(high) else 0
     fresh_count = batch_size-high_count
     # Both pools are uniform with replacement; scores only determine membership.
-    records = fresh.take(rng.integers(len(fresh), size=fresh_count))
+    arrays = fresh.take_arrays(rng.integers(len(fresh), size=fresh_count))
     if high_count:
-        records += high.take(rng.integers(len(high), size=high_count))
-    return WorldBatch(torch.from_numpy(np.stack([r.obs for r in records])),
-                      torch.from_numpy(np.stack([r.transition_next_obs for r in records])),
-                      torch.tensor([r.action for r in records], dtype=torch.int64),
-                      torch.tensor([r.transition_id for r in records], dtype=torch.int64),
+        extra = high.take_arrays(rng.integers(len(high), size=high_count))
+        arrays = {name: np.concatenate((value, extra[name])) for name, value in arrays.items()}
+    return WorldBatch(torch.from_numpy(arrays["obs"]),
+                      torch.from_numpy(arrays["next_obs"]),
+                      torch.from_numpy(arrays["metadata"]["action"].copy()),
+                      torch.from_numpy(arrays["metadata"]["transition_id"].copy()),
                       torch.arange(batch_size) >= fresh_count, task)

@@ -59,7 +59,7 @@ $\text{sg}$ 表示停止梯度；横向信息与Active上一tick激活**相加**
 | F：Fisher | KB自身轨迹上的无奖励策略Fisher估计 | 仅更新重要性统计和参数中心，不更新权重 |
 | P：Progress | 外在任务奖励下的循环PPO-clip | Active、Adapter、Critic |
 
-E只在W拟合时更新，其他阶段冻结参数与BN统计。Task-Agnostic期间W可能改变固定KB在新视觉下的行为，因此每次W前后都评估KB及同轨迹策略KL；TA结束后E永久冻结。
+E只在W拟合时更新，其他阶段冻结参数与BN统计；TA结束后E永久冻结。W拟合前将当前任务的fresh和high-error像素回放解压到内存，采样分布与训练目标不变。
 
 ## 3. W：预测驱动的视觉学习
 
@@ -144,4 +144,4 @@ $$
 
 单任务CTM、顺序PPO以及不含探索蒸馏的P&C对照，共享同seed主方法TA结束后的冻结视觉权重，但独立初始化控制器；因此它们属于**共享视觉预训练条件下的对照**。报告区分共享TA成本与各组新增训练成本。
 
-主方法最终使用E+KB，单列对照使用E及自身策略，在固定独立地图/布局上执行argmax策略，评估成功率、回报、episode长度及跨任务遗忘；另记录Active学习过程和W引起的视觉行为漂移。当前完整smoke验证了训练与恢复流程，尚不构成跨任务性能结论。运行与复现实验说明见[实现文档](tasks/continual_nav/README.md)。
+一次visit包含依次完成两个任务的全部训练轮次。TA仅在visit结束评估当前KB；P&C在visit结束评估最终KB及两个任务各自P结束时的Active，每个策略都测试两个任务。Active保留当时的Adapter和旧KB，视觉编码器在P&C期间冻结。评估采用固定面板、argmax策略、并行环境和批量推理，记录成功率、回报、episode长度及KB跨visit遗忘；训练结束另对最终策略执行独立test。主方法最终使用E+KB，单列对照使用E及自身策略。完整smoke验证训练与恢复流程，不构成跨任务性能结论。运行与复现实验说明见[实现文档](tasks/continual_nav/README.md)。

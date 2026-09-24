@@ -245,6 +245,11 @@ def verify(config: Config, output: Path, manifest: Path) -> None:
     for name, value in expected.items():
         assert runner.counters[name] == value, name
     assert runner.fisher.completed_compressions == 6 and int(runner.encoder.encoder_version) == 4
+    visits = [row for row in runner.evaluations if row["event"] == "visit_end"]
+    assert [(r["family"], r["policy_kind"], r["source_task"]) for r in visits] == [
+        ("ta", "kb", None), ("pnc", "kb", None),
+        ("pnc", "active", "maze_medium"), ("pnc", "active", "fourrooms")]
+    assert not runner.pending_active
     for label, expected_name in (("W", "X"), ("X", "C")):
         with (output / f"recovery_{label}.log").open("w", encoding="utf-8") as stream:
             subprocess.run([sys.executable, "-m", "tasks.continual_nav.verify_smoke", "--resume-probe",
@@ -277,6 +282,8 @@ def verify(config: Config, output: Path, manifest: Path) -> None:
             main_evaluation=runner.counters["eval_steps"], exported_policy_recheck=test["transitions"],
             trajectory_steps=sum(x["transitions"] for x in trajectories.values())),
         final_export_matches=True, fixed_test_recheck_matches=True, baselines_trained=False)
+    report["visit_evaluations"] = [{key: row[key] for key in (
+        "evaluation_id", "family", "visit", "policy_kind", "source_task", "global_training_steps")} for row in visits]
     ck.atomic_json(output / "smoke_report.json", report)
     (output / "smoke_report.md").write_text("# Complete continual navigation smoke\n\n"
         "Status: passed. Main training: 760 transitions; world updates: 8.\n\n"

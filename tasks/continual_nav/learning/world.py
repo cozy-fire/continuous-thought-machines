@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import hashlib
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -112,10 +113,18 @@ def fit_world_model(world: WorldModel, regularizer: SIGReg, fresh: TransitionSto
     world.set_fit_mode()
     completed = False
     metrics: dict[str, float | int] = {}
+    stores = [fresh] + ([high] if high is not None else [])
     try:
+        started = perf_counter()
+        cache_bytes = sum(store.preload() for store in stores) if config.replay.fit_cache == "memory" else 0
+        preload_seconds = perf_counter()-started
+        sample_seconds = 0.
+        fit_started = perf_counter()
         for update in range(config.world.updates_per_round):
+            sample_started = perf_counter()
             batch = sample_world_batch(fresh, high, task=task, batch_size=config.world.batch_size,
                                       high_fraction=config.replay.high_error_fraction, rng=replay_rng)
+            sample_seconds += perf_counter()-sample_started
             optimizer.zero_grad(set_to_none=True)
             prediction = world.transition(batch.obs.to(device), batch.next_obs.to(device), batch.actions.to(device))
             directions = regularizer.sample_directions(prediction.z.shape[1], sigreg_rng, device)
@@ -128,12 +137,18 @@ def fit_world_model(world: WorldModel, regularizer: SIGReg, fresh: TransitionSto
             optimizer.step()
             metrics = dict(updates=update+1, loss=loss.item(), forward_mse=mse.item(), sigreg=sigreg.item(),
                            grad_norm=float(grad_norm), high_count=int(batch.from_high_error.sum()),
-                           fresh_count=int((~batch.from_high_error).sum()))
+                           fresh_count=int((~batch.from_high_error).sum()),
+                           replay_loaded_records=sum(len(store) for store in stores) if cache_bytes else 0,
+                           replay_cache_bytes=cache_bytes, replay_preload_seconds=preload_seconds,
+                           replay_sample_seconds=sample_seconds, fit_seconds=perf_counter()-fit_started)
             if on_update is not None and ((update+1) % config.world.log_interval_updates == 0
                                           or update+1 == config.world.updates_per_round):
                 on_update(update+1, metrics)
         completed = True
     finally:
+        # Cache ownership ends at this fit, including partial preload or optimizer failures.
+        for store in stores:
+            store.release()
         # A failure never publishes versions and never leaves BN in training mode.
         world.freeze()
         world._fit_complete = completed

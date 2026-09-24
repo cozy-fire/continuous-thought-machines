@@ -65,6 +65,16 @@ def derive_seed(seed: int, method: str, task: str | None, stream: str, ordinal: 
                .generate_state(1, dtype=np.uint64)[0]) % (2**63-1)
 
 
+def visit_identity(stage: Stage) -> tuple[str, int | None]:
+    key = stage.key
+    return key.family, key.segment if key.family == "single" else key.visit
+
+
+def ends_visit(stages: list[Stage], index: int) -> bool:
+    return stages[index].key.family != "init" and (
+        index+1 == len(stages) or visit_identity(stages[index]) != visit_identity(stages[index+1]))
+
+
 class RandomStreams:
     def __init__(self, seed: int, method: str, task: str | None):
         self.identity = (seed, method, task)

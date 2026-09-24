@@ -124,6 +124,8 @@ class WorldTests(unittest.TestCase):
                     replay_rng=np.random.default_rng(8), sigreg_rng=torch.Generator().manual_seed(9),
                     on_update=lambda step, metrics: logged.append((step, dict(metrics))))
                 self.assertEqual(result["updates"], 2)
+                self.assertIsNone(fresh._memory)
+                self.assertGreater(result["replay_cache_bytes"], 0)
                 self.assertEqual([step for step, _ in logged], [1, 2])
                 self.assertEqual(logged[-1][1], result)
                 self.assertEqual(int(world.world_model_version), version)
@@ -138,6 +140,7 @@ class WorldTests(unittest.TestCase):
                     fit_world_model(world, reg, fresh, None, optimizer, c, task="maze_medium",
                         replay_rng=np.random.default_rng(8), sigreg_rng=torch.Generator().manual_seed(9))
             self.assertEqual(int(world.world_model_version), 2)
+            self.assertIsNone(fresh._memory)
             self.assertFalse(world.training)
             with self.assertRaises(RuntimeError):
                 world.commit_fit()

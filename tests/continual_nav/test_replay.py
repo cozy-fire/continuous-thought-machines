@@ -2,6 +2,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -130,6 +131,39 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(full.transition_ids.tolist(), [0]*128+[50]*128)
         with self.assertRaises(ValueError):
             sample(self.pool([20], [1], "fourrooms"))
+
+    def test_memory_batches_exactly_match_disk_without_reads(self):
+        fresh = fresh_store(self.root / "fresh", 7)
+        high = self.pool([10, 20, 30], [1, 2, 3])
+        for use_high in (False, True):
+            disk_rng = np.random.default_rng(19)
+            memory_rng = np.random.default_rng(19)
+            def sample(rng):
+                return sample_world_batch(fresh, high if use_high else None, task="maze_medium",
+                                          batch_size=20, high_fraction=.5, rng=rng)
+            expected = [sample(disk_rng) for _ in range(3)]
+            self.assertGreater(fresh.preload(), 0)
+            high.preload()
+            with patch("numpy.load", side_effect=AssertionError("unexpected disk read")), \
+                 patch.object(Path, "open", side_effect=AssertionError("unexpected file read")):
+                for reference in expected:
+                    actual = sample(memory_rng)
+                    for name in ("obs", "next_obs", "actions", "transition_ids", "from_high_error"):
+                        torch.testing.assert_close(getattr(actual, name), getattr(reference, name), atol=0, rtol=0)
+                arrays = fresh.take_arrays(np.array([6, 0, 6, 2]))
+                self.assertEqual(arrays["metadata"]["transition_id"].tolist(), [6, 0, 6, 2])
+            self.assertEqual(disk_rng.bit_generator.state, memory_rng.bit_generator.state)
+            fresh.release(); high.release()
+            self.assertIsNone(fresh._memory)
+            self.assertEqual(fresh._cache, {})
+
+    def test_failed_preload_does_not_publish_partial_cache(self):
+        fresh = fresh_store(self.root / "fresh", 5)
+        with patch.object(fresh, "_load", side_effect=MemoryError("injected")):
+            with self.assertRaises(MemoryError):
+                fresh.preload()
+        self.assertIsNone(fresh._memory)
+        self.assertEqual(fresh._cache, {})
 
 
 if __name__ == "__main__":

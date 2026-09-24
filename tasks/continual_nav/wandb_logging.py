@@ -38,17 +38,28 @@ def scalar_payload(event: dict, counters: dict[str, int]) -> tuple[dict, dict[st
 
     if event["type"] == "evaluation":
         row["evaluation_event"] = event["event"]
+        identity = event.get("policy_kind", "kb")
+        if event.get("source_task"):
+            identity += "_"+event["source_task"]
+        row.update(evaluation_id=event.get("evaluation_id"), evaluation_visit=event.get("visit"),
+                   evaluation_policy=identity)
+        split = event.get("split", "validation")
         for evaluated_task, metrics in event["report"]["tasks"].items():
-            prefix = f"eval_{evaluated_task}"
+            prefix = f"eval_{parts[0]}_{split}_{identity}_{evaluated_task}"
             axes[prefix] = "global_env_steps"
             for name, metric in metrics.items():
                 if isinstance(metric, (int, float)):
                     row[f"{prefix}/{name}"] = metric
                     row[f"{prefix}/{event['event']}_{name}"] = metric
-            if phase == "P":
-                progress_prefix = f"progress_{evaluated_task}"
+            if parts[0] in ("pnc", "single", "seq"):
+                progress_prefix = f"progress_{split}_{identity}_{evaluated_task}"
                 axes[progress_prefix] = "downstream_progress_steps"
                 row[f"{progress_prefix}/success_rate"] = metrics["success_rate"]
+        prefix = f"eval_{parts[0]}_{split}_{identity}_performance"
+        axes[prefix] = "global_env_steps"
+        for name in ("elapsed_seconds", "episodes_per_second", "transitions"):
+            if name in event["report"]:
+                row[f"{prefix}/{name}"] = event["report"][name]
 
     if event["type"] == "visual_drift":
         for evaluated_task, metrics in event["report"]["tasks"].items():
