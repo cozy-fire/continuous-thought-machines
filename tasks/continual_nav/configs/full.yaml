@@ -52,7 +52,7 @@ agnostic:
   rounds_per_task: 2
 world:
   collect_steps_per_round: 100000
-  updates_per_round: 5000
+  updates_per_round: 100000
   log_interval_updates: 50
   batch_size: 256
   projection_dim: 128
@@ -82,7 +82,7 @@ replay:
   retention: latest_exploration_topk_per_task
   shard_size: 2048
 exploration:
-  steps_per_round: 300000
+  steps_per_round: 10000
 ppo:
   rollout_steps: 50
   num_minibatches: 4
@@ -106,7 +106,7 @@ ppo:
   target_kl: null
   lr_schedule: linear_per_stage
 distill:
-  agnostic_steps_per_round: 300000
+  agnostic_steps_per_round: 150000
   learning_steps: 50
   log_interval_windows: 10
   burnin_ticks: 20

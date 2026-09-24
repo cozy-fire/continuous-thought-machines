@@ -19,15 +19,21 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(smoke.training.remote_logging)
         self.assertEqual((full.world.log_interval_updates, full.distill.log_interval_windows), (50, 10))
         self.assertEqual((smoke.world.log_interval_updates, smoke.distill.log_interval_windows), (1, 1))
-        self.assertEqual(budget_summary(full)["main_steps"], 32290112)
-        self.assertEqual(budget_summary(full)["all_methods_steps"], 83314688)
-        self.assertEqual(budget_summary(full)["world_updates"], 80000)
+        self.assertEqual(budget_summary(full)["main_steps"], 25250112)
+        self.assertEqual(budget_summary(full)["all_methods_steps"], 76274688)
+        self.assertEqual(budget_summary(full)["world_updates"], 1600000)
         self.assertEqual(budget_summary(smoke)["main_steps"], 760)
         self.assertEqual(budget_summary(smoke)["world_updates"], 8)
         rtx = load_config(CONFIGS / "rtx5090_32gb.yaml")
         self.assertEqual(budget_summary(rtx)["main_steps"], budget_summary(full)["main_steps"])
-        self.assertEqual((rtx.world.batch_size, rtx.world.updates_per_round), (512, 2500))
-        self.assertEqual(budget_summary(rtx)["world_updates"], 40000)
+        self.assertEqual((rtx.agnostic, rtx.pnc, rtx.world.collect_steps_per_round,
+                          rtx.exploration.steps_per_round, rtx.distill.agnostic_steps_per_round),
+                         (full.agnostic, full.pnc, full.world.collect_steps_per_round,
+                          full.exploration.steps_per_round, full.distill.agnostic_steps_per_round))
+        self.assertEqual((rtx.world.batch_size, rtx.world.updates_per_round), (512, 50000))
+        self.assertEqual(rtx.world.batch_size * rtx.world.updates_per_round,
+                         full.world.batch_size * full.world.updates_per_round)
+        self.assertEqual(budget_summary(rtx)["world_updates"], 800000)
         for config in (full, rtx):
             self.assertEqual(config.replay.fit_cache, "memory")
             self.assertEqual((config.evaluation.backend, config.evaluation.num_envs), ("subprocess", 16))
