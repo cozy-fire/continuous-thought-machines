@@ -11,10 +11,9 @@ training:
   # environments synchronously, so this does not create CPU parallelism.
   num_envs: 16
 world:
-  # 512 * 50000 = 256 * 100000 sampled transitions per W.fit round.
-  # The larger batch changes optimization even though sample exposure matches.
+  # 512 * 20000 = 10,240,000 sampled transitions per W.fit round.
   batch_size: 512
-  updates_per_round: 50000
+  updates_per_round: 20000
 ppo:
   # Four full-environment groups preserve 50-step recurrent trajectories.
   # Each minibatch has 4 * 50 = 200 transitions instead of 2 * 50 = 100.

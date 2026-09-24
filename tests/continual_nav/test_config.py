@@ -30,10 +30,9 @@ class ConfigTests(unittest.TestCase):
                           rtx.exploration.steps_per_round, rtx.distill.agnostic_steps_per_round),
                          (full.agnostic, full.pnc, full.world.collect_steps_per_round,
                           full.exploration.steps_per_round, full.distill.agnostic_steps_per_round))
-        self.assertEqual((rtx.world.batch_size, rtx.world.updates_per_round), (512, 50000))
-        self.assertEqual(rtx.world.batch_size * rtx.world.updates_per_round,
-                         full.world.batch_size * full.world.updates_per_round)
-        self.assertEqual(budget_summary(rtx)["world_updates"], 800000)
+        self.assertEqual((rtx.world.batch_size, rtx.world.updates_per_round), (512, 20000))
+        self.assertEqual(rtx.world.batch_size * rtx.world.updates_per_round, 10240000)
+        self.assertEqual(budget_summary(rtx)["world_updates"], 320000)
         for config in (full, rtx):
             self.assertEqual(config.replay.fit_cache, "memory")
             self.assertEqual((config.evaluation.backend, config.evaluation.num_envs), ("subprocess", 16))
