@@ -103,7 +103,7 @@ X仅使用此奖励，不混合外在奖励。每个任务保留本轮误差最�
 
 P使用外在任务奖励：在episode第 $t$ 步成功时奖励为 $1-0.9t/300$，其余步骤为0；每个episode最多300步。它鼓励更快成功，但没有逐步负奖励。
 
-两个阶段使用相同的循环PPO-clip目标。令 $\rho_t=\pi_\theta(a_t\mid H_t)/\pi_{\mathrm{old}}(a_t\mid H_t)$，$H_t$ 表示循环策略所依赖的观察历史，则最小化：
+两个阶段使用相同的循环PPO-clip目标。令 $\rho_t=\frac{\pi_\theta(a_t\mid H_t)}{\pi_{\mathrm{old}}(a_t\mid H_t)}$，$H_t$ 表示循环策略所依赖的观察历史，则最小化：
 
 $$
 \mathcal L_{\mathrm{PPO}}=
