@@ -32,7 +32,7 @@ python -m tasks.continual_nav.config --config tasks/continual_nav/configs/rtx509
 python -m tasks.continual_nav.train --config tasks/continual_nav/configs/rtx5090_32gb.yaml --method tapd_ctm_visual_revisit --dry-run
 ```
 
-`--dry-run` 会读取迷宫地图并生成阶段表，但不开始训练。当前正式配置为 4 个 TA visits、每任务每 visit 2 轮、每轮 X 500,000 环境步；**不要抄旧数字开展新运行**，以命令解析结果为准。`rtx5090_32gb.yaml` 是配置名称，不证明实际 GPU 为 RTX 5090；用 `nvidia-smi` 核对型号和显存。
+`--dry-run` 会读取迷宫地图并生成阶段表，但不开始训练。当前正式配置为 4 个 TA visits、每任务每 visit 2 轮、每轮 X 1,000,000 环境步；**不要抄旧数字开展新运行**，以命令解析结果为准。`rtx5090_32gb.yaml` 是配置名称，不证明实际 GPU 为 RTX 5090；用 `nvidia-smi` 核对型号和显存。
 
 ## 3. 不可混淆的方法契约
 

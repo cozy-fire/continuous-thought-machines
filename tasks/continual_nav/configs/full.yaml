@@ -58,7 +58,7 @@ sigreg:
   knots: 17
   t_max: 3.0
 exploration:
-  steps_per_round: 500000
+  steps_per_round: 1000000
   history_length: 20
   similarity_threshold: 0.999
   min_gap_weight: 0.2
