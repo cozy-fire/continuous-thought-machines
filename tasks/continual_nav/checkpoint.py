@@ -10,9 +10,15 @@ import uuid
 
 import torch
 
-from .data.replay import TransitionStore, file_hash
-
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def source_manifest() -> dict[str, str]:
@@ -62,12 +68,10 @@ def reference(root: Path, path: Path) -> dict:
     return dict(path=path.resolve().relative_to(root.resolve()).as_posix(), sha256=file_hash(path))
 
 
-def verify_reference(root: Path, ref: dict, *, replay: bool = False) -> Path:
+def verify_reference(root: Path, ref: dict) -> Path:
     path = contained(root, ref["path"])
     if not path.is_file() or file_hash(path) != ref["sha256"]:
         raise ValueError(f"missing/corrupt checkpoint dependency: {path}")
-    if replay:
-        TransitionStore(path)  # Validate every shard, not only its manifest.
     return path
 
 
@@ -76,7 +80,7 @@ def commit(root: Path, stage_key: str, payload: dict) -> Path:
     path = root / "checkpoints" / (name+".pt")
     marker = path.with_suffix(".complete.json")
     atomic_torch(path, payload)
-    atomic_json(marker, dict(schema_version=1, stage_key=stage_key, checkpoint=reference(root, path)))
+    atomic_json(marker, dict(schema_version=2, stage_key=stage_key, checkpoint=reference(root, path)))
     # A crash before this final switch leaves the previous committed boundary intact.
     atomic_json(root / "checkpoints/latest.json", reference(root, marker))
     return marker
@@ -90,14 +94,14 @@ def load(root: Path, marker: Path | None = None, *, expected_config_hash: str | 
     else:
         marker = contained(root, marker.resolve().relative_to(root).as_posix())
     record = json.loads(marker.read_text(encoding="utf-8"))
-    if record["schema_version"] != 1 or not marker.name.endswith(".complete.json"):
+    if record["schema_version"] != 2 or not marker.name.endswith(".complete.json"):
         raise ValueError("only complete checkpoint markers may be resumed")
     path = verify_reference(root, record["checkpoint"])
     payload = torch.load(path, map_location="cpu", weights_only=True)
     required = {"schema_version", "config", "config_hash", "sources", "method", "policy_kind", "seed", "task",
-                "current_stage", "next_index", "completed", "stages", "counters", "rng", "models", "world_optimizer",
-                "fisher", "kb_ready", "fresh", "pools", "manifests", "vision_source", "vision_export", "evaluations", "finalized"}
-    if not required <= payload.keys() or payload["schema_version"] != 1 or payload["current_stage"] != record["stage_key"]:
+                "current_stage", "next_index", "completed", "stages", "counters", "rng", "models", "visual_optimizer_state",
+                "fisher", "kb_ready", "manifests", "vision_source", "vision_export", "evaluations", "finalized", "diagnostics"}
+    if not required <= payload.keys() or payload["schema_version"] != 2 or payload["current_stage"] != record["stage_key"]:
         raise ValueError("incomplete/inconsistent checkpoint payload")
     if expected_config_hash is not None and payload["config_hash"] != expected_config_hash:
         raise ValueError("checkpoint configuration mismatch")
@@ -105,16 +109,14 @@ def load(root: Path, marker: Path | None = None, *, expected_config_hash: str | 
         raise ValueError("checkpoint source manifest mismatch")
     for ref in payload["manifests"].values():
         verify_reference(root, ref)
-    if payload["fresh"] is not None:
-        verify_reference(root, payload["fresh"], replay=True)
-    for ref in payload["pools"].values():
-        verify_reference(root, ref, replay=True)
     for ref in (payload["vision_source"], payload["vision_export"]):
         if ref is not None:
             verify_reference(root, ref)
     for ref in payload.get("pending_active", {}).values():
         snapshot = load_artifact(verify_reference(root, ref))
         verify_reference(root, snapshot["vision"])
+    for ref in payload["diagnostics"].values():
+        load_artifact(verify_reference(root, ref))
     return payload
 
 

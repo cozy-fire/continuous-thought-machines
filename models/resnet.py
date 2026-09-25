@@ -349,7 +349,7 @@ def resnet152(in_channels, feature_scales, stride=2, pretrained=False, progress=
         feature_scales, stride, "resnet152", Bottleneck, [3, 4, 36, 3], pretrained, progress, device, do_initial_max_pool, **kwargs
     )
 
-def prepare_resnet_backbone(backbone_type):
+def prepare_resnet_backbone(backbone_type, *, norm_layer=None):
       
     resnet_family = resnet18 # Default
     if '34' in backbone_type: resnet_family = resnet34
@@ -369,6 +369,7 @@ def prepare_resnet_backbone(backbone_type):
         progress=True,
         device="cpu",
         do_initial_max_pool=True,
+        norm_layer=norm_layer,
     )
 
     return backbone

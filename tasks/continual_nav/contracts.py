@@ -19,14 +19,6 @@ OBS_SHAPE = (3, 84, 84)
 NUM_ACTIONS = 5
 
 
-@dataclass(frozen=True)
-class CollectionResult:
-    transitions: int
-    next_transition_id: int
-    manifest: str
-    snapshot_id: str
-
-
 @dataclass
 class CTMState:
     """pre/post: float32 [B,D,M], oldest tick first."""
@@ -69,23 +61,6 @@ class EnvStep:
     truncated: NDArray[np.bool_]
     next_episode_start: NDArray[np.bool_]
     info: list[dict[str, object]]
-
-
-@dataclass(frozen=True)
-class Transition:
-    """World-model replay record; deliberately has no reward or answer label."""
-    obs: ImageArray
-    transition_next_obs: ImageArray
-    action: int
-    terminated: bool
-    truncated: bool
-    episode_start: bool
-    episode_id: int
-    episode_step: int
-    task_key: TaskKey
-    encoder_version: int
-    world_model_version: int
-    transition_id: int
 
 
 @dataclass
@@ -145,24 +120,6 @@ class FisherState:
     encoder_version: int
 
 
-@dataclass
-class WorldPrediction:
-    z: Tensor  # [B,128], current observation projection.
-    z_next: Tensor  # [B,128], real next observation; differentiable in W.fit.
-    z_pred: Tensor  # [B,128], action-conditioned prediction.
-    error: Tensor  # [B], un-squared L2, not the MSE training loss.
-
-
-@dataclass
-class WorldBatch:
-    obs: Tensor  # uint8 [B,3,84,84].
-    next_obs: Tensor  # Real transition target, never an autoreset observation.
-    actions: Tensor  # int64 [B], policy indices 0..4.
-    transition_ids: Tensor  # int64 [B].
-    from_high_error: Tensor  # bool [B], sampling provenance only.
-    task_key: TaskKey
-
-
 @dataclass(frozen=True)
 class PhaseKey:
     """Identity only; execution and checkpoint state machines are delivery 5."""
@@ -171,13 +128,12 @@ class PhaseKey:
     visit: int | None = None
     round: int | None = None
     segment: int | None = None
-    phase: Literal["W", "X", "C", "F", "P"] | None = None
-    subphase: Literal["collect", "fit"] | None = None
+    phase: Literal["X", "C", "F", "P"] | None = None
 
     def __post_init__(self) -> None:
         if self.family == "init":
             if any(x is not None for x in (self.task, self.visit, self.round,
-                                          self.segment, self.phase, self.subphase)):
+                                          self.segment, self.phase)):
                 raise ValueError("init cannot contain task/stage fields")
             return
         if self.task not in TASKS:
@@ -191,7 +147,7 @@ class PhaseKey:
             raise ValueError("single uses segment, not visit")
         if self.family != "single" and self.segment is not None:
             raise ValueError("segment is exclusive to single")
-        allowed = {"ta": ("W", "X", "C", "F"), "pnc": ("P", "C", "F"),
+        allowed = {"ta": ("X", "C", "F"), "pnc": ("P", "C", "F"),
                    "single": ("P",), "seq": ("P",)}[self.family]
         if self.phase not in allowed:
             raise ValueError("phase is not valid for this family")
@@ -200,8 +156,6 @@ class PhaseKey:
                 raise ValueError("TA requires a nonnegative round")
         elif self.round is not None:
             raise ValueError("round is exclusive to TA")
-        if self.subphase is not None and (self.phase != "W" or self.subphase not in ("collect", "fit")):
-            raise ValueError("only W accepts collect/fit subphases")
 
     def __str__(self) -> str:
         if self.family == "init":
@@ -213,4 +167,4 @@ class PhaseKey:
             if self.family == "ta":
                 key += f"/r{self.round}"
             key += f"/{self.phase}"
-        return key + (f"/{self.subphase}" if self.subphase else "")
+        return key

@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 task_order:
 - maze_medium
 - fourrooms
@@ -17,11 +17,12 @@ environment:
 vision:
   backbone: resnet34-2
   pretrained: false
+  norm: groupnorm32
 ctm:
   d_model: 512
   d_input: 128
   ticks: 2
-  memory_length: 20
+  memory_length: 40
   synapse: two_linear_glu_blocks
   nlm_hidden: 16
   deep_nlm: true
@@ -50,39 +51,27 @@ training:
 agnostic:
   visits: 4
   rounds_per_task: 2
-world:
-  collect_steps_per_round: 100000
-  updates_per_round: 100000
-  log_interval_updates: 50
-  batch_size: 256
-  projection_dim: 128
-  projector_hidden: 512
-  predictor_hidden: 512
-  forward_loss: mean_squared_error_over_batch_and_features
-  optimizer:
-    name: AdamW
-    lr: 0.0001
-    betas:
-    - 0.9
-    - 0.999
-    eps: 1.0e-08
-    weight_decay: 0.0001
-  max_grad_norm: 1.0
-  lr_schedule: constant
 sigreg:
   enabled: true
   lambda: 0.02
   directions: 256
   knots: 17
   t_max: 3.0
-replay:
-  fit_cache: memory
-  high_error_capacity_per_task: 50000
-  high_error_fraction: 0.5
-  retention: latest_exploration_topk_per_task
-  shard_size: 2048
 exploration:
-  steps_per_round: 10000
+  steps_per_round: 200000
+  history_length: 20
+  similarity_threshold: 0.999
+  min_gap_weight: 0.2
+  projector_hidden: 512
+  projection_dim: 128
+  visual_optimizer:
+    name: AdamW
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    eps: 1.0e-08
+    weight_decay: 0.0001
+  visual_max_grad_norm: 1.0
+  diagnostic_episodes: 4
 ppo:
   rollout_steps: 50
   num_minibatches: 4
@@ -109,8 +98,8 @@ distill:
   agnostic_steps_per_round: 150000
   learning_steps: 50
   log_interval_windows: 10
-  burnin_ticks: 20
-  burnin_env_obs: 10
+  burnin_ticks: 40
+  burnin_env_obs: 20
   minibatches: 4
   update_epochs: 1
   temperature: 1.0

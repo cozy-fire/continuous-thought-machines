@@ -21,10 +21,16 @@ def freeze(module: nn.Module) -> None:
         p.grad = None
 
 
-def prepare_ppo(policy: SingleActorCritic | DualPolicy, encoder: VisionEncoder) -> list[nn.Parameter]:
+def prepare_ppo(policy: SingleActorCritic | DualPolicy, encoder: VisionEncoder,
+                *, phase: str = "P") -> list[nn.Parameter]:
     if not isinstance(policy, (SingleActorCritic, DualPolicy)):
         raise TypeError("PPO requires an actor-critic")
-    encoder.freeze()
+    if phase == "X":
+        encoder.set_x_training(True)
+    elif phase == "P":
+        encoder.freeze()
+    else:
+        raise ValueError("invalid PPO phase")
     policy.requires_grad_(True).train()
     if isinstance(policy, DualPolicy):
         freeze(policy.kb)
@@ -45,11 +51,11 @@ def check_optimizer(optimizer: torch.optim.Optimizer, parameters: list[nn.Parame
         raise ValueError("optimizer parameter ownership does not match this phase")
 
 
-@torch.no_grad()
-def encode_sequence(obs: Tensor, encoder: VisionEncoder) -> Tensor:
+def encode_sequence(obs: Tensor, encoder: VisionEncoder, *, trainable: bool = False) -> Tensor:
     # One time slice at a time bounds ResNet activation memory for long sequences.
     device = next(encoder.parameters()).device
-    return torch.stack([encode_obs(frame.to(device), encoder) for frame in obs])
+    with torch.set_grad_enabled(trainable):
+        return torch.stack([encode_obs(frame.to(device), encoder) for frame in obs])
 
 
 def environment_groups(batch_size: int, count: int, rng: torch.Generator) -> tuple[Tensor, ...]:

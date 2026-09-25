@@ -11,8 +11,8 @@ import torch
 from tasks.continual_nav.config import load_config
 from tasks.continual_nav.data.rollout import PPOCollector
 from tasks.continual_nav.learning.common import encode_sequence
-from tasks.continual_nav.learning.ppo import compute_gae, make_ppo_optimizer, ppo_loss, run_ppo_stage, set_stage_learning_rate, train_ppo
-from tasks.continual_nav.models import DualPolicy, SingleActorCritic, StandalonePolicy, VisionEncoder, WorldModel, encode_obs
+from tasks.continual_nav.learning.ppo import compute_gae, make_ppo_optimizer, make_x_optimizer, ppo_loss, run_ppo_stage, set_stage_learning_rate, train_ppo
+from tasks.continual_nav.models import DualPolicy, SIGReg, SigregProjector, SingleActorCritic, StandalonePolicy, VisionEncoder, encode_obs
 from tasks.continual_nav.verify_models import tensor_hash
 
 
@@ -34,7 +34,8 @@ class PixelProbe:
     def reset(self):
         self.t = 0
         self.actions = []
-        return np.zeros((2, 3, 84, 84), np.uint8), [{"task_key": "maze_medium"}]*2
+        return np.zeros((2, 3, 84, 84), np.uint8), [dict(task_key="maze_medium", episode_id=0,
+            map_sha256="probe") for _ in range(2)]
     def step(self, actions):
         self.t += 1
         self.actions.append(np.asarray(actions).copy())
@@ -47,10 +48,16 @@ class PixelProbe:
                 if forbid:
                     raise AssertionError("reward access forbidden")
                 return np.full(2, reward, np.float32)
+        infos = [dict(task_key="maze_medium", episode_id=(self.t-1)//2,
+            episode_step=(self.t-1)%2+1, map_sha256="probe") for _ in range(2)]
+        if done:
+            for info in infos:
+                info["reset_info"] = dict(task_key="maze_medium", episode_id=self.t//2,
+                    map_sha256="probe")
         return Result(next_obs=np.zeros_like(final) if done else final.copy(), transition_next_obs=final,
                       terminated=np.array([done, False]), truncated=np.array([False, done]),
                       next_episode_start=np.array([done, done]),
-                      info=[dict(task_key="maze_medium", episode_id=(self.t-1)//2, episode_step=(self.t-1)%2+1)]*2)
+                      info=infos)
 
 
 class PPOTests(unittest.TestCase):
@@ -124,25 +131,21 @@ class PPOTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None for p in encoder.parameters()))
         self.assertTrue(all(p.grad is None for p in policy.kb.parameters()))
 
-    def test_X_never_reads_external_reward_and_identical_gradients(self):
+    def test_X_uses_visual_reward_and_joint_gradients(self):
         encoder = VisionEncoder(self.c)
-        world = WorldModel(self.c, encoder)
+        projector = SigregProjector(self.c)
         policy = DualPolicy(self.c, StandalonePolicy(self.c))
-        world_before = tensor_hash(world)
-        batches = []
-        for env in (PixelProbe(reward=-1000), PixelProbe(forbid_reward=True)):
-            collector = PPOCollector(env, policy, encoder, self.c, phase="X", world=world)
-            batches.append(collector.collect(4, action_rng=torch.Generator().manual_seed(7)))
-        for field in ("actions", "reward", "advantages", "returns", "old_logprob"):
-            torch.testing.assert_close(getattr(batches[0], field), getattr(batches[1], field), atol=0, rtol=0)
-        clones = [deepcopy(policy), deepcopy(policy)]
-        for batch, clone in zip(batches, clones):
-            train_ppo(batch, clone, encoder, make_ppo_optimizer(clone, encoder, self.c), self.c,
-                      rng=torch.Generator().manual_seed(8))
-        self.assertEqual(tensor_hash(clones[0]), tensor_hash(clones[1]))
-        for p, q in zip(clones[0].active.parameters(), clones[1].active.parameters()):
-            torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=0)
-        self.assertEqual(tensor_hash(world), world_before)
+        before = tuple(tensor_hash(module) for module in (encoder, projector, policy.active, policy.kb))
+        collector = PPOCollector(PixelProbe(forbid_reward=True), policy, encoder, self.c, phase="X")
+        batch = collector.collect(4, action_rng=torch.Generator().manual_seed(7))
+        self.assertTrue((batch.reward <= 0).all())
+        optimizer = make_x_optimizer(policy, encoder, projector, self.c, None)
+        train_ppo(batch, policy, encoder, optimizer, self.c, rng=torch.Generator().manual_seed(8),
+                  phase="X", projector=projector, regularizer=SIGReg(self.c.sigreg),
+                  sigreg_rng=torch.Generator().manual_seed(9))
+        after = tuple(tensor_hash(module) for module in (encoder, projector, policy.active, policy.kb))
+        self.assertTrue(all(a != b for a, b in zip(before[:3], after[:3])))
+        self.assertEqual(before[3], after[3])
 
     def test_stage_exact_tail_and_learning_rate_restart(self):
         encoder, policy = VisionEncoder(self.c), SingleActorCritic(self.c)

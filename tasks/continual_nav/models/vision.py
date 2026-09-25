@@ -1,6 +1,7 @@
-"""One shared CTM ResNet; visual learning is enabled only by W.fit callers."""
+"""Shared ResNet with GroupNorm; visual gradients belong only to TA X."""
 from __future__ import annotations
 
+from functools import partial
 import torch
 from torch import Tensor, nn
 
@@ -12,19 +13,20 @@ class VisionEncoder(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         validate_config(config)
-        self.backbone = prepare_resnet_backbone(config.vision.backbone)
+        self.backbone = prepare_resnet_backbone(config.vision.backbone,
+                                                norm_layer=partial(nn.GroupNorm, 32))
         self.register_buffer("permanently_frozen", torch.tensor(False))
         self.register_buffer("encoder_version", torch.tensor(0, dtype=torch.int64))
-        self._world_training = False
-        self.set_world_training(False)
+        self._x_training = False
+        self.set_x_training(False)
 
-    def set_world_training(self, enabled: bool) -> None:
+    def set_x_training(self, enabled: bool) -> None:
         if enabled and self.permanently_frozen.item():
             raise RuntimeError("visual learning cannot resume after permanent freezing")
-        self._world_training = enabled
+        self._x_training = enabled
         self.requires_grad_(enabled)
         if not enabled:
-            # Stale W.fit gradients must not look like leakage in the next phase.
+            # Clear stale X gradients before C/F/P assert frozen ownership.
             for parameter in self.parameters():
                 parameter.grad = None
         self.train(enabled)
@@ -32,11 +34,11 @@ class VisionEncoder(nn.Module):
     def freeze(self, *, permanent: bool = False) -> None:
         if permanent:
             self.permanently_frozen.fill_(True)
-        self.set_world_training(False)
+        self.set_x_training(False)
 
     def train(self, mode: bool = True) -> VisionEncoder:
-        # A parent module's train() must not reactivate frozen BatchNorm buffers.
-        super().train(mode and self._world_training and not self.permanently_frozen.item())
+        # A parent policy cannot reactivate the encoder outside TA X.
+        super().train(mode and self._x_training and not self.permanently_frozen.item())
         return self
 
     def forward(self, normalized_rgb: Tensor) -> Tensor:
@@ -44,8 +46,7 @@ class VisionEncoder(nn.Module):
             raise ValueError("vision input must have shape [B,3,84,84]")
         if normalized_rgb.dtype != torch.float32:
             raise ValueError("vision input must be normalized float32")
-        # Freezing parameters alone does not disable autograd through the input.
-        with torch.set_grad_enabled(torch.is_grad_enabled() and self._world_training):
+        with torch.set_grad_enabled(torch.is_grad_enabled() and self._x_training):
             return self.backbone(normalized_rgb)
 
 

@@ -156,12 +156,8 @@ def frozen_copy(module: ModuleT) -> ModuleT:
     snapshot.requires_grad_(False).eval()
     for parameter in snapshot.parameters():
         parameter.grad = None
-    # Vision snapshots must also lock their forward/autograd and BatchNorm policy.
+    # Vision snapshots must also lock their forward/autograd policy.
     from .vision import VisionEncoder
     if isinstance(snapshot, VisionEncoder):
         snapshot.freeze()
-    from .world import WorldModel
-    if isinstance(snapshot, WorldModel):
-        snapshot.freeze()
-        snapshot._fit_complete = False
     return snapshot

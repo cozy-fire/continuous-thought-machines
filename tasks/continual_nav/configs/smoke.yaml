@@ -7,11 +7,6 @@ training:
   remote_logging: false
 agnostic:
   visits: 1
-world:
-  collect_steps_per_round: 40
-  updates_per_round: 2
-  log_interval_updates: 1
-  batch_size: 8
 exploration:
   steps_per_round: 40
 distill:
@@ -29,8 +24,6 @@ pnc:
 fisher:
   collect_steps: 20
   scored_samples: 8
-replay:
-  high_error_capacity_per_task: 20
 evaluation:
   num_envs: 2
   validation_episodes: 2

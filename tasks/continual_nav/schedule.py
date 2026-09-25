@@ -11,9 +11,9 @@ import torch
 from .config import Config, validate_config
 from .contracts import PhaseKey, TASKS
 
-METHODS = ("tapd_ctm", "single_task_ctm_shared_vision", "sequential_ppo_shared_vision",
+METHODS = ("tapd_ctm_visual_revisit", "single_task_ctm_shared_vision", "sequential_ppo_shared_vision",
            "pnc_without_exploration_distill_shared_vision")
-STREAMS = ("model_init", "policy_action", "env", "replay", "ppo_shuffle", "fisher", "sigreg", "evaluation")
+STREAMS = ("model_init", "policy_action", "env", "ppo_shuffle", "fisher", "sigreg", "evaluation")
 
 
 @dataclass(frozen=True)
@@ -21,11 +21,10 @@ class Stage:
     ordinal: int
     key: PhaseKey
     transitions: int
-    world_updates: int = 0
 
     def record(self) -> dict:
         return dict(ordinal=self.ordinal, key=str(self.key), identity=asdict(self.key),
-                    transitions=self.transitions, world_updates=self.world_updates)
+                    transitions=self.transitions)
 
 
 def expand_stages(config: Config, method: str, task: str | None = None) -> list[Stage]:
@@ -33,17 +32,15 @@ def expand_stages(config: Config, method: str, task: str | None = None) -> list[
     if method not in METHODS or (method == METHODS[1] and task not in TASKS) or (method != METHODS[1] and task is not None):
         raise ValueError("invalid method/run-task combination")
     stages = [Stage(0, PhaseKey("init"), 0)]
-    def add(key, steps, updates=0):
-        stages.append(Stage(len(stages), key, steps, updates))
+    def add(key, steps):
+        stages.append(Stage(len(stages), key, steps))
     if method == METHODS[0]:
         for visit in range(config.agnostic.visits):
             for current_task in config.task_order:
                 for round_index in range(config.agnostic.rounds_per_task):
-                    for phase, subphase, count in (("W", "collect", config.world.collect_steps_per_round),
-                        ("W", "fit", 0), ("X", None, config.exploration.steps_per_round),
-                        ("C", None, config.distill.agnostic_steps_per_round), ("F", None, config.fisher.collect_steps)):
-                        add(PhaseKey("ta", current_task, visit, round_index, phase=phase, subphase=subphase), count,
-                            config.world.updates_per_round if subphase == "fit" else 0)
+                    for phase, count in (("X", config.exploration.steps_per_round),
+                        ("C", config.distill.agnostic_steps_per_round), ("F", config.fisher.collect_steps)):
+                        add(PhaseKey("ta", current_task, visit, round_index, phase=phase), count)
     for visit in range(config.pnc.visits):
         for current_task in ((task,) if method == METHODS[1] else config.task_order):
             if method in (METHODS[1], METHODS[2]):
@@ -81,7 +78,7 @@ class RandomStreams:
         self.seeds = {name: derive_seed(seed, method, task, name) for name in STREAMS}
         self.torch = {name: torch.Generator().manual_seed(self.seeds[name])
                       for name in ("policy_action", "ppo_shuffle", "fisher", "sigreg", "evaluation")}
-        self.numpy = {name: np.random.default_rng(self.seeds[name]) for name in ("env", "replay")}
+        self.numpy = {name: np.random.default_rng(self.seeds[name]) for name in ("env",)}
 
     def state_dict(self) -> dict:
         return dict(seeds=self.seeds, torch={k: g.get_state() for k, g in self.torch.items()},

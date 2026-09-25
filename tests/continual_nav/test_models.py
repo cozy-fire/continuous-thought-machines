@@ -56,26 +56,25 @@ class ModelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             encode_obs(images.float(), encoder)
 
-    def test_visual_world_training_then_permanent_freeze(self):
+    def test_visual_x_training_then_permanent_freeze(self):
         encoder = VisionEncoder(self.c)
         images = torch.randint(0, 256, (2, 3, 84, 84), dtype=torch.uint8)
-        bn = next(m for m in encoder.modules() if isinstance(m, nn.BatchNorm2d))
-        before = bn.running_mean.clone()
-        encoder.set_world_training(True)
+        self.assertTrue(any(isinstance(m, nn.GroupNorm) for m in encoder.modules()))
+        self.assertFalse(any(isinstance(m, nn.BatchNorm2d) for m in encoder.modules()))
+        encoder.set_x_training(True)
         encode_obs(images, encoder).square().mean().backward()
-        self.assertFalse(torch.equal(before, bn.running_mean))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in encoder.parameters()))
         encoder.freeze(permanent=True)
         self.assertTrue(all(p.grad is None and not p.requires_grad for p in encoder.parameters()))
         with self.assertRaises(RuntimeError):
-            encoder.set_world_training(True)
+            encoder.set_x_training(True)
         saved = io.BytesIO()
         torch.save(encoder.state_dict(), saved)
         saved.seek(0)
         restored = VisionEncoder(self.c)
         restored.load_state_dict(torch.load(saved, weights_only=True))
         with self.assertRaises(RuntimeError):
-            restored.set_world_training(True)
+            restored.set_x_training(True)
 
     def test_rope_coordinates_norm_and_zero_identity(self):
         rope = SpatialRoPE()
@@ -132,7 +131,7 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(new.pre[:, :, :-1], state.pre[:, :, 1:], atol=0, rtol=0)
         torch.testing.assert_close(new.post[:, :, :-1], state.post[:, :, 1:], atol=0, rtol=0)
         torch.testing.assert_close(activation, new.post[:, :, -1], atol=0, rtol=0)
-        trace = torch.randn(2, 512, 20)
+        trace = torch.randn(2, 512, self.c.ctm.memory_length)
         original = controller.nlm(trace)
         changed = trace.clone()
         changed[:, 13] += 2
@@ -294,7 +293,7 @@ class ModelTests(unittest.TestCase):
         torch.testing.assert_close(before, after, atol=0, rtol=0)
         self.assertFalse(after.requires_grad)
         encoder = VisionEncoder(self.c)
-        encoder.set_world_training(True)
+        encoder.set_x_training(True)
         snapshot = frozen_copy(encoder)
         obs = torch.randint(0, 256, (1, 3, 84, 84), dtype=torch.uint8)
         old = encode_obs(obs, snapshot)

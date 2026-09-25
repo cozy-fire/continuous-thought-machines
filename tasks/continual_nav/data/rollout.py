@@ -10,12 +10,12 @@ from torch import Tensor
 from torch.distributions import Categorical
 
 from ..config import Config
-from ..contracts import FisherSequenceBatch, PPOBatch, PolicyOutput, SequenceBatch, Transition
+from ..contracts import FisherSequenceBatch, PPOBatch, PolicyOutput, SequenceBatch
 from ..envs import VectorEnvAdapter
-from ..models import DualPolicy, SingleActorCritic, StandalonePolicy, VisionEncoder, WorldModel, detach_state, encode_obs, frozen_copy
+from ..models import DualPolicy, SingleActorCritic, StandalonePolicy, VisionEncoder, detach_state, encode_obs, frozen_copy
 from ..learning.common import prepare_ppo
 from ..learning.ppo import compute_gae
-from .replay import HighErrorBuilder
+from ..learning.revisit import VisualRevisit
 
 
 def sample_actions(logits: Tensor, rng: torch.Generator) -> Tensor:
@@ -27,27 +27,25 @@ def sample_actions(logits: Tensor, rng: torch.Generator) -> Tensor:
 class PPOCollector:
     def __init__(self, envs: VectorEnvAdapter, policy: SingleActorCritic | DualPolicy,
                  encoder: VisionEncoder, config: Config, *, phase: str,
-                 world: WorldModel | None = None, high_error: HighErrorBuilder | None = None,
                  start_transition_id: int = 0):
         if phase not in ("X", "P") or start_transition_id < 0:
             raise ValueError("invalid PPO phase/transition identity")
-        if phase == "X" and (world is None or world.encoder is not encoder):
-            raise ValueError("X requires the world model owning the same shared encoder")
-        if phase == "P" and (world is not None or high_error is not None):
-            raise ValueError("P cannot call the world model or populate the X pool")
         self.envs, self.policy, self.encoder, self.config = envs, policy, encoder, config
-        self.phase, self.world, self.high_error = phase, world, high_error
+        self.phase = phase
         self.device = next(policy.parameters()).device
-        if world is not None:
-            world.freeze()
         if phase == "P":
             encoder.freeze(permanent=True)
-        prepare_ppo(policy, encoder)
+        prepare_ppo(policy, encoder, phase=phase)
         self.obs, infos = envs.reset()
-        if high_error is not None and (any(i["task_key"] != high_error.task for i in infos)
-            or high_error.encoder_version != int(encoder.encoder_version)
-            or high_error.world_version != int(world.world_model_version)):
-            raise ValueError("X builder task/version mismatch")
+        self.revisit = VisualRevisit(config, self.device) if phase == "X" else None
+        if self.revisit is not None:
+            self.revisit.reset(self.obs, infos)
+        self.revisit_statistics = dict(reward_sum=0., nonzero=0, unchanged_pixels=0., identical_frames=0,
+            max_similarity_sum=0., match_similarity_sum=0., gap_sum=0., count=0,
+            actions=np.zeros(5, dtype=np.int64), similarity_bins=np.zeros(5, dtype=np.int64),
+            gaps=np.zeros(config.exploration.history_length, dtype=np.int64))
+        self.diagnostics = EpisodeDiagnostics(self.obs, infos, start_transition_id,
+            config.exploration.steps_per_round) if phase == "X" else None
         self.starts = np.ones(envs.num_envs, bool)
         self.state = detach_state(policy.initial_state(envs.num_envs))
         self.next_transition_id = start_transition_id
@@ -71,14 +69,25 @@ class PPOCollector:
             bootstrap = self.policy.step(encode_obs(final.to(self.device), self.encoder), output.state,
                                          torch.zeros(b, dtype=torch.bool, device=self.device)).value
             if self.phase == "X":
-                reward, errors = self.world.curiosity(obs.to(self.device), final.to(self.device), actions.to(self.device))
-                if self.high_error is not None:
-                    for slot, info in enumerate(result.info):
-                        self.high_error.offer(Transition(self.obs[slot], result.transition_next_obs[slot], int(actions[slot]),
-                            bool(result.terminated[slot]), bool(result.truncated[slot]), bool(self.starts[slot]),
-                            int(info["episode_id"])*b+slot, int(info["episode_step"]), info["task_key"],
-                            int(self.encoder.encoder_version), int(self.world.world_model_version),
-                            self.next_transition_id+slot), float(errors[slot]))
+                reward, max_similarity, matched_similarity, gap = self.revisit.score(result.transition_next_obs, result.info,
+                    result.next_episode_start, result.next_obs)
+                self.diagnostics.record(actions.numpy(), result.transition_next_obs, reward.numpy(),
+                    max_similarity.numpy(), matched_similarity.numpy(), gap.numpy(), result.terminated, result.truncated,
+                    result.info, result.next_obs, self.next_transition_id)
+                stats = self.revisit_statistics
+                stats["reward_sum"] += float(reward.sum())
+                stats["nonzero"] += int((reward < 0).sum())
+                equality = self.obs == result.transition_next_obs
+                stats["unchanged_pixels"] += float(equality.mean(axis=(1, 2, 3)).sum())
+                stats["identical_frames"] += int(np.count_nonzero(equality.all(axis=(1, 2, 3))))
+                stats["max_similarity_sum"] += float(max_similarity.sum())
+                stats["match_similarity_sum"] += float(matched_similarity.sum())
+                stats["gap_sum"] += float(gap.sum())
+                stats["count"] += b
+                stats["actions"] += np.bincount(actions.numpy(), minlength=5)
+                stats["similarity_bins"] += np.bincount(np.searchsorted(
+                    [.95, .99, .999, .9995], max_similarity.numpy(), side="right"), minlength=5)
+                stats["gaps"] += np.bincount(gap.numpy(), minlength=self.config.exploration.history_length+1)[1:]
             else:
                 reward = torch.from_numpy(result.reward_ext.copy())
             values = (obs, final, actions, Categorical(logits=output.logits).log_prob(actions.to(self.device)).cpu(),
@@ -95,6 +104,81 @@ class PPOCollector:
                                    self.config.ppo.gamma, self.config.ppo.gae_lambda)
         return PPOBatch(x["obs"], x["action"], x["logprob"], x["value"], x["reward"], adv, returns,
                         x["start"], x["term"], x["trunc"], initial, x["bootstrap"], valid, x["next"])
+
+    def revisit_metrics(self) -> dict[str, float]:
+        if self.phase != "X":
+            return {}
+        stats = self.revisit_statistics
+        count = stats["count"]
+        if not count:
+            return {}
+        metrics = dict(mean_penalty=-stats["reward_sum"]/count,
+            nonzero_penalty_fraction=stats["nonzero"]/count,
+            unchanged_pixel_fraction=stats["unchanged_pixels"]/count,
+            identical_frame_fraction=stats["identical_frames"]/count,
+            mean_max_similarity=stats["max_similarity_sum"]/count,
+            mean_match_similarity=stats["match_similarity_sum"]/count,
+            mean_match_gap=stats["gap_sum"]/count)
+        metrics.update({f"action_{i}_fraction": float(v/count) for i, v in enumerate(stats["actions"])})
+        metrics.update({f"similarity_bin_{i}_fraction": float(v/count) for i, v in enumerate(stats["similarity_bins"])})
+        metrics.update({f"gap_{i+1}_fraction": float(v/count) for i, v in enumerate(stats["gaps"])})
+        return metrics
+
+
+class EpisodeDiagnostics:
+    """Retain only selected complete episodes and current per-slot traces."""
+    def __init__(self, images: np.ndarray, infos: list[dict], start_id: int, budget: int):
+        self.start_id, self.halfway = start_id, start_id + budget // 2
+        self.current = [self._new(images[i], infos[i], start_id + i) for i in range(len(images))]
+        self.first = self.midpoint = self.last = self.most_penalized = None
+
+    @staticmethod
+    def _new(image: np.ndarray, info: dict, first_id: int) -> dict:
+        return dict(first_transition_id=first_id, task=info["task_key"], episode_id=int(info["episode_id"]),
+                    map_identity=info.get("map_sha256", info.get("episode_seed")),
+                    images=[image.copy()], actions=[], rewards=[], max_similarities=[], matched_similarities=[], gaps=[],
+                    terminated=False, truncated=False, success=False)
+
+    def record(self, actions: np.ndarray, finals: np.ndarray, rewards: np.ndarray,
+               max_similarities: np.ndarray, matched_similarities: np.ndarray, gaps: np.ndarray, terminated: np.ndarray,
+               truncated: np.ndarray, infos: list[dict], resets: np.ndarray, base_id: int) -> None:
+        for slot, episode in enumerate(self.current):
+            episode["images"].append(finals[slot].copy())
+            episode["actions"].append(int(actions[slot]))
+            episode["rewards"].append(float(rewards[slot]))
+            episode["max_similarities"].append(float(max_similarities[slot]))
+            episode["matched_similarities"].append(float(matched_similarities[slot]))
+            episode["gaps"].append(int(gaps[slot]))
+            if terminated[slot] or truncated[slot]:
+                episode["terminated"] = bool(terminated[slot])
+                episode["truncated"] = bool(truncated[slot])
+                episode["success"] = bool(infos[slot].get("success", False))
+                episode["last_transition_id"] = base_id + slot
+                episode["nonzero_penalties"] = sum(value < 0 for value in episode["rewards"])
+                if self.first is None or episode["last_transition_id"] < self.first["last_transition_id"]:
+                    self.first = episode
+                if episode["last_transition_id"] >= self.halfway and (self.midpoint is None or
+                        episode["last_transition_id"] < self.midpoint["last_transition_id"]):
+                    self.midpoint = episode
+                if self.last is None or episode["last_transition_id"] > self.last["last_transition_id"]:
+                    self.last = episode
+                if self.most_penalized is None or (episode["nonzero_penalties"], -episode["first_transition_id"]) > (
+                        self.most_penalized["nonzero_penalties"], -self.most_penalized["first_transition_id"]):
+                    self.most_penalized = episode
+                self.current[slot] = self._new(resets[slot], infos[slot]["reset_info"], base_id + len(self.current) + slot)
+
+    def selected(self) -> list[dict]:
+        unique = {}
+        for label, episode in (("first", self.first), ("after_halfway", self.midpoint),
+                               ("last", self.last), ("most_penalized", self.most_penalized)):
+            if episode is not None:
+                key = (episode["first_transition_id"], episode["last_transition_id"])
+                if key not in unique:
+                    item = {**episode, "selection": [label], "images": torch.from_numpy(np.stack(episode["images"]))}
+                    unique[key] = item
+                else:
+                    unique[key]["selection"].append(label)
+        return list(unique.values())
 
 
 class SequenceCollector:
@@ -128,7 +212,7 @@ class SequenceCollector:
         b, u, length = self.envs.num_envs, self.config.distill.burnin_env_obs, self.config.distill.learning_steps
         if steps < 1 or steps % b or steps > b*length:
             raise ValueError("invalid exact sequence-window budget")
-        if int(self.encoder.encoder_version) != self.encoder_version or self.encoder._world_training:
+        if int(self.encoder.encoder_version) != self.encoder_version or self.encoder._x_training:
             raise RuntimeError("sequence collection requires a fixed visual encoder")
         obs = torch.zeros(u+length, b, 3, 84, 84, dtype=torch.uint8)
         starts = torch.zeros(u+length, b, dtype=torch.bool)

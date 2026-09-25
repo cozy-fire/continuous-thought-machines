@@ -1,1 +1,1 @@
-"""Dataset identities, split manifests and bounded raw-pixel world-model replay."""
+"""Dataset identities, fixed panels, and raw-pixel rollout collection."""

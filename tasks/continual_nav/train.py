@@ -18,36 +18,16 @@ from .analysis.metrics import forgetting
 from .config import Config, budget_summary, config_hash, load_config, resolved_dict, save_config
 from .contracts import FisherState, TASKS
 from .data.manifest import MazeManifest, build_manifest
-from .data.replay import ReplayBank, ShardedWriter, TransitionStore
 from .data.rollout import collect_fisher
 from .envs import VectorEnvAdapter, build_env
 from .evaluate import evaluate_policy
-from .learning.common import freeze, prepare_kb, prepare_ppo
+from .learning.common import prepare_kb, prepare_ppo
 from .learning.distill import run_compress_stage
 from .learning.fisher import estimate_fisher, update_online_fisher
 from .learning.ppo import run_ppo_stage
-from .learning.world import SnapshotCollector, fit_world_model, make_world_optimizer
-from .models import Controller, DualPolicy, SIGReg, SingleActorCritic, StandalonePolicy, VisionEncoder, WorldModel, frozen_copy
+from .models import Controller, DualPolicy, SIGReg, SigregProjector, SingleActorCritic, StandalonePolicy, VisionEncoder, frozen_copy
 from .schedule import METHODS, RandomStreams, expand_stages, ends_visit, visit_identity, isolated_rng
 from .wandb_logging import WandbLogger
-
-
-_PRE_WANDB_SOURCES = {
-    "tasks/continual_nav/config.py": "c56ae3d2da03ae63bffc3f5657be6c7478347afd37c52438d5b25ae0a7d97db3",
-    "tasks/continual_nav/train.py": "0d3e21b7e5340a9567158b8ef81d6d0ba5248b03493938df2300555df2ea1e22",
-}
-
-
-def _validate_resume_sources(saved: dict[str, str], current: dict[str, str]) -> bool:
-    if saved == current:
-        return False
-    # Permit only the exact pre-W&B checkout to cross this logging-only boundary.
-    if (all(saved.get(path) == digest for path, digest in _PRE_WANDB_SOURCES.items())
-            and set(current) - set(saved) == {"tasks/continual_nav/wandb_logging.py"}
-            and set(saved) - set(current) == set()
-            and all(saved[path] == current[path] for path in saved if path not in _PRE_WANDB_SOURCES)):
-        return True
-    raise ValueError("checkpoint source manifest mismatch")
 
 
 class CountedVector(VectorEnvAdapter):
@@ -89,20 +69,20 @@ class Runner:
         self.rng = RandomStreams(seed, method, task)
         self.sources = ck.source_manifest()
         self.single = method in (METHODS[1], METHODS[2])
-        self.encoder = self.world = self.kb = self.policy = self.world_optimizer = None
-        self.fisher, self.kb_ready, self.fresh, self.pools = None, False, None, {}
+        self.encoder = self.projector = self.kb = self.policy = None
+        self.visual_optimizer_state = {}
+        self.fisher, self.kb_ready = None, False
         self.vision_source = self.vision_export = None
         self.completed, self.evaluations, self.next_index = [], [], 1
         self.pending_active = {}
+        self.diagnostics = {}
         self.finalized, self._logger = False, None
-        self.counters = {name: 0 for name in ("global_env_steps", "world_collect_steps", "explore_steps", "progress_steps",
-            "compress_steps", "fisher_steps", "eval_steps", "world_optimizer_updates", "ppo_optimizer_updates",
+        self.counters = {name: 0 for name in ("global_env_steps", "explore_steps", "progress_steps",
+            "compress_steps", "fisher_steps", "eval_steps", "x_joint_updates", "ppo_optimizer_updates",
             "distill_optimizer_updates", "policy_internal_ticks", "eval_internal_ticks")}
         self._hooked, self._evaluating = WeakSet(), False
-        logging_migration = False
         if resume:
-            payload = ck.load(self.root, expected_config_hash=config_hash(config))
-            logging_migration = _validate_resume_sources(payload["sources"], self.sources)
+            payload = ck.load(self.root, expected_config_hash=config_hash(config), expected_sources=self.sources)
             if (payload["method"], payload["seed"], payload["task"]) != (method, seed, task):
                 raise ValueError("resume method/seed/task mismatch")
             if payload["stages"] != [s.record() for s in self.stages] or payload["policy_kind"] != ("single" if self.single else "dual"):
@@ -140,28 +120,17 @@ class Runner:
                 versions={name: importlib.metadata.version(name)
                 for name in ("torch", "torchvision", "numpy", "gymnasium", "minigrid", "PyYAML", "wandb")}))
             self.completed = ["init"]
-        self.bank = ReplayBank(self.root / "replay", capacity=config.replay.high_error_capacity_per_task,
-                                shard_size=config.replay.shard_size) if method == METHODS[0] else None
-        if resume and self.bank is not None:
-            # The global checkpoint, not a possibly uncommitted latest pool, is authoritative.
-            for current_task in TASKS:
-                if current_task in self.pools:
-                    self.bank._publish(current_task, ck.verify_reference(self.root, self.pools[current_task], replay=True))
-                else:
-                    (self.root / "replay" / current_task / "latest.json").unlink(missing_ok=True)
         if not resume:
             self._commit("init")
         mode = wandb_mode or ("online" if config.training.remote_logging else "disabled")
         self._logger = WandbLogger(self.root, config, method, seed, task, mode=mode, resume=resume)
-        if logging_migration:
-            self._event(dict(type="logging_migration", stage=self.completed[-1], backend="wandb"))
 
     def _construct(self):
         with self.rng.model_initialization(0):
             self.encoder = VisionEncoder(self.config).to(self.device)
             if self.method == METHODS[0]:
-                self.world = WorldModel(self.config, self.encoder).to(self.device)
-                self.world_optimizer = make_world_optimizer(self.world, self.config)
+                self.projector = SigregProjector(self.config).to(self.device)
+                self.projector.requires_grad_(False).eval()
             if self.single:
                 self.policy = SingleActorCritic(self.config).to(self.device)
                 self._track_ticks(self.policy)
@@ -180,7 +149,8 @@ class Runner:
 
     def _import_vision(self, path):
         artifact = ck.load_artifact(path)
-        if artifact["kind"] != "vision" or artifact["method"] != METHODS[0] or artifact["seed"] != self.seed:
+        if (artifact.get("schema_version") != 2 or artifact["kind"] != "vision"
+                or artifact["method"] != METHODS[0] or artifact["seed"] != self.seed):
             raise ValueError("vision artifact must come from the same seed's main method TA")
         structural = ("schema_version", "observation", "vision", "ctm", "attention")
         if any(artifact["config"][k] != resolved_dict(self.config)[k] for k in structural):
@@ -199,12 +169,12 @@ class Runner:
 
     def _restore(self, payload):
         self.encoder.load_state_dict(payload["models"]["encoder"])
-        if self.world is not None:
-            self.world.load_state_dict(payload["models"]["world"])
-            self.world_optimizer.load_state_dict(payload["world_optimizer"])
-            self.world.freeze()
-        elif payload["models"]["world"] is not None or payload["world_optimizer"] is not None:
-            raise ValueError("baseline checkpoint contains forbidden world state")
+        if self.projector is not None:
+            self.projector.load_state_dict(payload["models"]["projector"])
+            self.projector.requires_grad_(False).eval()
+        elif payload["models"]["projector"] is not None:
+            raise ValueError("baseline checkpoint contains forbidden projector state")
+        self.visual_optimizer_state = payload["visual_optimizer_state"]
         if self.single:
             if any(payload["models"][name] is not None for name in ("kb", "dual")) or payload["fisher"] is not None:
                 raise ValueError("single-column checkpoint contains KB/dual/Fisher state")
@@ -218,10 +188,11 @@ class Runner:
                 self._track_ticks(self.policy)
         self.fisher = FisherState(**payload["fisher"]) if payload["fisher"] is not None else None
         self.pending_active = payload.get("pending_active", {})
+        self.diagnostics = payload["diagnostics"]
         if self.fisher is not None:
             from .learning.fisher import validate_fisher
             validate_fisher(self.kb, self.fisher)
-        for key in ("kb_ready", "fresh", "pools", "vision_source", "vision_export", "completed", "evaluations", "next_index", "counters", "finalized"):
+        for key in ("kb_ready", "vision_source", "vision_export", "completed", "evaluations", "next_index", "counters", "finalized"):
             setattr(self, key, payload[key])
         if self.completed != [str(s.key) for s in self.stages[:self.next_index]]:
             raise ValueError("completed stage prefix does not match next stage")
@@ -244,18 +215,18 @@ class Runner:
                     evaluation_steps=self.counters["eval_steps"])
 
     def _payload(self, stage_key):
-        return dict(schema_version=1, config=resolved_dict(self.config), config_hash=config_hash(self.config),
+        return dict(schema_version=2, config=resolved_dict(self.config), config_hash=config_hash(self.config),
             sources=self.sources, method=self.method, policy_kind="single" if self.single else "dual", seed=self.seed,
             task=self.task, current_stage=stage_key, next_index=self.next_index, completed=self.completed,
             stages=[s.record() for s in self.stages], counters=self.counters, rng=self.rng.state_dict(),
-            models=dict(encoder=self.encoder.state_dict(), world=self.world.state_dict() if self.world is not None else None,
+            models=dict(encoder=self.encoder.state_dict(), projector=self.projector.state_dict() if self.projector is not None else None,
                 kb=self.kb.state_dict() if self.kb is not None else None,
                 single=self.policy.state_dict() if self.single else None,
                 dual=self.policy.state_dict() if not self.single and self.policy is not None else None),
-            world_optimizer=self.world_optimizer.state_dict() if self.world_optimizer is not None else None,
+            visual_optimizer_state=self.visual_optimizer_state,
             fisher=asdict(self.fisher) if self.fisher is not None else None, kb_ready=self.kb_ready,
-            fresh=self.fresh, pools=self.pools, manifests=self.manifests, vision_source=self.vision_source,
-            vision_export=self.vision_export, pending_active=self.pending_active,
+            manifests=self.manifests, vision_source=self.vision_source,
+            vision_export=self.vision_export, pending_active=self.pending_active, diagnostics=self.diagnostics,
             evaluations=self.evaluations, costs=self.costs(), finalized=self.finalized)
 
     def _commit(self, key):
@@ -267,7 +238,7 @@ class Runner:
         value["downstream_progress_steps"] = self.counters["progress_steps"]+progress
         with (self.root / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(value, allow_nan=False)+"\n")
-        if value["type"] in ("ppo_update", "world_update", "distill_update", "learner_update",
+        if value["type"] in ("ppo_update", "distill_update", "learner_update",
                              "evaluation", "visual_drift", "stage_complete"):
             with (self.root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(value, allow_nan=False)+"\n")
@@ -297,7 +268,7 @@ class Runner:
             raise RuntimeError("P Active snapshot requires the shared frozen vision artifact")
         path = self.root / "exports/active" / f"v{stage.key.visit}_{stage.key.task}.pt"
         # The DualPolicy includes its original KB and adapter, not the future C student.
-        ck.save_artifact(path, dict(kind="active_snapshot", family=stage.key.family,
+        ck.save_artifact(path, dict(kind="active_snapshot", schema_version=2, family=stage.key.family,
             visit=stage.key.visit, task=stage.key.task, policy=self.policy.state_dict(),
             vision=vision, encoder_version=int(self.encoder.encoder_version)))
         self.pending_active[stage.key.task] = ck.reference(self.root, path)
@@ -305,8 +276,8 @@ class Runner:
     def _load_active(self, task, visit):
         path = ck.verify_reference(self.root, self.pending_active[task])
         payload = ck.load_artifact(path)
-        if (payload["kind"], payload["family"], payload["visit"], payload["task"]) != (
-                "active_snapshot", "pnc", visit, task):
+        if (payload["kind"], payload.get("schema_version"), payload["family"], payload["visit"], payload["task"]) != (
+                "active_snapshot", 2, "pnc", visit, task):
             raise ValueError("Active snapshot identity mismatch")
         # Never reconstruct a historical teacher on self.kb: load_state_dict would
         # overwrite the live, already compressed KB through shared parameter storage.
@@ -342,14 +313,14 @@ class Runner:
 
     def _phase_modes(self):
         return {name: dict(training=module.training, trainable=[n for n, p in module.named_parameters() if p.requires_grad])
-                for name, module in (("encoder", self.encoder), ("world", self.world), ("kb", self.kb), ("policy", self.policy)) if module is not None}
+                for name, module in (("encoder", self.encoder), ("projector", self.projector), ("kb", self.kb), ("policy", self.policy)) if module is not None}
 
     def _assert_phase_modes(self, stage):
-        world_fit = stage.key.subphase == "fit"
-        if self.encoder.training != world_fit or any(p.requires_grad != world_fit for p in self.encoder.parameters()):
+        x_stage = stage.key.phase == "X"
+        if self.encoder.training != x_stage or any(p.requires_grad != x_stage for p in self.encoder.parameters()):
             raise RuntimeError("visual phase ownership mismatch")
-        if self.world is not None and any(p.requires_grad != world_fit for p in self.world.parameters()):
-            raise RuntimeError("world phase ownership mismatch")
+        if self.projector is not None and any(p.requires_grad != x_stage for p in self.projector.parameters()):
+            raise RuntimeError("projector phase ownership mismatch")
         if self.kb is not None and any(p.requires_grad != (stage.key.phase in ("C", "F")) for p in self.kb.parameters()):
             raise RuntimeError("KB phase ownership mismatch")
         if self.policy is not None:
@@ -368,8 +339,8 @@ class Runner:
         def observed(count):
             attempt["confirmed_env_steps"] += count
             ck.atomic_json(attempt_path, attempt)
-        phase, sub = stage.key.phase, stage.key.subphase
-        envs, builder = None, None
+        phase = stage.key.phase
+        envs = None
         metrics = {}
         try:
             if phase in ("X", "P") and not self.single:
@@ -378,71 +349,52 @@ class Runner:
                 self._track_ticks(self.policy)
             if phase == "P":
                 self.encoder.freeze(permanent=True)
-            if phase != "W" and self.world is not None:
-                self.world.freeze()
-            if phase == "W":
-                freeze(self.kb)
-                if sub == "fit":
-                    self.world.set_fit_mode()
-                else:
-                    self.world.freeze()
-            elif phase in ("X", "P"):
-                if self.world is not None:
-                    self.world.freeze()
-                prepare_ppo(self.policy, self.encoder)
+            if phase in ("X", "P"):
+                prepare_ppo(self.policy, self.encoder, phase=phase)
+                if self.projector is not None:
+                    self.projector.requires_grad_(phase == "X").train(phase == "X")
             elif phase == "C":
                 self.policy = frozen_copy(self.policy)  # Separate teacher old-KB from live student before enabling gradients.
                 prepare_kb(self.kb, self.encoder)
+                if self.projector is not None:
+                    self.projector.requires_grad_(False).eval()
             else:
                 prepare_kb(self.kb, self.encoder)
                 self.kb.eval()
+                if self.projector is not None:
+                    self.projector.requires_grad_(False).eval()
             self._assert_phase_modes(stage)
             self._event(dict(type="stage_enter", stage=str(stage.key), modes=self._phase_modes()))
-            if phase != "W" or sub != "fit":
-                seeds = self.rng.numpy["env"].integers(0, 2**63-1, size=self.config.training.num_envs)
-                envs = CountedVector([build_env(stage.key.task, "train", int(seed), config=self.config,
-                                       maze_manifest=self.manifest) for seed in seeds], observed)
-            if phase == "W" and sub == "collect":
-                freeze(self.kb)
-                self.world.freeze()
-                collector = SnapshotCollector(self.encoder, self.kb, self.config, world_version=int(self.world.world_model_version))
-                directory = self.root / "world_fresh" / uuid.uuid4().hex
-                writer = ShardedWriter(directory, task=stage.key.task, encoder_version=int(self.encoder.encoder_version),
-                    world_version=int(self.world.world_model_version), source="W", source_stage=str(stage.key),
-                    expected_count=stage.transitions, shard_size=self.config.replay.shard_size, snapshot_id=collector.snapshot_id)
-                result = collector.collect(envs, writer, steps=stage.transitions,
-                    action_rng=self.rng.torch["policy_action"], start_transition_id=self.counters["global_env_steps"])
-                self.fresh = ck.reference(self.root, Path(result.manifest))
-                self.counters["world_collect_steps"] += stage.transitions
-            elif phase == "W":
-                fresh = TransitionStore(ck.verify_reference(self.root, self.fresh, replay=True))
-                high_ref = self.pools.get(stage.key.task)
-                high = TransitionStore(ck.verify_reference(self.root, high_ref, replay=True)) if high_ref else None
-                def world_progress(updates, metrics):
-                    self._event(dict(type="world_update", stage=str(stage.key),
-                        world_optimizer_updates=self.counters["world_optimizer_updates"]+updates, metrics=metrics))
-                metrics = fit_world_model(self.world, SIGReg(self.config.sigreg), fresh, high, self.world_optimizer, self.config,
-                    task=stage.key.task, replay_rng=self.rng.numpy["replay"], sigreg_rng=self.rng.torch["sigreg"],
-                    on_update=world_progress)
-                self.world.commit_fit()
-                self.counters["world_optimizer_updates"] += stage.world_updates
-                self.fresh = None
-            elif phase in ("X", "P"):
-                if phase == "X":
-                    builder = self.bank.begin(stage.key.task, encoder_version=int(self.encoder.encoder_version),
-                        world_version=int(self.world.world_model_version), source_stage=str(stage.key), expected_count=stage.transitions)
+            seeds = self.rng.numpy["env"].integers(0, 2**63-1, size=self.config.training.num_envs)
+            envs = CountedVector([build_env(stage.key.task, "train", int(seed), config=self.config,
+                                   maze_manifest=self.manifest) for seed in seeds], observed)
+            if phase in ("X", "P"):
                 def progress(consumed, metrics):
-                    self._event(dict(type="ppo_update", stage=str(stage.key), consumed=consumed, metrics=metrics))
+                    self._event(dict(type="ppo_update", stage=str(stage.key), consumed=consumed,
+                        x_joint_updates=self.counters["x_joint_updates"] +
+                            (metrics["stage_updates"] if phase == "X" else 0), metrics=metrics))
                 result = run_ppo_stage(envs, self.policy, self.encoder, self.config, phase=phase, steps=stage.transitions,
                     action_rng=self.rng.torch["policy_action"], minibatch_rng=self.rng.torch["ppo_shuffle"],
-                    world=self.world if phase == "X" else None, high_error=builder,
+                    projector=self.projector if phase == "X" else None,
+                    regularizer=SIGReg(self.config.sigreg).to(self.device) if phase == "X" else None,
+                    sigreg_rng=self.rng.torch["sigreg"] if phase == "X" else None,
+                    visual_state=self.visual_optimizer_state if phase == "X" else None,
                     start_transition_id=self.counters["global_env_steps"], on_rollout=progress)
                 if phase == "P" and not self.single:
                     self._save_active(stage)
                 self.counters["ppo_optimizer_updates"] += result["updates"]
                 self.counters["explore_steps" if phase == "X" else "progress_steps"] += stage.transitions
-                if builder is not None:
-                    self.pools[stage.key.task] = ck.reference(self.root, Path(result["pool_manifest"]))
+                if phase == "X":
+                    self.visual_optimizer_state = result["visual_state"]
+                    self.counters["x_joint_updates"] += result["updates"]
+                    self.encoder.encoder_version.add_(1)
+                    path = self.root / "diagnostics" / (str(stage.key).replace("/", "__")+"__"+uuid.uuid4().hex+".pt")
+                    ck.save_artifact(path, dict(kind="x_episodes", schema_version=2,
+                        stage=str(stage.key), episodes=result["diagnostic_episodes"]))
+                    self.diagnostics[str(stage.key)] = ck.reference(self.root, path)
+                    metrics = {**result["last"], **result["revisit"]}
+                else:
+                    metrics = result["last"]
             elif phase == "C":
                 def distill_progress(consumed, updates, metrics):
                     self._event(dict(type="distill_update", stage=str(stage.key), consumed=consumed,
@@ -475,7 +427,7 @@ class Runner:
             if stage.key.family == "ta" and (self.next_index == len(self.stages) or self.stages[self.next_index].key.family != "ta"):
                 self.encoder.freeze(permanent=True)
                 path = self.root / "exports/vision_final.pt"
-                ck.save_artifact(path, dict(kind="vision", method=self.method, seed=self.seed, config=resolved_dict(self.config),
+                ck.save_artifact(path, dict(kind="vision", schema_version=2, method=self.method, seed=self.seed, config=resolved_dict(self.config),
                     encoder=self.encoder.state_dict(), shared_ta_steps=self.counters["global_env_steps"],
                     maze_manifest_hash=self.manifests["maze"]["sha256"]))
                 self.vision_export = ck.reference(self.root, path)
@@ -483,7 +435,6 @@ class Runner:
             self._commit(str(stage.key))
             attempt.update(status="complete", committed=True, checkpoint=self.marker.name)
             ck.atomic_json(attempt_path, attempt)
-            self._cleanup()
             if self.next_index == len(self.stages):
                 self.finalize()
             return True
@@ -494,30 +445,6 @@ class Runner:
         finally:
             if envs is not None:
                 envs.close()
-            if builder is not None:
-                builder.abort()
-
-    def _cleanup(self):
-        # Only committed dependencies survive; old markers may intentionally become
-        # non-resumable and will fail dependency validation rather than resample data.
-        parent = self.root / "world_fresh"
-        keep = ck.contained(self.root, self.fresh["path"]).parent if self.fresh else None
-        if parent.exists():
-            for child in parent.iterdir():
-                if child.resolve().parent != parent.resolve() or not child.is_dir():
-                    raise ValueError("unsafe fresh cleanup target")
-                if child != keep:
-                    manifest = child / "manifest.json"
-                    if manifest.exists():
-                        audit = self.root / "manifests/fresh_audit" / (child.name+".json")
-                        audit.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(manifest, audit)
-                    shutil.rmtree(child)
-        if self.bank is not None:
-            for task in self.pools:
-                for manifest in (self.root / "replay" / task / "versions").glob("*/manifest.json"):
-                    audit = self.root / "manifests/replay_audit" / (task+"_"+manifest.parent.name+".json")
-                    audit.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(manifest, audit)
-                self.bank.prune(task)
 
     def finalize(self):
         output = self.root / "exports/final.pt"
@@ -549,7 +476,7 @@ class Runner:
             matrices[family] = dict(visits=[row["visit"] for row in rows],
                                     success_matrix=matrix, forgetting=forgetting(matrix))
         ck.atomic_json(self.root / "evaluation/forgetting.json", matrices)
-        ck.save_artifact(output, dict(kind="inference", method=self.method, seed=self.seed, task=self.task,
+        ck.save_artifact(output, dict(kind="inference", schema_version=2, method=self.method, seed=self.seed, task=self.task,
             policy_kind="single" if self.single else "dual", config=resolved_dict(self.config),
             encoder=self.encoder.state_dict(), policy=policy.state_dict(), maze_manifest=asdict(self.manifest), costs=self.costs()))
         self.finalized = True
@@ -576,7 +503,7 @@ def main() -> None:
     if args.dry_run:
         manifest = prepare_manifest(config, args.maze_manifest)
         print(json.dumps(dict(config_hash=config_hash(config), stages=[s.record() for s in stages],
-            transitions=sum(s.transitions for s in stages), world_updates=sum(s.world_updates for s in stages),
+            transitions=sum(s.transitions for s in stages),
             data_counts={name: len(manifest.entries(name)) for name in ("train", "validation", "test")}), indent=2))
         return
     if args.seed is None or args.run_dir is None or (args.max_stages is not None and args.max_stages < 1):
