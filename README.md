@@ -8,7 +8,7 @@
 
 ## Task-Agnostic：$X\rightarrow C\rightarrow F$
 
-默认执行 4 次 visit，每次按 Maze→FourRooms 顺序访问，每个任务执行 2 轮 $X\rightarrow C\rightarrow F$。每轮 X 恰好 200,000 环境步，无外在任务奖励。每个环境槽仅保存当前 episode 最近 20 张原始 RGB 帧；reset 时以初始帧填满窗口。动作后的真实末帧先与窗口比较，再入窗。设余弦相似度为 $s_i$，候选帧与当前帧的间隔为 $d_i\in[1,20]$，唯一 PPO 回报为
+默认执行 4 次 visit，每次按 Maze→FourRooms 顺序访问，每个任务执行 2 轮 $X\rightarrow C\rightarrow F$。每轮 X 恰好 500,000 环境步，无外在任务奖励。每个环境槽仅保存当前 episode 最近 20 张原始 RGB 帧；reset 时以初始帧填满窗口。动作后的真实末帧先与窗口比较，再入窗。设余弦相似度为 $s_i$，候选帧与当前帧的间隔为 $d_i\in[1,20]$，唯一 PPO 回报为
 
 $$
 q_i=\operatorname{clip}\left(\frac{s_i-0.999}{0.001},0,1\right),\quad

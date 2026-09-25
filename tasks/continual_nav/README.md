@@ -4,7 +4,7 @@
 
 ## 关键契约
 
-- 一次 TA visit 完成两个任务各自的全部 round；每个 round 依次执行 X、C、F。正式配置为 4 visits、每任务每 visit 2 rounds、每轮 X 200,000 环境步。X 的奖励仅来自当前 episode 原始像素重访惩罚。`transition_next_obs` 是奖励查询帧，自动 reset 帧只用于下一 episode 的窗口初始化。
+- 一次 TA visit 完成两个任务各自的全部 round；每个 round 依次执行 X、C、F。正式配置为 4 visits、每任务每 visit 2 rounds、每轮 X 500,000 环境步。X 的奖励仅来自当前 episode 原始像素重访惩罚。`transition_next_obs` 是奖励查询帧，自动 reset 帧只用于下一 episode 的窗口初始化。
 - X 的 Encoder、projector 和 Active 用 PPO＋SIGReg 联合更新；KB 冻结。每轮 Active 及其优化器随机重置；视觉权重及 AdamW 状态跨 X 轮延续。X 阶段完整结束后才生成可恢复 checkpoint。X 的 episode 窗口不持久化，最多四条完成的 episode 写入 `diagnostics/`，包含逐帧图片、动作、回报、窗口最大相似度、最大综合惩罚对应的相似度与间隔。
 - C 使用冻结的双列教师、20 张观察的 burn-in 和 Online EWC 蒸馏 KB。F 使用 KB 自身轨迹估计 Fisher。TA 结束后永久冻结 Encoder。P&C 的 P 只更新 Active/Adapter/Critic，C/F 仍只更新 KB 或 Fisher。
 - TA 每 visit 末评估 KB；P&C 每 visit 末依次评估 KB 与两个任务各自 P 阶段的原始 Active 快照。Active 快照包含当时的旧 KB，并引用冻结视觉 artifact。最终 test 只用 KB。评估步数单独计数，不计入训练预算。
