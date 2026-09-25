@@ -45,7 +45,11 @@ class WindowSynchrony(nn.Module):
 
     def forward(self, post: Tensor) -> Tensor:
         # Recompute from the finite window; age zero is the newest tick.
-        weights = torch.exp(-self.decay.clamp(0, 4)[:, None] * self.ages[None, :])
+        # Keep boundary gradients explicit: torch.clamp has version-dependent
+        # subgradients at 0 and 4, and decay is initialized exactly at 0.
+        decay = torch.where(self.decay < 0, torch.zeros_like(self.decay),
+                            torch.where(self.decay > 4, torch.full_like(self.decay, 4), self.decay))
+        weights = torch.exp(-decay[:, None] * self.ages[None, :])
         products = post[:, self.left, :] * post[:, self.right, :]
         return (products * weights).sum(-1) / weights.sum(-1).sqrt()
 
