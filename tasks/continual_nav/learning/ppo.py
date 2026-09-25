@@ -114,7 +114,8 @@ def train_ppo(batch: PPOBatch, policy: SingleActorCritic | DualPolicy, encoder: 
     for _ in range(config.ppo.update_epochs):
         for cpu_indices in environment_groups(batch.obs.shape[1], config.ppo.num_minibatches, rng):
             indices = cpu_indices.to(device)
-            features = encode_sequence(batch.obs[:, cpu_indices], encoder, trainable=phase == "X")
+            features = encode_sequence(batch.obs[:, cpu_indices], encoder, trainable=phase == "X",
+                                       max_images_per_forward=config.ppo.encoder_microbatch_images)
             def field(name):
                 return getattr(batch, name)[:, cpu_indices].to(device)
             output = policy.sequence(features, select_state(batch.initial_state, indices),

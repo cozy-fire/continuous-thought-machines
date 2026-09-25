@@ -13,7 +13,7 @@ from ..config import Config
 from ..contracts import FisherSequenceBatch, PPOBatch, PolicyOutput, SequenceBatch
 from ..envs import VectorEnvAdapter
 from ..models import DualPolicy, SingleActorCritic, StandalonePolicy, VisionEncoder, detach_state, encode_obs, frozen_copy
-from ..learning.common import prepare_ppo
+from ..learning.common import prepare_ppo, select_state
 from ..learning.ppo import compute_gae
 from ..learning.revisit import VisualRevisit
 
@@ -57,17 +57,29 @@ class PPOCollector:
             raise ValueError("rollout requires an exact positive budget no larger than rollout_steps")
         initial = detach_state(self.state)
         rows = {name: [] for name in ("obs", "next", "action", "logprob", "value", "reward", "start", "term", "trunc", "bootstrap")}
+        pending_nonterminal = None
         for _ in range(steps//b):
             obs = torch.from_numpy(self.obs.copy())
             output = self.policy.step(encode_obs(obs.to(self.device), self.encoder), self.state,
                                       torch.from_numpy(self.starts).to(self.device))
+            value = output.value.cpu()
+            if pending_nonterminal is not None:
+                # The next sampled observation has the same recurrent state and
+                # unchanged weights as the previous nonterminal's successor.
+                rows["bootstrap"][-1][pending_nonterminal] = value[pending_nonterminal]
             actions = sample_actions(output.logits, action_rng)
             result = self.envs.step(actions.numpy())
             final = torch.from_numpy(result.transition_next_obs.copy())
-            # Bootstrap from a functional state fork. Never assign its advanced trace
-            # back to the collector, and never reset it before a timeout final frame.
-            bootstrap = self.policy.step(encode_obs(final.to(self.device), self.encoder), output.state,
-                                         torch.zeros(b, dtype=torch.bool, device=self.device)).value
+            bootstrap = torch.zeros_like(value)
+            timeout_slots = torch.from_numpy(np.flatnonzero(result.truncated))
+            if len(timeout_slots):
+                # A timeout needs the true final frame, not the auto-reset frame.
+                # Advance only a detached state fork; keep the live rollout trace.
+                timeout_value = self.policy.step(
+                    encode_obs(final[timeout_slots].to(self.device), self.encoder),
+                    select_state(output.state, timeout_slots.to(self.device)),
+                    torch.zeros(len(timeout_slots), dtype=torch.bool, device=self.device)).value
+                bootstrap[timeout_slots] = timeout_value.cpu()
             if self.phase == "X":
                 reward, max_similarity, matched_similarity, gap = self.revisit.score(result.transition_next_obs, result.info,
                     result.next_episode_start, result.next_obs)
@@ -91,13 +103,22 @@ class PPOCollector:
             else:
                 reward = torch.from_numpy(result.reward_ext.copy())
             values = (obs, final, actions, Categorical(logits=output.logits).log_prob(actions.to(self.device)).cpu(),
-                      output.value.cpu(), reward.cpu(), torch.from_numpy(self.starts.copy()),
-                      torch.from_numpy(result.terminated.copy()), torch.from_numpy(result.truncated.copy()), bootstrap.cpu())
+                      value, reward.cpu(), torch.from_numpy(self.starts.copy()),
+                      torch.from_numpy(result.terminated.copy()), torch.from_numpy(result.truncated.copy()), bootstrap)
             for key, value in zip(rows, values):
                 rows[key].append(value)
             self.next_transition_id += b
             self.obs, self.starts = result.next_obs, result.next_episode_start
             self.state = detach_state(output.state)
+            pending_nonterminal = torch.from_numpy(~result.next_episode_start.copy())
+        if bool(pending_nonterminal.any()):
+            # Only the rollout boundary lacks a subsequent sampled value.
+            slots = pending_nonterminal.nonzero(as_tuple=True)[0]
+            boundary_value = self.policy.step(
+                encode_obs(torch.from_numpy(self.obs[slots.numpy()].copy()).to(self.device), self.encoder),
+                select_state(self.state, slots.to(self.device)),
+                torch.zeros(len(slots), dtype=torch.bool, device=self.device)).value
+            rows["bootstrap"][-1][slots] = boundary_value.cpu()
         x = {name: torch.stack(value) for name, value in rows.items()}
         valid = torch.ones_like(x["term"])
         adv, returns = compute_gae(x["reward"], x["value"], x["bootstrap"], x["term"], x["trunc"], valid,

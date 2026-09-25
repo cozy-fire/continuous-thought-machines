@@ -75,6 +75,7 @@ exploration:
 ppo:
   rollout_steps: 50
   num_minibatches: 4
+  encoder_microbatch_images: 32
   update_epochs: 1
   optimizer:
     name: Adam

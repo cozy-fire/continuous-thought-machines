@@ -2,6 +2,8 @@
 
 主方法 `tapd_ctm_visual_revisit` 使用 Task-Agnostic 的 `X→C→F` 和后续 `P→C→F`。`configs/full.yaml` 是正式预算，`configs/rtx5090_32gb.yaml` 保持相同环境步与 visit 数并调整吞吐设置，`configs/smoke.yaml` 是缩小预算的全流程验证。`python -m tasks.continual_nav.config --config <yaml>` 输出预算；`python -m tasks.continual_nav.train --config <yaml> --dry-run` 输出完整阶段表。
 
+`ppo.encoder_microbatch_images` 控制一次 ResNet 前向最多处理的图片数，不改变 PPO minibatch、优化器更新次数或训练预算。`full.yaml` 设为 32；RTX 5090 配置设为 200，覆盖当前每个 50 步×4 槽的完整 PPO minibatch。更改此值会改变配置哈希，已有 run 不能据此直接续训。
+
 ## 关键契约
 
 - 一次 TA visit 完成两个任务各自的全部 round；每个 round 依次执行 X、C、F。正式配置为 4 visits、每任务每 visit 2 rounds、每轮 X 500,000 环境步。X 的奖励仅来自当前 episode 原始像素重访惩罚。`transition_next_obs` 是奖励查询帧，自动 reset 帧只用于下一 episode 的窗口初始化。

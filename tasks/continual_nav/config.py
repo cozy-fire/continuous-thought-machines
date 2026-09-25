@@ -113,6 +113,7 @@ class ExplorationConfig:
 class PPOConfig:
     rollout_steps: int = 50
     num_minibatches: int = 4
+    encoder_microbatch_images: int = 32
     update_epochs: int = 1
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     gamma: float = 0.99
@@ -298,6 +299,7 @@ def validate_config(c: Config) -> None:
         "history length": c.exploration.history_length,
         "diagnostic episodes": c.exploration.diagnostic_episodes,
         "rollout_steps": c.ppo.rollout_steps, "ppo minibatches": c.ppo.num_minibatches,
+        "encoder microbatch images": c.ppo.encoder_microbatch_images,
         "learning_steps": c.distill.learning_steps, "distill minibatches": c.distill.minibatches,
         "distill log interval": c.distill.log_interval_windows,
         "Fisher samples": c.fisher.scored_samples, "eval interval": c.evaluation.interval_steps,

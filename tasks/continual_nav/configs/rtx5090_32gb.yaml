@@ -12,6 +12,9 @@ ppo:
   # Four full-environment groups preserve 50-step recurrent trajectories.
   # Each minibatch has 4 * 50 = 200 transitions instead of 2 * 50 = 100.
   num_minibatches: 4
+  # One ResNet forward covers the full 4 * 50 = 200-image PPO minibatch.
+  # Verify end-to-end X update time and peak VRAM on the actual 5090.
+  encoder_microbatch_images: 200
 distill:
   # Four groups yield 200 learning targets plus 40 burn-in observations.
   minibatches: 4

@@ -17,7 +17,7 @@
 | 目的 | 入口／来源 | 交接时要注意 |
 |---|---|---|
 | 阶段顺序、visit 边界、方法名 | `tasks/continual_nav/schedule.py` | `expand_stages` 是阶段表的准绳；一次 TA visit 完成任务顺序中**每个任务的全部 round**，不是每轮就切任务。 |
-| 正式预算 | `tasks/continual_nav/configs/full.yaml` | `rtx5090_32gb.yaml` 继承它，覆盖训练/评估槽数并显式写出 minibatch（当前 minibatch 数与 full 同值）；`smoke.yaml` 是小预算测试。`config.py` 的 dataclass 默认值不是正式实验预算。 |
+| 正式预算 | `tasks/continual_nav/configs/full.yaml` | `rtx5090_32gb.yaml` 继承它，覆盖训练/评估槽数、视觉 microbatch 图片数，并显式写出 minibatch（当前 minibatch 数与 full 同值）；`smoke.yaml` 是小预算测试。`config.py` 的 dataclass 默认值不是正式实验预算。 |
 | 配置检查和预算计算 | `tasks/continual_nav/config.py` | 始终运行 `python -m tasks.continual_nav.config --config <yaml>`，核对 `config_hash`、`ta_rounds`、`shared_ta_steps`、`main_steps`、`x_joint_updates`。所有阶段预算必须能被 `training.num_envs` 整除。 |
 | 训练、日志、恢复 | `tasks/continual_nav/train.py`、`checkpoint.py`、`wandb_logging.py` | 从仓库根目录以 `python -m ...` 调用；`--seed` 和 `--run-dir` 必填。 |
 | 环境、数据与动作 | `envs/`、`data/manifest.py`、`data/rollout.py` | 地图数据不在 Git；先验证目录和 manifest，不要重造固定评估面板。 |

@@ -51,11 +51,19 @@ def check_optimizer(optimizer: torch.optim.Optimizer, parameters: list[nn.Parame
         raise ValueError("optimizer parameter ownership does not match this phase")
 
 
-def encode_sequence(obs: Tensor, encoder: VisionEncoder, *, trainable: bool = False) -> Tensor:
-    # One time slice at a time bounds ResNet activation memory for long sequences.
+def encode_sequence(obs: Tensor, encoder: VisionEncoder, *, trainable: bool = False,
+                    max_images_per_forward: int = 32) -> Tensor:
+    if obs.ndim != 5 or not obs.shape[0] or not obs.shape[1] or max_images_per_forward < 1:
+        raise ValueError("visual sequence must be nonempty [L,B,C,H,W] with a positive chunk size")
+    length, batch_size = obs.shape[:2]
+    frames = obs.reshape(length*batch_size, *obs.shape[2:])
     device = next(encoder.parameters()).device
     with torch.set_grad_enabled(trainable):
-        return torch.stack([encode_obs(frame.to(device), encoder) for frame in obs])
+        # GroupNorm has per-image statistics, so contiguous chunks preserve each
+        # frame's features while bounding retained ResNet activations in X.
+        features = torch.cat([encode_obs(chunk.to(device), encoder)
+                              for chunk in frames.split(max_images_per_forward)], dim=0)
+    return features.reshape(length, batch_size, *features.shape[1:])
 
 
 def environment_groups(batch_size: int, count: int, rng: torch.Generator) -> tuple[Tensor, ...]:

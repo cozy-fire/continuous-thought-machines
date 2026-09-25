@@ -10,7 +10,7 @@ import torch
 
 from tasks.continual_nav.config import load_config
 from tasks.continual_nav.data.rollout import PPOCollector
-from tasks.continual_nav.learning.common import encode_sequence
+from tasks.continual_nav.learning.common import encode_sequence, select_state
 from tasks.continual_nav.learning.ppo import compute_gae, make_ppo_optimizer, make_x_optimizer, ppo_loss, run_ppo_stage, set_stage_learning_rate, train_ppo
 from tasks.continual_nav.models import DualPolicy, SIGReg, SigregProjector, SingleActorCritic, StandalonePolicy, VisionEncoder, encode_obs
 from tasks.continual_nav.verify_models import tensor_hash
@@ -60,6 +60,23 @@ class PixelProbe:
                       info=infos)
 
 
+class StaggeredProbe(PixelProbe):
+    """Terminate one slot while the other continues, then time out that slot."""
+    def step(self, actions):
+        self.t += 1
+        final = np.full((2, 3, 84, 84), 30+self.t, np.uint8)
+        terminated = np.array([self.t == 2, False])
+        truncated = np.array([False, self.t == 3])
+        done = terminated | truncated
+        next_obs = final.copy()
+        next_obs[done] = 0
+        infos = [dict(task_key="maze_medium", episode_id=0, episode_step=self.t,
+                      map_sha256="probe") for _ in range(2)]
+        return SimpleNamespace(next_obs=next_obs, transition_next_obs=final,
+                               terminated=terminated, truncated=truncated,
+                               next_episode_start=done, reward_ext=np.full(2, self.reward, np.float32), info=infos)
+
+
 class PPOTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(12)
@@ -99,6 +116,24 @@ class PPOTests(unittest.TestCase):
         _, metrics = ppo_loss(logits[:1], values[:1], actions[:1], old[:1], adv[:1], returns[:1], valid[:1], self.c)
         self.assertEqual(metrics["policy_loss"], 0)
 
+    def test_visual_sequence_chunks_preserve_features_and_gradients(self):
+        encoder = torch.nn.Sequential(torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.GroupNorm(2, 4))
+        reference = deepcopy(encoder)
+        obs = torch.randint(0, 256, (7, 3, 3, 8, 8), dtype=torch.uint8)
+        batch_sizes = []
+        hook = encoder.register_forward_pre_hook(lambda _module, args: batch_sizes.append(len(args[0])))
+        features = encode_sequence(obs, encoder, trainable=True, max_images_per_forward=5)
+        hook.remove()
+        expected = torch.stack([encode_obs(frame, reference) for frame in obs])
+        self.assertEqual(batch_sizes, [5, 5, 5, 5, 1])
+        torch.testing.assert_close(features, expected, atol=2e-6, rtol=1e-6)
+        features.square().mean().backward()
+        expected.square().mean().backward()
+        for actual, original in zip(encoder.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual.grad, original.grad, atol=2e-6, rtol=1e-5)
+        with self.assertRaises(ValueError):
+            encode_sequence(obs, encoder, max_images_per_forward=0)
+
     def test_real_policy_replay_ratio_final_bootstrap_and_frozen_groups(self):
         encoder = VisionEncoder(self.c)
         policy = DualPolicy(self.c, StandalonePolicy(self.c), kb_ready=True)
@@ -120,7 +155,17 @@ class PPOTests(unittest.TestCase):
                 if bool(batch.truncated[1, 1]):
                     state = policy.sequence(encode_sequence(batch.obs[:2], encoder), batch.initial_state, batch.episode_start[:2]).state
                     expected = policy.step(encode_obs(batch.transition_next_obs[1], encoder), state, torch.zeros(2, dtype=torch.bool)).value
-                    torch.testing.assert_close(expected, batch.bootstrap_values[1])
+                    torch.testing.assert_close(expected[1], batch.bootstrap_values[1, 1], atol=1e-5, rtol=0)
+                    self.assertEqual(batch.bootstrap_values[1, 0].item(), 0)
+                continuing = ~(batch.terminated[0] | batch.truncated[0])
+                torch.testing.assert_close(batch.bootstrap_values[0, continuing], batch.old_value[1, continuing],
+                                           atol=1e-5, rtol=0)
+                boundary_slots = ~(batch.terminated[-1] | batch.truncated[-1])
+                if bool(boundary_slots.any()):
+                    boundary = policy.step(encode_obs(torch.from_numpy(collector.obs.copy()), encoder), collector.state,
+                                           torch.zeros(2, dtype=torch.bool)).value
+                    torch.testing.assert_close(batch.bootstrap_values[-1, boundary_slots], boundary[boundary_slots],
+                                               atol=1e-5, rtol=0)
             collect_state = collector.state.active.post.clone()
             metrics = train_ppo(batch, policy, encoder, optimizer, self.c, rng=torch.Generator().manual_seed(5))
             self.assertLess(metrics["max_logprob_difference"], 1e-5)
@@ -131,7 +176,36 @@ class PPOTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None for p in encoder.parameters()))
         self.assertTrue(all(p.grad is None for p in policy.kb.parameters()))
 
+    def test_collector_bootstrap_inference_only_on_timeout_and_boundary(self):
+        encoder = VisionEncoder(self.c)
+        policy = SingleActorCritic(self.c)
+        collector = PPOCollector(PixelProbe(), policy, encoder, self.c, phase="P")
+        batch_sizes = []
+        hook = encoder.register_forward_pre_hook(lambda _module, args: batch_sizes.append(len(args[0])))
+        try:
+            batch = collector.collect(6, action_rng=torch.Generator().manual_seed(4))
+        finally:
+            hook.remove()
+        self.assertEqual(batch_sizes, [2, 2, 1, 2, 2])
+        self.assertEqual(batch.bootstrap_values.shape, (3, 2))
+
+    def test_bootstrap_tracks_independent_episode_boundaries(self):
+        encoder = VisionEncoder(self.c)
+        policy = SingleActorCritic(self.c)
+        collector = PPOCollector(StaggeredProbe(), policy, encoder, self.c, phase="P")
+        batch = collector.collect(8, action_rng=torch.Generator().manual_seed(4))
+        self.assertEqual(batch.bootstrap_values[1, 0].item(), 0)
+        torch.testing.assert_close(batch.bootstrap_values[1, 1], batch.old_value[2, 1], atol=1e-5, rtol=0)
+        torch.testing.assert_close(batch.bootstrap_values[2, 0], batch.old_value[3, 0], atol=1e-5, rtol=0)
+        with torch.no_grad():
+            state = policy.sequence(encode_sequence(batch.obs[:3], encoder), batch.initial_state,
+                                    batch.episode_start[:3]).state
+            final = encode_obs(batch.transition_next_obs[2, 1:2], encoder)
+            expected = policy.step(final, select_state(state, torch.tensor([1])), torch.zeros(1, dtype=torch.bool)).value
+        torch.testing.assert_close(batch.bootstrap_values[2, 1], expected[0], atol=1e-5, rtol=0)
+
     def test_X_uses_visual_reward_and_joint_gradients(self):
+        config = replace(self.c, ppo=replace(self.c.ppo, encoder_microbatch_images=3))
         encoder = VisionEncoder(self.c)
         projector = SigregProjector(self.c)
         policy = DualPolicy(self.c, StandalonePolicy(self.c))
@@ -139,10 +213,16 @@ class PPOTests(unittest.TestCase):
         collector = PPOCollector(PixelProbe(forbid_reward=True), policy, encoder, self.c, phase="X")
         batch = collector.collect(4, action_rng=torch.Generator().manual_seed(7))
         self.assertTrue((batch.reward <= 0).all())
-        optimizer = make_x_optimizer(policy, encoder, projector, self.c, None)
-        train_ppo(batch, policy, encoder, optimizer, self.c, rng=torch.Generator().manual_seed(8),
-                  phase="X", projector=projector, regularizer=SIGReg(self.c.sigreg),
-                  sigreg_rng=torch.Generator().manual_seed(9))
+        optimizer = make_x_optimizer(policy, encoder, projector, config, None)
+        batch_sizes = []
+        hook = encoder.register_forward_pre_hook(lambda _module, args: batch_sizes.append(len(args[0])))
+        try:
+            train_ppo(batch, policy, encoder, optimizer, config, rng=torch.Generator().manual_seed(8),
+                      phase="X", projector=projector, regularizer=SIGReg(config.sigreg),
+                      sigreg_rng=torch.Generator().manual_seed(9))
+        finally:
+            hook.remove()
+        self.assertEqual(batch_sizes, [3, 1])
         after = tuple(tensor_hash(module) for module in (encoder, projector, policy.active, policy.kb))
         self.assertTrue(all(a != b for a, b in zip(before[:3], after[:3])))
         self.assertEqual(before[3], after[3])
