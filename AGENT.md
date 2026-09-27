@@ -41,6 +41,7 @@ python -m tasks.continual_nav.train --config tasks/continual_nav/configs/rtx5090
 - v2 TA 每轮是 `X→C→F`，**没有 W 阶段、动作条件预测器或 high_error replay**。X 每槽只保留当前 episode 最近 20 张原始 RGB 帧；reset 用初始帧填窗。动作后必须用真实 `transition_next_obs` 先算回报再入窗，不能把自动 reset 的图片当上一 episode 的末帧。回报仅为像素重访惩罚，不混入环境任务成功奖励。X 的 PPO 与 SIGReg 一次反传更新 Encoder、projector 和 Active；KB 保持冻结。
 - C 用冻结的双列教师及 Encoder、20 张观察的无梯度 burn-in、KL 蒸馏和 Online EWC 更新 KB；F 在 KB 自身轨迹上估计 Fisher，不训练策略。TA 结束才导出并永久冻结共享视觉。P&C 每任务执行 `P→C→F`；当前代码的 P 用任务成功奖励训练 Active/Adapter/Critic，**Encoder 仍冻结**。若用户以后要求 P 更新 Encoder，那是新的算法和 checkpoint 契约变更，不能悄悄在运行中切换。
 - TA 每个完整 visit 末只评估当前 KB；P&C 每个完整 visit 末评估 KB、Maze Active、FourRooms Active，均覆盖两个任务。P 完成保存的 Active 快照带**当时的旧 KB、Adapter 和视觉引用**；不能把它接到后来 C 更新过的 KB。最终 test 仅用最终 KB（单列基线用最终单列策略）。评估环境步独立计数，不属于训练预算。
+- 主方法还支持 `--phase ta` 与 `--phase pnc` 两条独立训练命令。TA 结束导出 `exports/pnc_handoff.pt`；P&C 用 `--handoff-checkpoint` 导入冻结 Encoder、KB 与 Fisher，只校验交接产物的哈希、结构、任务和固定面板契约，不回查 TA 阶段流程。两阶段使用不同 run 目录；P&C 会复制交接产物到自身 run，后续 `--resume --phase pnc` 不依赖原 TA 目录。已有部分 TA 边界导出的同类交接产物也可直接启动 P&C；其未完成 TA 阶段不会自动补跑。
 - 对照方法名见 `schedule.METHODS`。除主方法外都要求同 seed 的 schema-v2 `exports/vision_final.pt`，且结构与 Maze manifest 哈希匹配；`single_task_ctm_shared_vision` 还必须传 `--task`。对照报告必须计入或明确列出共享视觉预训练成本，不能称为“完全没有预训练”。
 
 ## 4. 新训练、续训与代码更新

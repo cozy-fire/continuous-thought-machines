@@ -54,6 +54,18 @@ def expand_stages(config: Config, method: str, task: str | None = None) -> list[
     return stages
 
 
+def select_stages(config: Config, method: str, task: str | None = None,
+                  phase_mode: str = "full") -> list[Stage]:
+    stages = expand_stages(config, method, task)
+    if phase_mode == "full":
+        return stages
+    if method != METHODS[0] or phase_mode not in ("ta", "pnc"):
+        raise ValueError("split TA/P&C is supported only for the main method")
+    family = "ta" if phase_mode == "ta" else "pnc"
+    selected = [s for s in stages if s.key.family in ("init", family)]
+    return [Stage(index, stage.key, stage.transitions) for index, stage in enumerate(selected)]
+
+
 def derive_seed(seed: int, method: str, task: str | None, stream: str, ordinal: int = 0) -> int:
     if seed < 0 or method not in METHODS or stream not in STREAMS or ordinal < 0:
         raise ValueError("invalid deterministic RNG identity")

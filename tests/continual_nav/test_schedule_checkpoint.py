@@ -6,7 +6,7 @@ import unittest
 
 from tasks.continual_nav import checkpoint as ck
 from tasks.continual_nav.config import load_config
-from tasks.continual_nav.schedule import METHODS, RandomStreams, ends_visit, expand_stages
+from tasks.continual_nav.schedule import METHODS, RandomStreams, ends_visit, expand_stages, select_stages
 
 
 class ScheduleCheckpointTests(unittest.TestCase):
@@ -21,6 +21,13 @@ class ScheduleCheckpointTests(unittest.TestCase):
                          ["ta/v0/fourrooms/r1/F", "pnc/v0/fourrooms/F"])
         self.assertEqual(sum(s.transitions for s in stages), 600)
         self.assertEqual(len(expand_stages(self.config, METHODS[1], "maze_medium")), 2)
+        handoff_stages = select_stages(self.config, METHODS[0], phase_mode="pnc")
+        self.assertEqual([s.key.family for s in handoff_stages], ["init"]+["pnc"]*6)
+        self.assertEqual([str(s.key) for s in handoff_stages[1:]],
+                         [f"pnc/v0/{task}/{phase}" for task in ("maze_medium", "fourrooms")
+                          for phase in ("P", "C", "F")])
+        ta_stages = select_stages(self.config, METHODS[0], phase_mode="ta")
+        self.assertEqual([s.key.family for s in ta_stages], ["init"]+["ta"]*12)
 
     def test_rng_state_roundtrip(self):
         a = RandomStreams(0, METHODS[0], None)

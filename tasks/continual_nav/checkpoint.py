@@ -109,9 +109,11 @@ def load(root: Path, marker: Path | None = None, *, expected_config_hash: str | 
         raise ValueError("checkpoint source manifest mismatch")
     for ref in payload["manifests"].values():
         verify_reference(root, ref)
-    for ref in (payload["vision_source"], payload["vision_export"]):
+    for ref in (payload["vision_source"], payload["vision_export"], payload.get("handoff_source")):
         if ref is not None:
             verify_reference(root, ref)
+    if payload.get("handoff_source") is not None:
+        load_artifact(verify_reference(root, payload["handoff_source"]))
     for ref in payload.get("pending_active", {}).values():
         snapshot = load_artifact(verify_reference(root, ref))
         verify_reference(root, snapshot["vision"])

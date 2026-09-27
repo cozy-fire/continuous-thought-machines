@@ -22,6 +22,15 @@ python -m tasks.continual_nav.train --config tasks/continual_nav/configs/rtx5090
 python -m tasks.continual_nav.verify_smoke --output-dir runs/continual_nav/v2-smoke --device cpu
 ```
 
+TA 与 P&C 可由两个独立命令衔接。TA 完成时自动生成带 SHA-256 sidecar 的 `exports/pnc_handoff.pt`；它保存冻结 Encoder、KB、Online Fisher、来源训练计数和配置。P&C 只校验交接文件及结构、任务和固定面板契约，不读取 TA run 的 checkpoint 或阶段表。两个 run 分别用 `--phase ta`、`--phase pnc` 恢复；P&C 会将交接产物复制进自身 run，之后恢复不依赖原 TA 目录。新实例可使用不同的训练并行度与 microbatch 配置，但模型结构、任务及固定面板必须一致。
+
+```powershell
+python -m tasks.continual_nav.train --config <ta-config> --method tapd_ctm_visual_revisit --phase ta --seed 0 --run-dir <ta-run> --wandb-mode online
+python -m tasks.continual_nav.train --config <pnc-config> --method tapd_ctm_visual_revisit --phase pnc --seed 0 --run-dir <new-pnc-run> --handoff-checkpoint <ta-run>/exports/pnc_handoff.pt --wandb-mode online
+```
+
+已从部分 TA 的 C/F 边界导出的同类交接产物也可用于第二条命令；P&C 不推断或补跑剩余 TA。原有不带 `--phase` 的完整运行仍受支持。
+
 主方法运行结束后，`exports/vision_final.pt` 可供共享视觉基线导入。所有训练与评估标量写入本地 `events.jsonl`、`metrics.jsonl` 和 W&B。X 的 `ta_X_{task}/*` 面板包含 PPO、SIGReg、两组梯度范数、平均惩罚、非零惩罚率、RGB 元素不变率、整帧不变率、动作频率、相似度区间及间隔频率。`progress/*` 记录阶段完成的累计环境步与更新次数；评估面板按 TA/P&C、KB/Active 和任务分开。
 
 本实现仍使用同步训练环境适配器；评估可通过 `evaluation.backend=subprocess` 和 `evaluation.num_envs` 并行环境执行。`evaluation.interval_steps` 与 `evaluation.drift_episodes` 是保留的旧配置字段，不触发自动阶段中途评估。

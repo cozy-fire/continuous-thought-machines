@@ -26,7 +26,7 @@ from .learning.distill import run_compress_stage
 from .learning.fisher import estimate_fisher, update_online_fisher
 from .learning.ppo import run_ppo_stage
 from .models import Controller, DualPolicy, SIGReg, SigregProjector, SingleActorCritic, StandalonePolicy, VisionEncoder, frozen_copy
-from .schedule import METHODS, RandomStreams, expand_stages, ends_visit, visit_identity, isolated_rng
+from .schedule import METHODS, RandomStreams, select_stages, ends_visit, visit_identity, isolated_rng
 from .wandb_logging import WandbLogger
 
 
@@ -58,9 +58,10 @@ def prepare_manifest(config: Config, supplied: Path | None) -> MazeManifest:
 class Runner:
     def __init__(self, config: Config, method: str, seed: int, root: Path, *, task: str | None = None,
                  manifest_path: Path | None = None, vision_checkpoint: Path | None = None, resume: bool = False,
-                 wandb_mode: str | None = None):
+                 handoff_checkpoint: Path | None = None, phase_mode: str = "full", wandb_mode: str | None = None):
         self.config, self.method, self.seed, self.task, self.root = config, method, seed, task, root.resolve()
-        self.stages = expand_stages(config, method, task)
+        self.phase_mode = phase_mode
+        self.stages = select_stages(config, method, task, phase_mode)
         if seed not in config.training.seeds:
             raise ValueError("seed must be explicitly listed in the run configuration")
         self.device = torch.device(config.training.device)
@@ -72,7 +73,7 @@ class Runner:
         self.encoder = self.projector = self.kb = self.policy = None
         self.visual_optimizer_state = {}
         self.fisher, self.kb_ready = None, False
-        self.vision_source = self.vision_export = None
+        self.vision_source = self.vision_export = self.handoff_source = None
         self.completed, self.evaluations, self.next_index = [], [], 1
         self.pending_active = {}
         self.diagnostics = {}
@@ -85,6 +86,8 @@ class Runner:
             payload = ck.load(self.root, expected_config_hash=config_hash(config), expected_sources=self.sources)
             if (payload["method"], payload["seed"], payload["task"]) != (method, seed, task):
                 raise ValueError("resume method/seed/task mismatch")
+            if payload.get("phase_mode", "full") != phase_mode:
+                raise ValueError("resume training phase mismatch")
             if payload["stages"] != [s.record() for s in self.stages] or payload["policy_kind"] != ("single" if self.single else "dual"):
                 raise ValueError("resume schedule/policy kind mismatch")
             self.manifests = payload["manifests"]
@@ -92,6 +95,8 @@ class Runner:
             self._construct()
             self._restore(payload)
         else:
+            if (phase_mode == "pnc") != (handoff_checkpoint is not None):
+                raise ValueError("P&C-only training requires exactly one --handoff-checkpoint")
             if method != METHODS[0] and vision_checkpoint is None:
                 raise ValueError("shared-vision baseline requires --vision-checkpoint")
             if method == METHODS[0] and vision_checkpoint is not None:
@@ -112,8 +117,11 @@ class Runner:
             self._construct()
             if vision_checkpoint is not None:
                 self._import_vision(vision_checkpoint)
-            ck.atomic_json(self.root / "provenance.json", dict(method=method, seed=seed, task=task,
+            if handoff_checkpoint is not None:
+                self._import_handoff(handoff_checkpoint)
+            ck.atomic_json(self.root / "provenance.json", dict(method=method, phase_mode=phase_mode, seed=seed, task=task,
                 sources=self.sources, config_hash=config_hash(config), device=str(self.device), rng_seeds=self.rng.seeds,
+                handoff_source=self.handoff_source,
                 stages=[s.record() for s in self.stages], python=platform.python_version(),
                 cuda_runtime=torch.version.cuda,
                 gpu=torch.cuda.get_device_name(self.device) if self.device.type == "cuda" else None,
@@ -128,7 +136,7 @@ class Runner:
     def _construct(self):
         with self.rng.model_initialization(0):
             self.encoder = VisionEncoder(self.config).to(self.device)
-            if self.method == METHODS[0]:
+            if self.method == METHODS[0] and self.phase_mode != "pnc":
                 self.projector = SigregProjector(self.config).to(self.device)
                 self.projector.requires_grad_(False).eval()
             if self.single:
@@ -167,6 +175,42 @@ class Runner:
         shutil.copyfile(path.with_suffix(path.suffix+".sha256.json"), destination.with_suffix(destination.suffix+".sha256.json"))
         self.vision_source = ck.reference(self.root, destination)
 
+    def _import_handoff(self, path: Path) -> None:
+        artifact = ck.load_artifact(path)
+        if (artifact.get("kind"), artifact.get("schema_version"), artifact.get("method"), artifact.get("seed")) != (
+                "partial_ta_pnc_handoff", 2, METHODS[0], self.seed):
+            raise ValueError("handoff must contain the same seed's v2 main-method TA state")
+        source_config = artifact["config"]
+        current_config = resolved_dict(self.config)
+        for key in ("schema_version", "task_order", "observation", "vision", "ctm", "attention"):
+            if source_config[key] != current_config[key]:
+                raise ValueError(f"handoff {key} mismatch")
+        for key in ("max_steps", "reward", "tile_size"):
+            if source_config["environment"][key] != current_config["environment"][key]:
+                raise ValueError(f"handoff environment {key} mismatch")
+        if artifact["maze_manifest_sha"] != self.manifests["maze"]["sha256"]:
+            raise ValueError("handoff maze and fixed evaluation panels mismatch")
+        # P&C consumes a complete, hash-checked artifact; the producing TA run
+        # and its stage history are provenance, never runtime dependencies.
+        self.encoder.load_state_dict(artifact["models"]["encoder"])
+        self.kb.load_state_dict(artifact["models"]["kb"])
+        self.fisher = FisherState(**artifact["fisher"])
+        from .learning.fisher import validate_fisher
+        validate_fisher(self.kb, self.fisher)
+        self.kb_ready = True
+        self.encoder.freeze(permanent=True)
+        destination = self.root / "exports/partial_ta_handoff.pt"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, destination)
+        shutil.copyfile(path.with_suffix(path.suffix+".sha256.json"), destination.with_suffix(destination.suffix+".sha256.json"))
+        self.handoff_source = ck.reference(self.root, destination)
+        vision_path = self.root / "exports/vision_final.pt"
+        ck.save_artifact(vision_path, dict(kind="vision", schema_version=2, method=METHODS[0], seed=self.seed,
+            config=resolved_dict(self.config), encoder=self.encoder.state_dict(),
+            shared_ta_steps=artifact["counters"]["global_env_steps"],
+            maze_manifest_hash=self.manifests["maze"]["sha256"]))
+        self.vision_export = ck.reference(self.root, vision_path)
+
     def _restore(self, payload):
         self.encoder.load_state_dict(payload["models"]["encoder"])
         if self.projector is not None:
@@ -194,6 +238,7 @@ class Runner:
             validate_fisher(self.kb, self.fisher)
         for key in ("kb_ready", "vision_source", "vision_export", "completed", "evaluations", "next_index", "counters", "finalized"):
             setattr(self, key, payload[key])
+        self.handoff_source = payload.get("handoff_source")
         if self.completed != [str(s.key) for s in self.stages[:self.next_index]]:
             raise ValueError("completed stage prefix does not match next stage")
         self.rng.load_state_dict(payload["rng"])
@@ -205,17 +250,19 @@ class Runner:
         if vision_ref is not None:
             artifact = torch.load(ck.verify_reference(self.root, vision_ref), map_location="cpu", weights_only=True)
             shared = artifact["shared_ta_steps"]
-        return dict(shared_visual_TA_generation_steps=shared, shared_cost_paid_in_this_run=self.method == METHODS[0],
+        return dict(shared_visual_TA_generation_steps=shared,
+                    shared_cost_paid_in_this_run=self.method == METHODS[0] and self.phase_mode != "pnc",
                     planned_shared_TA_steps=budget_summary(self.config)["shared_ta_steps"],
                     actual_committed_training_steps=self.counters["global_env_steps"],
                     additional_downstream_training_steps=(max(0, self.counters["global_env_steps"]-(shared or self.counters["global_env_steps"]))
-                        if self.method == METHODS[0] else self.counters["global_env_steps"]),
+                        if self.method == METHODS[0] and self.phase_mode != "pnc" else self.counters["global_env_steps"]),
                     downstream_progress_steps=self.counters["progress_steps"],
                     planned_run_training_steps=sum(s.transitions for s in self.stages),
                     evaluation_steps=self.counters["eval_steps"])
 
     def _payload(self, stage_key):
         return dict(schema_version=2, config=resolved_dict(self.config), config_hash=config_hash(self.config),
+            phase_mode=self.phase_mode,
             sources=self.sources, method=self.method, policy_kind="single" if self.single else "dual", seed=self.seed,
             task=self.task, current_stage=stage_key, next_index=self.next_index, completed=self.completed,
             stages=[s.record() for s in self.stages], counters=self.counters, rng=self.rng.state_dict(),
@@ -226,7 +273,8 @@ class Runner:
             visual_optimizer_state=self.visual_optimizer_state,
             fisher=asdict(self.fisher) if self.fisher is not None else None, kb_ready=self.kb_ready,
             manifests=self.manifests, vision_source=self.vision_source,
-            vision_export=self.vision_export, pending_active=self.pending_active, diagnostics=self.diagnostics,
+            vision_export=self.vision_export, handoff_source=self.handoff_source,
+            pending_active=self.pending_active, diagnostics=self.diagnostics,
             evaluations=self.evaluations, costs=self.costs(), finalized=self.finalized)
 
     def _commit(self, key):
@@ -431,6 +479,13 @@ class Runner:
                     encoder=self.encoder.state_dict(), shared_ta_steps=self.counters["global_env_steps"],
                     maze_manifest_hash=self.manifests["maze"]["sha256"]))
                 self.vision_export = ck.reference(self.root, path)
+                handoff_path = self.root / "exports/pnc_handoff.pt"
+                ck.save_artifact(handoff_path, dict(kind="partial_ta_pnc_handoff", schema_version=2,
+                    method=METHODS[0], seed=self.seed, config=resolved_dict(self.config),
+                    config_hash=config_hash(self.config), maze_manifest_sha=self.manifests["maze"]["sha256"],
+                    models=dict(encoder=self.encoder.state_dict(), kb=self.kb.state_dict()),
+                    fisher=asdict(self.fisher), counters=self.counters.copy(),
+                    source_stage=str(stage.key), completed_ta=self.completed.copy()))
             self._event(dict(type="stage_complete", stage=str(stage.key), modes=self._phase_modes(), counters=self.counters))
             self._commit(str(stage.key))
             attempt.update(status="complete", committed=True, checkpoint=self.marker.name)
@@ -487,11 +542,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--method", choices=METHODS, default=METHODS[0])
+    parser.add_argument("--phase", choices=("full", "ta", "pnc"), default="full",
+                        help="Run the main method end-to-end or as two independent TA/P&C commands")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--task", choices=TASKS)
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--maze-manifest", type=Path)
     parser.add_argument("--vision-checkpoint", type=Path)
+    parser.add_argument("--handoff-checkpoint", type=Path, help="Hash-checked TA model/Fisher artifact for P&C-only training")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
                         help="Override W&B mode; full runs default to online")
@@ -499,7 +557,7 @@ def main() -> None:
     parser.add_argument("--max-stages", type=int, help="Stop after N additional complete stages; never truncate a stage")
     args = parser.parse_args()
     config = load_config(args.config)
-    stages = expand_stages(config, args.method, args.task)
+    stages = select_stages(config, args.method, args.task, args.phase)
     if args.dry_run:
         manifest = prepare_manifest(config, args.maze_manifest)
         print(json.dumps(dict(config_hash=config_hash(config), stages=[s.record() for s in stages],
@@ -510,7 +568,8 @@ def main() -> None:
         parser.error("training requires explicit --seed and --run-dir; --max-stages must be positive")
     torch.set_num_threads(2)
     runner = Runner(config, args.method, args.seed, args.run_dir, task=args.task, manifest_path=args.maze_manifest,
-                    vision_checkpoint=args.vision_checkpoint, resume=args.resume, wandb_mode=args.wandb_mode)
+                    vision_checkpoint=args.vision_checkpoint, handoff_checkpoint=args.handoff_checkpoint,
+                    phase_mode=args.phase, resume=args.resume, wandb_mode=args.wandb_mode)
     try:
         count = 0
         while runner.next_index < len(stages) and (args.max_stages is None or count < args.max_stages):
