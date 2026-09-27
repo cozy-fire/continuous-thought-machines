@@ -1,12 +1,14 @@
 """New X→C→F schedule and fail-closed schema-v2 checkpoints."""
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from dataclasses import replace
 import json
 import unittest
 
 from tasks.continual_nav import checkpoint as ck
-from tasks.continual_nav.config import load_config
+from tasks.continual_nav.config import load_config, resolved_dict
 from tasks.continual_nav.schedule import METHODS, RandomStreams, ends_visit, expand_stages, select_stages
+from tasks.continual_nav.train import _validate_pnc_budget_resume
 
 
 class ScheduleCheckpointTests(unittest.TestCase):
@@ -43,6 +45,39 @@ class ScheduleCheckpointTests(unittest.TestCase):
             marker.write_text(json.dumps({"schema_version": 1, "stage_key": "init", "checkpoint": {}}))
             with self.assertRaisesRegex(ValueError, "complete checkpoint"):
                 ck.load(root, marker)
+
+    def test_pnc_budget_resume_preserves_committed_prefix_and_changes_future(self):
+        old = load_config("tasks/continual_nav/configs/full.yaml")
+        new = replace(old, pnc=replace(old.pnc, visits=6, progress_steps=250000, compress_steps=100000))
+        old_stages = select_stages(old, METHODS[0], phase_mode="pnc")
+        new_stages = select_stages(new, METHODS[0], phase_mode="pnc")
+        next_index = next(i + 1 for i, stage in enumerate(old_stages)
+                          if str(stage.key) == "pnc/v0/fourrooms/F")
+        payload = dict(config=resolved_dict(old), stages=[stage.record() for stage in old_stages],
+                       next_index=next_index,
+                       sources={"tasks/continual_nav/train.py": "old", "same.py": "same"}, phase_mode="pnc")
+
+        resumed = _validate_pnc_budget_resume(payload, new, new_stages,
+            {"tasks/continual_nav/train.py": "new", "same.py": "same"})
+
+        self.assertEqual(len(resumed), 1 + 6 * len(new.task_order) * 3)
+        self.assertEqual([stage.transitions for stage in resumed[:next_index]],
+                         [stage.transitions for stage in old_stages[:next_index]])
+        self.assertEqual(str(resumed[next_index].key), "pnc/v1/maze_medium/P")
+        self.assertEqual(resumed[next_index].transitions, 250000)
+        self.assertEqual(resumed[next_index + 1].transitions, 100000)
+
+    def test_pnc_budget_resume_rejects_other_config_changes(self):
+        old = load_config("tasks/continual_nav/configs/full.yaml")
+        changed = replace(old, pnc=replace(old.pnc, visits=6, progress_steps=250000, compress_steps=100000),
+                          training=replace(old.training, num_envs=old.training.num_envs * 2))
+        stages = select_stages(changed, METHODS[0], phase_mode="pnc")
+        payload = dict(config=resolved_dict(old), stages=[stage.record() for stage in
+                       select_stages(old, METHODS[0], phase_mode="pnc")], next_index=7,
+                       sources={"tasks/continual_nav/train.py": "old"}, phase_mode="pnc")
+        with self.assertRaisesRegex(ValueError, "non-P&C configuration"):
+            _validate_pnc_budget_resume(payload, changed, stages,
+                                        {"tasks/continual_nav/train.py": "new"})
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ import torch
 
 from . import checkpoint as ck
 from .analysis.metrics import forgetting
-from .config import Config, budget_summary, config_hash, load_config, resolved_dict, save_config
+from .config import Config, budget_summary, config_from_dict, config_hash, load_config, resolved_dict, save_config
 from .contracts import FisherState, TASKS
 from .data.manifest import MazeManifest, build_manifest
 from .data.rollout import collect_fisher
@@ -55,10 +55,53 @@ def prepare_manifest(config: Config, supplied: Path | None) -> MazeManifest:
                    test_panel=manifest.test_panel[:ev.test_episodes], drift_panel=manifest.drift_panel[:ev.drift_episodes])
 
 
+def _validate_pnc_budget_resume(payload: dict, config: Config, stages: list, sources: dict) -> list:
+    """Allow only future P&C budget edits while retaining the committed schedule prefix."""
+    if payload.get("phase_mode", "full") != "pnc":
+        raise ValueError("P&C budget changes are supported only for P&C-only resumes")
+    old_config = config_from_dict(payload["config"])
+    old_resolved, new_resolved = resolved_dict(old_config), resolved_dict(config)
+    old_pnc, new_pnc = old_resolved.pop("pnc"), new_resolved.pop("pnc")
+    if old_resolved != new_resolved:
+        raise ValueError("P&C budget resume cannot change non-P&C configuration")
+    if old_pnc == new_pnc or config.pnc.visits < old_config.pnc.visits:
+        raise ValueError("P&C budget resume requires changed budgets and a non-decreasing visit count")
+
+    # This explicit opt-in tolerates only this resume-validation edit in source provenance.
+    old_sources = dict(payload["sources"])
+    new_sources = dict(sources)
+    source_path = "tasks/continual_nav/train.py"
+    old_sources.pop(source_path, None)
+    new_sources.pop(source_path, None)
+    if old_sources != new_sources:
+        raise ValueError("P&C budget resume source manifest mismatch outside train.py")
+
+    old_stages = payload["stages"]
+    current = [stage.record() for stage in stages]
+    next_index = int(payload["next_index"])
+    if not 0 < next_index < len(old_stages) or len(current) < len(old_stages):
+        raise ValueError("P&C budget resume requires a committed prefix and a non-shortened schedule")
+    for index, old in enumerate(old_stages):
+        new = current[index]
+        if any(old[field] != new[field] for field in ("ordinal", "key", "identity")):
+            raise ValueError("P&C budget resume changed stage identity or order")
+        if index >= next_index and old["transitions"] != new["transitions"]:
+            identity = old["identity"]
+            if identity["family"] != "pnc" or identity["phase"] not in ("P", "C"):
+                raise ValueError("P&C budget resume may change only future P/C transition budgets")
+    if any(stage.key.family != "pnc" for stage in stages[len(old_stages):]):
+        raise ValueError("P&C budget resume may append only P&C stages")
+
+    # Keep the original transition counts on completed stages for an auditable history.
+    return [replace(stage, transitions=old_stages[index]["transitions"]) if index < next_index else stage
+            for index, stage in enumerate(stages)]
+
+
 class Runner:
     def __init__(self, config: Config, method: str, seed: int, root: Path, *, task: str | None = None,
                  manifest_path: Path | None = None, vision_checkpoint: Path | None = None, resume: bool = False,
-                 handoff_checkpoint: Path | None = None, phase_mode: str = "full", wandb_mode: str | None = None):
+                 handoff_checkpoint: Path | None = None, phase_mode: str = "full", wandb_mode: str | None = None,
+                 allow_pnc_budget_change: bool = False):
         self.config, self.method, self.seed, self.task, self.root = config, method, seed, task, root.resolve()
         self.phase_mode = phase_mode
         self.stages = select_stages(config, method, task, phase_mode)
@@ -82,13 +125,31 @@ class Runner:
             "compress_steps", "fisher_steps", "eval_steps", "x_joint_updates", "ppo_optimizer_updates",
             "distill_optimizer_updates", "policy_internal_ticks", "eval_internal_ticks")}
         self._hooked, self._evaluating = WeakSet(), False
+        if allow_pnc_budget_change and not resume:
+            raise ValueError("--allow-pnc-budget-change requires --resume")
         if resume:
-            payload = ck.load(self.root, expected_config_hash=config_hash(config), expected_sources=self.sources)
+            payload = ck.load(self.root,
+                expected_config_hash=None if allow_pnc_budget_change else config_hash(config),
+                expected_sources=None if allow_pnc_budget_change else self.sources)
+            if allow_pnc_budget_change:
+                self.stages = _validate_pnc_budget_resume(payload, config, self.stages, self.sources)
+                if payload["sources"].get("tasks/continual_nav/train.py") == self.sources.get("tasks/continual_nav/train.py"):
+                    raise ValueError("--allow-pnc-budget-change is reserved for the explicit resume compatibility change")
             if (payload["method"], payload["seed"], payload["task"]) != (method, seed, task):
                 raise ValueError("resume method/seed/task mismatch")
             if payload.get("phase_mode", "full") != phase_mode:
                 raise ValueError("resume training phase mismatch")
-            if payload["stages"] != [s.record() for s in self.stages] or payload["policy_kind"] != ("single" if self.single else "dual"):
+            expected_stages = [s.record() for s in self.stages]
+            if payload["policy_kind"] != ("single" if self.single else "dual"):
+                raise ValueError("resume schedule/policy kind mismatch")
+            if allow_pnc_budget_change:
+                for index, (old, new) in enumerate(zip(payload["stages"], expected_stages)):
+                    if index < payload["next_index"]:
+                        if any(old[field] != new[field] for field in ("ordinal", "key", "identity", "transitions")):
+                            raise ValueError("committed stage history could not be preserved")
+                    elif any(old[field] != new[field] for field in ("ordinal", "key", "identity")):
+                        raise ValueError("resume schedule/policy kind mismatch")
+            elif payload["stages"] != expected_stages:
                 raise ValueError("resume schedule/policy kind mismatch")
             self.manifests = payload["manifests"]
             self.manifest = MazeManifest.load(ck.verify_reference(self.root, self.manifests["maze"]), config.environment.maze_root)
@@ -551,6 +612,8 @@ def main() -> None:
     parser.add_argument("--vision-checkpoint", type=Path)
     parser.add_argument("--handoff-checkpoint", type=Path, help="Hash-checked TA model/Fisher artifact for P&C-only training")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--allow-pnc-budget-change", action="store_true",
+                        help="Resume after changing only P&C visit/P/C budgets; preserves committed history")
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"),
                         help="Override W&B mode; full runs default to online")
     parser.add_argument("--dry-run", action="store_true")
@@ -569,7 +632,8 @@ def main() -> None:
     torch.set_num_threads(2)
     runner = Runner(config, args.method, args.seed, args.run_dir, task=args.task, manifest_path=args.maze_manifest,
                     vision_checkpoint=args.vision_checkpoint, handoff_checkpoint=args.handoff_checkpoint,
-                    phase_mode=args.phase, resume=args.resume, wandb_mode=args.wandb_mode)
+                    phase_mode=args.phase, resume=args.resume, wandb_mode=args.wandb_mode,
+                    allow_pnc_budget_change=args.allow_pnc_budget_change)
     try:
         count = 0
         while runner.next_index < len(stages) and (args.max_stages is None or count < args.max_stages):
