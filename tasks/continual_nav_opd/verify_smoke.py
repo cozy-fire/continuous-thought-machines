@@ -1,0 +1,157 @@
+"""Real two-visit acceptance, boundary resume, inference and media verification."""
+from __future__ import annotations
+
+import argparse
+import csv
+from dataclasses import replace
+import hashlib
+import json
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import time
+
+import torch
+from PIL import Image
+
+from .checkpoint import atomic_json, load_boundary, verify_reference
+from .config import REPO_ROOT, load_config
+from .evaluate import evaluate_policy, load_for_evaluation
+from .runner import run
+from .schedule import expand_stages
+from .visualize import visualize
+
+
+def file_inventory(root: Path) -> dict:
+    """Hash files incrementally; never materialize a checkpoint in a second buffer."""
+    result = {}
+    for path in sorted(root.rglob('*')):
+        if path.is_file() and path.name != 'inventory.json':
+            digest = hashlib.sha256()
+            with path.open('rb') as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(block)
+            result[path.relative_to(root).as_posix()] = {'size': path.stat().st_size, 'sha256': digest.hexdigest()}
+    return result
+
+
+def audit_run(root: Path, config, seed: int) -> dict:
+    payload, _ = load_boundary(root/'checkpoints/latest.json', config, seed)
+    stages = expand_stages(config)
+    if not payload['finalized'] or payload['next_index'] != 12 or len(stages) != 12:
+        raise ValueError('incomplete two-visit smoke')
+    if payload['global_env_steps'] != 1664 or payload['optimizer_updates'] != 20:
+        raise ValueError('unexpected smoke budget or update count')
+    events = [json.loads(line) for line in (root/'events.jsonl').read_text(encoding='utf-8').splitlines()]
+    completed = [e for e in events if e['event'] == 'stage_complete']
+    if len(completed) != 12 or [e['stage'] for e in completed] != [s.key for s in stages]:
+        raise ValueError('missing, duplicate or out-of-order stages')
+    for stage, event in zip(stages, completed):
+        stats = event['statistics']
+        if stage.phase == 'F':
+            if stats['scored_samples'] != 8 or len(set(stats['selected_ids'])) != 8:
+                raise ValueError('Fisher IDs are incomplete/nonunique')
+        else:
+            windows = [e for e in events if e['event'] == 'training' and e['stage'] == stage.key]
+            if not windows or windows[-1]['eligible_target_steps'] != stage.env_steps:
+                raise ValueError('first-step teaching or final target count is wrong')
+            if windows[-1]['optimizer_updates'] != (3 if stage.phase == 'P' else 2):
+                raise ValueError('unexpected stage optimizer count')
+    reports = {}
+    for key, entry in payload['evaluations'].items():
+        report = json.loads(verify_reference(root, entry['reference']).read_text(encoding='utf-8'))
+        if set(report['tasks']) != set(config.task_order):
+            raise ValueError('incomplete task panel')
+        for task, metrics in report['tasks'].items():
+            if len(metrics['results']) != config.evaluation.validation_episodes:
+                raise ValueError('incomplete episode panel')
+        reports[key] = {task: value['success_rate'] for task, value in report['tasks'].items()}
+    if len(reports) != 8 or len(payload['visit_reports']) != 2:
+        raise ValueError('incorrect evaluation schedule')
+    policy, _, _, _ = load_for_evaluation(root/'exports/final.pt', device=config.training.device)
+    if set(payload['fisher'].importance) != set(dict(policy.named_parameters())):
+        raise ValueError('Fisher does not cover the complete model')
+    return {'stages': 12, 'transitions': 1664, 'updates': 20, 'validation': reports,
+            'fisher_parameters': len(payload['fisher'].importance), 'finalized': True}
+
+
+def verify(output_dir, device='cuda:0', seed=0):
+    root = Path(output_dir).resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    torch.set_num_threads(2)
+    config = load_config(REPO_ROOT/'tasks/continual_nav_opd/configs/smoke.yaml')
+    config = replace(config, training=replace(config.training, device=device))
+    start = time.perf_counter()
+    commands = [('git_commit', ['git', '-c', f'safe.directory={REPO_ROOT.as_posix()}', 'rev-parse', 'HEAD']),
+                ('git_dirty', ['git', '-c', f'safe.directory={REPO_ROOT.as_posix()}', 'status', '--short'])]
+    environment = {'python': sys.version, 'executable': sys.executable, 'platform': platform.platform(),
+                   'torch': torch.__version__, 'cuda_runtime': torch.version.cuda, 'device': device,
+                   'gpu': torch.cuda.get_device_name(device) if device.startswith('cuda') else None}
+    for name, command in commands:
+        value = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+        environment[name] = value.stdout.strip()
+    atomic_json(root/'environment.json', environment)
+    try:
+        peaks = []
+        def capture_peak():
+            if device.startswith('cuda'):
+                peaks.append((torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)))
+        # Exercise a REAL P boundary resume. Already committed P/evaluation must not run again.
+        run(config, seed, root/'run', max_stages=1)
+        capture_peak()
+        run(config, seed, root/'run', resume=True)
+        capture_peak()
+        report = audit_run(root/'run', config, seed)
+        before = file_inventory(root/'run')
+        run(config, seed, root/'run', resume=True)
+        if before != file_inventory(root/'run'):
+            raise ValueError('finalized resume rewrote committed artifacts')
+        policy, _, manifest, _ = load_for_evaluation(root/'run/exports/final.pt', device=device)
+        serial = evaluate_policy(policy, config, manifest, backend='serial')
+        parallel = evaluate_policy(policy, config, manifest, backend='subprocess')
+        for task in config.task_order:
+            if serial['tasks'][task]['results'] != parallel['tasks'][task]['results']:
+                raise ValueError('serial/subprocess argmax episode divergence; inspect separately')
+        atomic_json(root/'serial.json', serial)
+        atomic_json(root/'subprocess.json', parallel)
+        for task in config.task_order:
+            destination = root/f'visualization_{task}'
+            key = f'pnc/v0/{task}/P'
+            visualize(root/'run/checkpoints/latest.json', 'active', task, 0, destination,
+                      device=device, active_key=key, teacher_diagnostics=True)
+            rows = list(csv.DictReader((destination/'steps.csv').open(encoding='utf-8', newline='')))
+            trajectory = json.loads((destination/'trajectory.json').read_text(encoding='utf-8'))
+            with Image.open(destination/'behavior.gif') as image:
+                if image.n_frames != len(rows)+1 or trajectory['actions'] != len(rows):
+                    raise ValueError('media/CSV length mismatch')
+                image.seek(image.n_frames-1); image.load()
+            with Image.open(destination/'reward.png') as image:
+                image.verify()
+        capture_peak()
+        # run() resets CUDA peak counters on every resume, including a finalized no-op.
+        # Preserve each real training segment's peaks BEFORE testing idempotent resume.
+        report.update(status='passed', elapsed_seconds=time.perf_counter()-start,
+                      peak_allocated_bytes=max(p[0] for p in peaks) if peaks else None,
+                      peak_reserved_bytes=max(p[1] for p in peaks) if peaks else None,
+                      limits='Engineering smoke only; no learning-success or RTX5090 throughput claim. W&B online not tested.')
+        atomic_json(root/'report.json', report)
+        atomic_json(root/'inventory.json', file_inventory(root))
+        print(json.dumps(report), flush=True)
+        return report
+    except Exception as exc:
+        atomic_json(root/'failure.json', {'error': repr(exc), 'elapsed_seconds': time.perf_counter()-start})
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-dir', required=True)
+    parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--seed', type=int, default=0)
+    args = parser.parse_args()
+    verify(args.output_dir, args.device, args.seed)
+
+
+if __name__ == '__main__':
+    main()

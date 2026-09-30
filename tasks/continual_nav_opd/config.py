@@ -1,0 +1,298 @@
+"""Strict typed configuration, with no model/data/remote side effects."""
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass, fields, is_dataclass
+from copy import deepcopy
+import hashlib
+import json
+import math
+from pathlib import Path
+from typing import get_args, get_origin, get_type_hints
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+METHOD = "ctm_pnc_opd"
+TASKS = ("maze_medium", "fourrooms")
+
+
+@dataclass(frozen=True)
+class ObservationConfig:
+    shape: tuple[int, int, int]
+    scale: str
+    actions: int
+
+@dataclass(frozen=True)
+class EnvironmentConfig:
+    max_steps: int
+    reward: str
+    maze_root: str
+    tile_size: int
+
+@dataclass(frozen=True)
+class VisionConfig:
+    backbone: str
+    pretrained: bool
+    norm: str
+
+@dataclass(frozen=True)
+class CTMConfig:
+    d_model: int
+    d_input: int
+    ticks: int
+    memory_length: int
+    synapse: str
+    nlm_hidden: int
+    deep_nlm: bool
+    nlm_layernorm: bool
+    neuron_selection: str
+    n_out: int
+    n_action: int
+    dropout: float
+
+@dataclass(frozen=True)
+class AttentionConfig:
+    heads: int
+    rope_theta: float
+    query_position: tuple[int, int]
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    seed: int
+    num_envs: int
+    device: str
+    precision: str
+    vector_backend: str
+    remote_logging: bool
+
+@dataclass(frozen=True)
+class TaskBudget:
+    progress_steps: int
+    compress_steps: int
+
+@dataclass(frozen=True)
+class TaskBudgets:
+    maze_medium: TaskBudget
+    fourrooms: TaskBudget
+
+@dataclass(frozen=True)
+class PNCConfig:
+    visits: int
+    task_budgets: TaskBudgets
+
+@dataclass(frozen=True)
+class FisherConfig:
+    collect_steps: int
+    scored_samples: int
+
+@dataclass(frozen=True)
+class OptimizerConfig:
+    name: str
+    lr: float
+    betas: tuple[float, float]
+    eps: float
+    weight_decay: float
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    learning_steps: int
+    minibatches: int
+    update_epochs: int
+    encoder_microbatch_images: int
+    optimizer: OptimizerConfig
+    lr_schedule: str
+    max_grad_norm: float
+
+@dataclass(frozen=True)
+class DistillConfig:
+    temperature: float
+
+@dataclass(frozen=True)
+class MazeTeacherConfig:
+    type: str
+    algorithm_version: str
+    tie_break_order: tuple[int, int, int, int]
+    target_distribution: str
+
+@dataclass(frozen=True)
+class FourRoomsTeacherConfig:
+    checkpoint: str
+
+@dataclass(frozen=True)
+class TeachersConfig:
+    maze_medium: MazeTeacherConfig
+    fourrooms: FourRoomsTeacherConfig
+
+@dataclass(frozen=True)
+class EWCConfig:
+    lambda_: float
+    decay: float
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    backend: str
+    num_envs: int
+    validation_episodes: int
+    test_episodes: int
+    maze_validation_hashes: int
+    fourrooms_train_seed_stop: int
+    fourrooms_validation_seed_start: int
+    fourrooms_test_seed_start: int
+
+@dataclass(frozen=True)
+class LoggingConfig:
+    interval_windows: int
+
+@dataclass(frozen=True)
+class Config:
+    method: str
+    schema_version: int
+    sequence_protocol: str
+    task_order: tuple[str, str]
+    observation: ObservationConfig
+    environment: EnvironmentConfig
+    vision: VisionConfig
+    ctm: CTMConfig
+    attention: AttentionConfig
+    training: TrainingConfig
+    pnc: PNCConfig
+    fisher: FisherConfig
+    optimization: OptimizationConfig
+    distill: DistillConfig
+    teachers: TeachersConfig
+    ewc: EWCConfig
+    evaluation: EvaluationConfig
+    logging: LoggingConfig
+
+
+class StrictLoader(yaml.SafeLoader):
+    pass
+
+def _mapping(loader, node):
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node)
+        if not isinstance(key, str) or key in result:
+            raise ValueError(f"invalid/duplicate YAML key: {key!r}")
+        result[key] = loader.construct_object(value_node)
+    return result
+
+StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
+
+
+def _merge(base, overrides):
+    result = deepcopy(base)
+    for key, value in overrides.items():
+        result[key] = _merge(result[key], value) if isinstance(value, dict) and isinstance(result.get(key), dict) else value
+    return result
+
+
+def _read(path: Path, chain=()):
+    path = path.resolve(strict=True)
+    if path in chain:
+        raise ValueError("cyclic config inheritance")
+    raw = yaml.load(path.read_text(encoding="utf-8"), Loader=StrictLoader)
+    if not isinstance(raw, dict):
+        raise ValueError("configuration must be a mapping")
+    parent = raw.pop("extends", None)
+    if parent is None:
+        return raw
+    if not isinstance(parent, str) or not parent:
+        raise ValueError("extends must name a YAML file")
+    return _merge(_read(path.parent/parent, (*chain, path)), raw)
+
+
+def _convert(raw, kind, location):
+    if is_dataclass(kind):
+        hints = get_type_hints(kind)
+        names = {f.name: ("lambda" if f.name == "lambda_" else f.name) for f in fields(kind)}
+        if not isinstance(raw, dict) or set(raw) != set(names.values()):
+            raise ValueError(f"{location}: missing or unknown fields; expected {sorted(names.values())}")
+        return kind(**{name: _convert(raw[key], hints[name], f"{location}.{key}") for name, key in names.items()})
+    if get_origin(kind) is tuple:
+        types = get_args(kind)
+        if not isinstance(raw, (tuple, list)) or len(raw) != len(types):
+            raise ValueError(f"{location}: wrong tuple length")
+        return tuple(_convert(v, t, location) for v, t in zip(raw, types))
+    if kind is float and type(raw) in (int, float) and math.isfinite(raw):
+        return float(raw)
+    if kind in (int, bool, str) and type(raw) is kind:
+        return raw
+    raise ValueError(f"{location}: invalid {kind.__name__} value")
+
+
+def parse_config(raw: dict) -> Config:
+    config = _convert(raw, Config, "config")
+    validate_config(config)
+    return config
+
+
+def validate_config(c: Config) -> None:
+    def require(ok, message):
+        if not ok:
+            raise ValueError(message)
+    require((c.method, c.schema_version, c.sequence_protocol) == (METHOD, 3, "rollout_state_v1"), "unsupported method/schema/sequence protocol")
+    require(c.task_order == TASKS, "task_order must be maze_medium, fourrooms")
+    require(c.observation == ObservationConfig((3,84,84), "uint8_to_float_div255", 5), "invalid student interface")
+    require(c.environment.max_steps == 300 and c.environment.reward == "success_time_discount" and c.environment.tile_size == 8 and bool(c.environment.maze_root), "invalid environment")
+    require(c.vision == VisionConfig("resnet34-2", False, "groupnorm32"), "invalid visual architecture")
+    require(c.ctm == CTMConfig(512,128,2,40,"two_linear_glu_blocks",16,True,False,"first-last",32,32,0.0), "invalid CTM architecture")
+    require(c.attention == AttentionConfig(4,10000.0,(10,10)), "invalid attention")
+    t, opt = c.training, c.optimization
+    require(t.seed >= 0 and t.num_envs > 0 and (t.device == "cpu" or re_cuda_device(t.device)), "invalid training seed/slots/device")
+    require(t.precision == "float32" and t.vector_backend == "sync", "invalid precision/backend")
+    require(c.pnc.visits > 0 and c.fisher.collect_steps > 0 and 0 < c.fisher.scored_samples <= c.fisher.collect_steps, "invalid visits/Fisher")
+    for task in TASKS:
+        budget = getattr(c.pnc.task_budgets, task)
+        require(min(budget.progress_steps, budget.compress_steps) > 0 and budget.progress_steps % t.num_envs == 0 and budget.compress_steps % t.num_envs == 0, f"{task}: budgets must be positive/divisible by slots")
+    require(c.fisher.collect_steps % t.num_envs == 0, "F budget must divide by slots")
+    require(0 < opt.learning_steps <= 50 and opt.minibatches > 0 and t.num_envs % opt.minibatches == 0 and opt.update_epochs == 1 and opt.encoder_microbatch_images > 0, "invalid sequence/minibatch settings")
+    require(opt.optimizer == OptimizerConfig("Adam",1e-4,(0.9,0.999),1e-5,0.0) and opt.lr_schedule == "constant" and opt.max_grad_norm == 0.5, "invalid Adam/clipping settings")
+    require(c.distill.temperature == 1 and c.ewc == EWCConfig(250.0,0.3), "invalid distillation/EWC")
+    require(c.teachers.maze_medium == MazeTeacherConfig("shortest_path_bfs","bfs_grid_v1",(0,1,2,3),"one_hot") and bool(c.teachers.fourrooms.checkpoint), "invalid teacher protocol")
+    e = c.evaluation
+    require(e.backend in ("serial","subprocess") and min(e.num_envs,e.validation_episodes,e.test_episodes)>0 and e.maze_validation_hashes == 512 and e.validation_episodes <= 512 and e.test_episodes <= 1000000, "invalid evaluation")
+    require((e.fourrooms_train_seed_stop,e.fourrooms_validation_seed_start,e.fourrooms_test_seed_start)==(1000000,2000000,3000000), "invalid seed partitions")
+    require(c.logging.interval_windows > 0, "invalid logging interval")
+
+
+def re_cuda_device(value: str) -> bool:
+    return value.startswith("cuda:") and value[5:].isdigit()
+
+
+def resolved_dict(config: Config) -> dict:
+    raw = asdict(config)
+    raw["ewc"]["lambda"] = raw["ewc"].pop("lambda_")
+    return raw
+
+
+def config_hash(config: Config) -> str:
+    return hashlib.sha256(json.dumps(resolved_dict(config),sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
+
+
+def load_config(path: str | Path) -> Config:
+    path = Path(path)
+    return parse_config(_read(path if path.is_absolute() else REPO_ROOT/path))
+
+
+def budget_summary(config: Config) -> dict:
+    values = {phase:0 for phase in ("P","C","F")}
+    for task in config.task_order:
+        budget = getattr(config.pnc.task_budgets,task)
+        values["P"] += budget.progress_steps*config.pnc.visits
+        values["C"] += budget.compress_steps*config.pnc.visits
+        values["F"] += config.fisher.collect_steps*config.pnc.visits
+    return dict(**values,total=sum(values.values()),stage_count=6*config.pnc.visits)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config",required=True)
+    args = parser.parse_args()
+    config = load_config(args.config)
+    print(json.dumps(dict(method=config.method,schema=config.schema_version,sequence_protocol=config.sequence_protocol,
+                          config_hash=config_hash(config),budget=budget_summary(config)),indent=2))
+
+if __name__ == "__main__":
+    main()

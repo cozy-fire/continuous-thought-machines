@@ -1,0 +1,25 @@
+extends: full.yaml
+training:
+  num_envs: 2
+  device: cpu
+  remote_logging: false
+pnc:
+  task_budgets:
+    maze_medium:
+      progress_steps: 256
+      compress_steps: 128
+    fourrooms:
+      progress_steps: 256
+      compress_steps: 128
+fisher:
+  collect_steps: 32
+  scored_samples: 8
+optimization:
+  minibatches: 1
+  encoder_microbatch_images: 8
+evaluation:
+  num_envs: 2
+  validation_episodes: 2
+  test_episodes: 2
+logging:
+  interval_windows: 1

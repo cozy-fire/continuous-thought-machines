@@ -1,0 +1,169 @@
+"""Atomic stage boundaries with strict v3 identity and run-relative SHA references."""
+from contextlib import contextmanager
+from dataclasses import asdict
+import hashlib
+import json
+import os
+from pathlib import Path
+import random
+import uuid
+import numpy as np
+import torch
+from .config import REPO_ROOT,config_hash
+from .schedule import expand_stages
+from .teachers import MazeTeacher
+from .teachers.fourrooms import file_sha256
+
+
+def atomic_json(path,value):
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
+    try:
+        with temporary.open('x',encoding='utf-8') as stream:
+            json.dump(value,stream,ensure_ascii=False,allow_nan=False,sort_keys=True,indent=2)
+            stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary,path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def reference(root,path):
+    root=Path(root).resolve(); path=Path(path).resolve(strict=True)
+    if not path.is_relative_to(root): raise ValueError('artifact reference escapes run')
+    return {'path':path.relative_to(root).as_posix(),'size':path.stat().st_size,'sha256':file_sha256(path)}
+
+
+def verify_reference(root,ref):
+    if not isinstance(ref,dict) or set(ref)!={'path','size','sha256'}: raise ValueError('invalid artifact reference')
+    root=Path(root).resolve(); path=(root/ref['path']).resolve()
+    if not path.is_relative_to(root) or not path.is_file(): raise ValueError('missing/unsafe artifact reference')
+    if path.stat().st_size!=ref['size'] or file_sha256(path)!=ref['sha256']: raise ValueError('artifact SHA/size mismatch: '+ref['path'])
+    return path
+
+
+def source_manifest():
+    paths=list((REPO_ROOT/'tasks/continual_nav_opd').rglob('*.py'))
+    paths += list((REPO_ROOT/'tasks/continual_nav/envs').glob('*.py'))
+    paths += [REPO_ROOT/'tasks/continual_nav/data/manifest.py']
+    paths += [REPO_ROOT/'tasks/continual_nav/contracts.py']
+    paths += [REPO_ROOT/'models'/name for name in ('ctm.py','ctm_rl.py','resnet.py','modules.py','utils.py','constants.py')]
+    return {p.relative_to(REPO_ROOT).as_posix():file_sha256(p) for p in sorted(paths)}
+
+
+def rng_state(action=None,minibatch=None,fisher=None):
+    state={'python':random.getstate(),'numpy':np.random.get_state(),'torch':torch.get_rng_state(),
+           'cuda':torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else []}
+    if action is not None: state.update(action=action.get_state(),minibatch=minibatch.bit_generator.state,fisher=fisher.bit_generator.state)
+    return state
+
+
+def restore_rng(state,action=None,minibatch=None,fisher=None):
+    random.setstate(state['python']); np.random.set_state(state['numpy']); torch.set_rng_state(state['torch'])
+    if state['cuda']: torch.cuda.set_rng_state_all(state['cuda'])
+    if action is not None:
+        action.set_state(state['action']); minibatch.bit_generator.state=state['minibatch']; fisher.bit_generator.state=state['fisher']
+
+
+@contextmanager
+def isolated_rng():
+    state=rng_state()
+    try: yield
+    finally: restore_rng(state)
+
+
+def seal_artifact(path):
+    path=Path(path)
+    atomic_json(str(path)+'.sha256.json',{'size':path.stat().st_size,'sha256':file_sha256(path)})
+
+
+def verify_artifact(path):
+    path=Path(path); sidecar=Path(str(path)+'.sha256.json')
+    if not path.is_file() or not sidecar.is_file(): raise ValueError('missing artifact/sidecar')
+    value=json.loads(sidecar.read_text(encoding='utf-8'))
+    if value!={'size':path.stat().st_size,'sha256':file_sha256(path)}: raise ValueError('artifact integrity mismatch')
+    return path
+
+
+def save_boundary(root,payload):
+    root=Path(root); directory=root/'checkpoints'; directory.mkdir(exist_ok=True)
+    name=f"boundary_{payload['next_index']:03d}_{uuid.uuid4().hex}.pt"
+    path=directory/name; temporary=Path(str(path)+'.tmp')
+    try:
+        with temporary.open('xb') as stream:
+            torch.save(payload,stream); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary,path)
+    finally: temporary.unlink(missing_ok=True)
+    marker={'schema_version':3,'checkpoint':reference(root,path),'next_index':payload['next_index'],'finalized':payload['finalized']}
+    complete=Path(str(path)+'.complete.json'); atomic_json(complete,marker)
+    # latest changes LAST; a crash can only leave an unreferenced complete boundary.
+    atomic_json(directory/'latest.json',{'complete':reference(root,complete)})
+    return path
+
+
+REQUIRED={'artifact_type','schema_version','method','sequence_protocol','seed','config_hash','source','stages',
+          'next_index','kb','kb_ready','fisher','global_env_steps','optimizer_updates','next_transition_id','rng',
+          'references','active_snapshots','evaluations','visit_reports','finalized','teacher_identity','data_hash'}
+
+
+def load_boundary(latest,config,seed):
+    latest=Path(latest).resolve(); root=latest.parent.parent
+    index=json.loads(latest.read_text(encoding='utf-8'))
+    if set(index)!={'complete'}: raise ValueError('invalid latest index')
+    complete=verify_reference(root,index['complete']); marker=json.loads(complete.read_text(encoding='utf-8'))
+    if set(marker)!={'schema_version','checkpoint','next_index','finalized'} or marker['schema_version']!=3:
+        raise ValueError('invalid complete marker')
+    path=verify_reference(root,marker['checkpoint'])
+    # Stage payload is trusted local torch serialization, guarded by file SHA, never v2.
+    payload=torch.load(path,map_location='cpu',weights_only=False)
+    if not isinstance(payload,dict) or not REQUIRED<=set(payload): raise ValueError('missing checkpoint fields')
+    if (payload['artifact_type'],payload['schema_version'],payload['method'],payload['sequence_protocol'])!=('v3_stage_boundary',3,'ctm_pnc_opd','rollout_state_v1'):
+        raise ValueError('incompatible checkpoint identity')
+    stages=[asdict(s) for s in expand_stages(config)]
+    if payload['seed']!=seed or payload['config_hash']!=config_hash(config) or payload['source']!=source_manifest() or payload['stages']!=stages:
+        raise ValueError('checkpoint config/source/seed/stages mismatch')
+    if not 0<=payload['next_index']<=len(stages) or marker.get('next_index')!=payload['next_index'] or marker.get('finalized')!=payload['finalized']:
+        raise ValueError('invalid checkpoint boundary')
+    expected=sum(s['env_steps'] for s in stages[:payload['next_index']])
+    if payload['global_env_steps']!=expected or payload['next_transition_id']!=expected or (payload['finalized'] and payload['next_index']!=len(stages)):
+        raise ValueError('checkpoint budget/index mismatch')
+    expected_updates=sum(((s['env_steps']//config.training.num_envs+config.optimization.learning_steps-1)//config.optimization.learning_steps)
+                         *config.optimization.minibatches for s in stages[:payload['next_index']] if s['phase'] in ('P','C'))
+    if payload['optimizer_updates']!=expected_updates: raise ValueError('checkpoint optimizer update count mismatch')
+    for ref in payload['references'].values(): verify_reference(root,ref)
+    if not {'config','provenance','manifest','maze_teacher','fourrooms_teacher'}<=set(payload['references']):
+        raise ValueError('missing required artifact references')
+    if not {'python','numpy','torch','cuda','action','minibatch','fisher'}<=set(payload['rng']):
+        raise ValueError('missing RNG streams')
+    if type(payload['finalized']) is not bool or type(payload['kb_ready']) is not bool or payload['optimizer_updates']<0:
+        raise ValueError('invalid checkpoint counters/flags')
+    completed=stages[:payload['next_index']]
+    pkeys={s['key'] for s in completed if s['phase']=='P'}
+    evalkeys={s['key'] for s in completed if s['phase'] in ('P','C')}
+    if set(payload['active_snapshots'])!=pkeys or set(payload['evaluations'])!=evalkeys:
+        raise ValueError('missing stage snapshot/evaluation records')
+    if payload['kb_ready']!=any(s['phase']=='C' for s in completed): raise ValueError('invalid KB readiness')
+    fcount=sum(s['phase']=='F' for s in completed)
+    if (payload['fisher'] is None)!=(fcount==0) or (payload['fisher'] is not None and payload['fisher'].completed_compressions!=fcount):
+        raise ValueError('Fisher stage counter mismatch')
+    required_final={'final_test','final_policy','final_sidecar','final_metadata','final_metadata_sidecar'}
+    if payload['finalized'] and not required_final<=set(payload['references']):
+        raise ValueError('finalized checkpoint is missing final artifacts')
+    if payload['teacher_identity']['maze']!=MazeTeacher().source_snapshot_id:
+        raise ValueError('incompatible Maze algorithm identity')
+    descriptor=verify_reference(root,payload['references']['maze_teacher'])
+    if descriptor.read_bytes()!=MazeTeacher().descriptor_bytes(): raise ValueError('Maze descriptor/source mismatch')
+    if payload['teacher_identity']['fourrooms']!=payload['references']['fourrooms_teacher']['sha256'] or payload['data_hash']!=payload['references']['manifest']['sha256']:
+        raise ValueError('teacher/data identity mismatch')
+    for ref in payload['active_snapshots'].values(): verify_reference(root,ref)
+    for key,item in payload['evaluations'].items():
+        report_path=verify_reference(root,item['reference'])
+        report=json.loads(report_path.read_text(encoding='utf-8'))
+        expected_policy='active' if key in pkeys else 'kb'
+        if report.get('stage')!=key or report.get('policy_type')!=expected_policy or report.get('split')!='validation' or set(report.get('tasks',{}))!=set(config.task_order):
+            raise ValueError('evaluation identity/task mismatch')
+        for task,metrics in report['tasks'].items():
+            expected_count=config.evaluation.validation_episodes
+            if metrics.get('episodes')!=expected_count or len(metrics.get('results',[]))!=expected_count:
+                raise ValueError('incomplete evaluation panel')
+    for ref in payload['visit_reports'].values(): verify_reference(root,ref)
+    return payload,root

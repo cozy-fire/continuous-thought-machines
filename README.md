@@ -1,51 +1,59 @@
-# TAPD & CTM跨任务联合训练
+#  CTM跨任务联合训练
 
-本项目基于 [CTM 源项目](https://github.com/SakanaAI/continuous-thought-machines/blob/main/README.md)，在 2D Maze（mazes-medium）和 MiniGrid FourRooms 上研究共享视觉表征与逐任务知识压缩。两种环境统一为 $3\times84\times84$ RGB 观察和五维离散动作；FourRooms 的两个额外动作槽执行等待。策略不接收任务 ID。
+基于 [CTM 源项目](https://github.com/SakanaAI/continuous-thought-machines/blob/main/README.md)，本项目以 **On-policy Distillation（OPD）与 Progress & Compress（P&C）** 验证 CTM 在 2D Maze medium 和 MiniGrid FourRooms 间的知识学习、压缩与保留。当前方案从随机初始化开始，直接使用专一教师。
 
-## 架构
+## 统一输入与双列结构
 
-随机初始化的 ResNet34-2 使用 32 组 GroupNorm，输出 $128\times21\times21$ 空间特征。KB 与 Active 各有独立的空间 cross-attention 和 CTM 控制器；KB 是无 Critic 的策略，Active 是 Actor-Critic。每次观察推进 2 个内部 tick，CTM 保存 40 tick 记忆。每个 tick 先更新 KB，Adapter 将其当前 post activation 经 LayerNorm、线性投影和零初始化门控传给 Active 的 synapse 输入。KB 在 Active 学习时冻结；Active 每轮 X 和每个 P 阶段随机初始化。
+学生只接收 $3\times84\times84$ RGB，不接收任务 ID 或教师专用观察。两任务统一为五维动作：Maze 为上、下、左、右、等待；FourRooms 为左转、右转、前进及两个等待槽。
 
-## Task-Agnostic：$X\rightarrow C\rightarrow F$
+知识库 **KB** 与活动列 **Active** 各有独立的 ResNet34-2（GroupNorm）、空间 Attention、CTM 和 Actor。编码器输出 $128\times21\times21$ 空间特征；CTM 每次观察推进 2 ticks，保留 40 ticks 的神经元滑动记忆。Attention 根据神经元同步状态查询空间特征。
 
-默认执行 4 次 visit，每次按 Maze→FourRooms 顺序访问，每个任务执行 2 轮 $X\rightarrow C\rightarrow F$。每轮 X 恰好 1,000,000 环境步，无外在任务奖励。每个环境槽仅保存当前 episode 最近 20 张原始 RGB 帧；reset 时以初始帧填满窗口。动作后的真实末帧先与窗口比较，再入窗。设余弦相似度为 $s_i$，候选帧与当前帧的间隔为 $d_i\in[1,20]$，唯一 PPO 回报为
+每个 tick 先推进 KB，再将其当前 post activation 经过可训练的门控 Adapter 输入 Active 的 synapse；侧向输入停止向 KB 反传。每个 P 开始时，Active 复制当前 KB 的视觉权重，随机初始化控制器、Actor 和 Adapter；完整旧 KB 冻结。首次 KB 尚无知识时关闭侧向连接。
 
-$$
-q_i=\operatorname{clip}\left(\frac{s_i-0.999}{0.001},0,1\right),\quad
-w(d_i)=0.2+0.8\frac{20-d_i}{19},\quad
-r_t=-\max_i q_iw(d_i).
-$$
+## Progress：专一教师指导学生轨迹
 
-X 用循环 PPO-clip 同时更新 Active、Adapter、Critic 和共享视觉编码器 $E$。对有效观察的视觉特征另计算 $z=g(\operatorname{GAP}(E(o)))$，其中 $g$ 是 $128\rightarrow512\rightarrow128$ 的两层 projector；单次反传的目标是
+P 由 **Active 自己采样动作**，教师在学生实际到达的状态提供动作分布。Active 的视觉编码器、CTM、Actor 和 Adapter 一起训练；完整旧 KB 与专一教师冻结。
 
-$$
-\mathcal L_X=\mathcal L_{\mathrm{PPO}}+0.02\,\mathcal L_{\mathrm{SIGReg}}(z)/N.
-$$
-
-SIGReg 通过随机方向的经验特征函数约束 $z$ 的分布；projector 只接受该项梯度。Active 的优化器状态每轮重置，$E+g$ 的 AdamW 状态跨轮保留。X 不使用动作条件预测器、世界模型 MSE 或 high-error replay。
-
-C 冻结完整双列教师与视觉编码器，将教师动作分布蒸馏到 KB，并使用 Online EWC：
+- **Maze：** 算法教师读取当前完整原生地图，用 BFS 计算当前位置到终点的最短路径，将第一步动作作为 one-hot 目标。每步根据学生实际位置重新求解，不读取数据集答案路线。
+- **FourRooms：** 冻结的专一 CTM 教师读取同一环境状态的原生符号观察，连续推进自己的状态。七动作概率映射为学生五动作分布：
 
 $$
-\mathcal L_C=\mathbb E_t D_{\mathrm{KL}}(\pi_T\|\pi_{\mathrm{KB}})
-+\frac{\lambda_{\mathrm{EWC}}}{2}\sum_i\Omega_i(\theta_i-\theta_i^*)^2.
+p_{\mathrm{expert}}=
+\left[p_0,p_1,p_2,\frac{p_3+p_4+p_5+p_6}{2},\frac{p_3+p_4+p_5+p_6}{2}\right].
 $$
 
-C/F 在学习窗口前使用 20 张历史观察（40 tick）进行无梯度 burn-in。F 在 KB 自己采样的轨迹上估计策略 Fisher，对权重不做优化：
+两任务从 episode 的第一步开始教学，无预热或 burn-in。纯动作蒸馏目标为
 
 $$
-\widehat F_i=\frac1N\sum_n\left[\partial_{\theta_i}\log\pi_{\mathrm{KB}}(a_n\mid H_n)\right]^2,
-\quad\Omega_i\leftarrow\gamma_F\Omega_i+\widehat F_i.
+\mathcal L_P=\frac1N\sum_{t\in\mathcal V}
+D_{\mathrm{KL}}\!\left(p_{\mathrm{expert},t}\Vert\pi_{\mathrm{Active},t}\right).
 $$
 
-## Progress & Compress：$P\rightarrow C\rightarrow F$
+Maze 的 one-hot KL 等价于最短路径动作的交叉熵。环境奖励仅用于记录和评估，不进入训练目标。
 
-TA 完成后永久冻结共享视觉编码器。P 使用任务成功奖励与循环 PPO 训练新 Active；C/F 与 TA 同义，共进行 3 次完整任务遍历。PPO 的主要目标为
+## Compress：压缩完整策略并保留旧知识
+
+C 冻结 P 结束时的完整双列策略，包括当时的旧 KB、两套视觉编码器和 Adapter。环境动作由该双列教师采样；独立 KB 在同一轨迹上学习教师动作分布。KB 的视觉编码器、CTM 和 Actor 都接受蒸馏梯度，不直接用 Active 覆盖 KB。
 
 $$
-\mathcal L_{\mathrm{PPO}}=-\mathbb E_t\min\!\left(\rho_t\widehat A_t,
-\operatorname{clip}(\rho_t,1-\epsilon,1+\epsilon)\widehat A_t\right)
-+\frac{c_v}{2}\mathbb E_t(V_t-\widehat R_t)^2-c_H\mathbb E_t\mathcal H(\pi_t).
+\mathcal L_C=\frac1N\sum_{t\in\mathcal V}
+D_{\mathrm{KL}}\!\left(\pi_{\mathrm{Dual},t}\Vert\pi_{\mathrm{KB},t}\right)
++\frac{250}{2}\sum_j\Omega_j(\theta_j-\theta_j^\star)^2.
 $$
 
-TA 每个 visit 末评估当前 KB；P&C 每个 visit 末评估当前 KB 和两个任务各自 P 结束时的 Active 快照。最终仅测试 KB。单任务 CTM、顺序 PPO 与无探索蒸馏 P&C 对照复用同 seed 的冻结 TA 视觉权重，因此报告中单列共享视觉预训练成本。运行、配置、schema v2 checkpoint 和 smoke 验证见 [实现说明](tasks/continual_nav/README.md)。
+Online EWC 同时约束 KB 的视觉与控制器参数。首个 C 无历史约束；后续用累计重要性 $\Omega$ 和最近一次压缩后的参数中心 $\theta^\star$ 保留已学知识。
+
+## Fisher 与跨任务循环
+
+F 由当前 KB 采样轨迹，逐样本计算策略 score 梯度平方，不更新模型参数：
+
+$$
+\widehat F_j=\frac1K\sum_{n=1}^{K}
+\left[\partial_{\theta_j}\log\pi_{\mathrm{KB}}(a_n\mid H_n)\right]^2,
+\qquad
+\Omega_j\leftarrow0.3\,\Omega_j+\widehat F_j.
+$$
+
+当前进行两次完整任务遍历，每次依次执行 **Maze $P\rightarrow C\rightarrow F$，FourRooms $P\rightarrow C\rightarrow F$**。连续状态在 episode reset 时恢复可学习初态；每个学习窗口保存采集起点状态，更新时重放全部新观察，窗口之间截断梯度而保留采集状态。
+
+P 后评估完整 Active，C 后评估 KB；每个策略都在两个任务的固定面板上测试，最终独立测试 KB。成功率与跨任务遗忘用于判断学习和保留效果。该方案验证教师知识的学习与压缩；是否产生正向迁移仍需进一步对照实验。

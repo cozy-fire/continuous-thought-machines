@@ -1,0 +1,90 @@
+method: ctm_pnc_opd
+schema_version: 3
+sequence_protocol: rollout_state_v1
+task_order: [maze_medium, fourrooms]
+observation:
+  shape: [3, 84, 84]
+  scale: uint8_to_float_div255
+  actions: 5
+environment:
+  max_steps: 300
+  reward: success_time_discount
+  maze_root: data/mazes/medium
+  tile_size: 8
+vision:
+  backbone: resnet34-2
+  pretrained: false
+  norm: groupnorm32
+ctm:
+  d_model: 512
+  d_input: 128
+  ticks: 2
+  memory_length: 40
+  synapse: two_linear_glu_blocks
+  nlm_hidden: 16
+  deep_nlm: true
+  nlm_layernorm: false
+  neuron_selection: first-last
+  n_out: 32
+  n_action: 32
+  dropout: 0.0
+attention:
+  heads: 4
+  rope_theta: 10000.0
+  query_position: [10, 10]
+training:
+  seed: 0
+  num_envs: 8
+  device: cuda:0
+  precision: float32
+  vector_backend: sync
+  remote_logging: true
+pnc:
+  visits: 2
+  task_budgets:
+    maze_medium:
+      progress_steps: 3200000
+      compress_steps: 1280000
+    fourrooms:
+      progress_steps: 15000000
+      compress_steps: 6000000
+fisher:
+  collect_steps: 4096
+  scored_samples: 1024
+optimization:
+  learning_steps: 50
+  minibatches: 4
+  update_epochs: 1
+  encoder_microbatch_images: 32
+  optimizer:
+    name: Adam
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    eps: 0.00001
+    weight_decay: 0.0
+  lr_schedule: constant
+  max_grad_norm: 0.5
+distill:
+  temperature: 1.0
+teachers:
+  maze_medium:
+    type: shortest_path_bfs
+    algorithm_version: bfs_grid_v1
+    tie_break_order: [0, 1, 2, 3]
+    target_distribution: one_hot
+  fourrooms:
+    checkpoint: logs/rl/MiniGrid-FourRooms-v0/run1/ctm_2_M40_100M_e001/checkpoint.pt
+ewc:
+  lambda: 250.0
+  decay: 0.3
+evaluation:
+  backend: subprocess
+  num_envs: 16
+  validation_episodes: 200
+  test_episodes: 200
+  maze_validation_hashes: 512
+  fourrooms_train_seed_stop: 1000000
+  fourrooms_validation_seed_start: 2000000
+  fourrooms_test_seed_start: 3000000
+logging:
+  interval_windows: 10
