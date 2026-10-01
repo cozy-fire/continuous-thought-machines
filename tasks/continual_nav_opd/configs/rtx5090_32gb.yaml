@@ -1,6 +1,0 @@
-# Hardware profile: training budgets and algorithm remain inherited.
-extends: full.yaml
-training:
-  num_envs: 16
-optimization:
-  encoder_microbatch_images: 200

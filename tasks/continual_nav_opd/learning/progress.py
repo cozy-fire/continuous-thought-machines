@@ -8,6 +8,7 @@ from ..config import Config, validate_config
 from ..data.progress import ProgressCollector
 from ..models import DualPolicy, frozen_copy
 from .sequence import update_window
+from .behavior import IntervalBehavior
 
 
 @dataclass
@@ -38,6 +39,7 @@ def run_progress(envs, student: DualPolicy, expert, config: Config, steps: int,
     opt = config.optimization.optimizer
     optimizer = torch.optim.Adam(parameters, lr=opt.lr, betas=opt.betas, eps=opt.eps, weight_decay=opt.weight_decay)
     collector = ProgressCollector(envs,student,expert,action_rng)
+    behavior = IntervalBehavior(slots)
     consumed, updates, targets, windows, empty = 0, 0, 0, 0, 0
     sums, action_counts = {}, np.zeros(5,dtype=np.int64)
     total_reward, successes, timeouts, distance_sum = 0., 0, 0, 0.
@@ -48,6 +50,7 @@ def run_progress(envs, student: DualPolicy, expert, config: Config, steps: int,
     while consumed < steps:
         length = min(config.optimization.learning_steps,(steps-consumed)//slots)
         window = collector.collect(length,start_transition_id+consumed)
+        behavior.add(window)
         # Collector data is one current rollout only; reward/terminal metadata never enter KL.
         begin = time.perf_counter()
         metrics = update_window(student,window.batch,optimizer,config,minibatch_rng)
@@ -88,6 +91,7 @@ def run_progress(envs, student: DualPolicy, expert, config: Config, steps: int,
                        **{key:value/targets for key,value in sums.items()},
                        "action_counts":action_counts.tolist(),"reward_sum":total_reward,
                        "successes":successes,"timeouts":timeouts,"elapsed_seconds":elapsed,
+                       **behavior.flush(),
                        "displacement_rate":moves/consumed if collector.task=='fourrooms' else None,
                        "turn_rate":turns/consumed if collector.task=='fourrooms' else None,
                        "transitions_per_second":consumed/elapsed,**timing,

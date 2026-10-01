@@ -52,7 +52,12 @@ class CompressFisherTests(unittest.TestCase):
     def test_c_changes_visual_and_controller_but_not_teacher(self):
         before=policy_hash(self.teacher); visual=next(self.kb.encoder.parameters()).detach().clone()
         control=next(self.kb.actor.parameters()).detach().clone()
-        result=run_compress_stage(self.envs,self.teacher,self.kb,None,self.config,4,self.rng,np.random.default_rng(2))
+        events=[]
+        result=run_compress_stage(self.envs,self.teacher,self.kb,None,self.config,4,self.rng,np.random.default_rng(2),on_window=events.append)
+        self.assertEqual(len(events),1)
+        self.assertAlmostEqual(sum(events[0]['action_fractions']),1.)
+        self.assertIn('episode_mean_return',events[0])
+        self.assertIn('episode_success_rate',events[0])
         self.assertEqual((result.transitions,result.optimizer_updates,result.next_transition_id),(4,1,4))
         self.assertTrue(result.kb_ready)
         self.assertFalse(torch.equal(visual,next(self.kb.encoder.parameters())))

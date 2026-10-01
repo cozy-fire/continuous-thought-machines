@@ -8,8 +8,8 @@
 
 ```powershell
 python -c "import sys,torch,wandb; print(sys.executable,torch.__version__,torch.version.cuda,wandb.__file__); print(torch.cuda.get_device_name(0))"
-python -m tasks.continual_nav_opd.config --config tasks/continual_nav_opd/configs/rtx5090_32gb.yaml
-python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/rtx5090_32gb.yaml --dry-run
+python -m tasks.continual_nav_opd.config --config tasks/continual_nav_opd/configs/remote_config.yaml
+python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/remote_config.yaml --dry-run
 wandb login
 ```
 
@@ -22,7 +22,7 @@ wandb login
 下面命令仅作为交接说明，需用户授权后在目标机器执行。`run-dir` 必须不存在：
 
 ```bash
-PYTHONNOUSERSITE=1 python -u -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/rtx5090_32gb.yaml --seed 0 --run-dir runs/continual_nav_opd/seed0_first_formal --wandb-mode online
+PYTHONNOUSERSITE=1 python -u -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/remote_config.yaml --seed 0 --run-dir runs/continual_nav_opd/seed0_first_formal --wandb-mode online
 ```
 
 后台部署应把 stdout/stderr 放在 run 目录之外，用 `nohup` 或独立会话启动，核验精确 PID、完整命令、W&B URL和事件推进。不要同时启动本机性能测试污染正式计时。RTX5090上的实际吞吐和microbatch200显存上限必须在该硬件实测。
@@ -43,7 +43,7 @@ python -m tasks.continual_nav_opd.profile_training --device cuda:0 --num-envs 2 
 ## 合法恢复与部署产物
 
 ```bash
-PYTHONNOUSERSITE=1 python -u -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/rtx5090_32gb.yaml --seed 0 --run-dir runs/continual_nav_opd/seed0_first_formal --resume --wandb-mode online
+PYTHONNOUSERSITE=1 python -u -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/remote_config.yaml --seed 0 --run-dir runs/continual_nav_opd/seed0_first_formal --resume --wandb-mode online
 ```
 
 只恢复 `checkpoints/latest.json` 指向的已提交阶段边界。配置、方法/schema/时序协议、受检源码、seed、教师、地图和引用文件必须匹配。中断重做未提交的整个 P/C/F及对应评估；不恢复窗口或Adam中途状态。不能修改预算或源码后强行续训。最终 F 已提交但 finalization 中断时，只重做 finalization；已 finalized 不重复 test。
@@ -88,7 +88,7 @@ Runner 启动时校验并解码训练地图和固定 validation/test 面板，�
 
 教师模型在阶段入口加载后常驻 GPU，窗口训练不读取权重文件。checkpoint、源码/引用完整性校验和日志仍保留磁盘操作；不能为了省 I/O 跳过这些边界。需要磁盘对照时设置 `environment.map_cache: disk`。
 
-`optimization.ctm_compile` 支持 `disabled`（默认）、`default` 和 `reduce-overhead`。只编译 CTM tick 的张量核心，Encoder、Python 校验、状态容器和计时不在编译区域。编译失败直接抛出错误，禁止通过 `suppress_errors=True` 静默切回 eager。编译后的 callable 不附着在模型上，完整双列快照仍拥有独立旧 KB 存储与原参数命名。
+`optimization.ctm_compile` 支持 `disabled`、`default` 和 `reduce-overhead`。基础 `full.yaml` 默认为 `disabled`；与 GPU 型号无关的 `remote_config.yaml` 默认使用 `reduce-overhead`，保留 16 个训练槽及视觉 microbatch 200，预算继承基础配置。只编译 CTM tick 的张量核心，Encoder、Python 校验、状态容器和计时不在编译区域。编译失败直接抛出错误，禁止通过 `suppress_errors=True` 静默切回 eager。编译后的 callable 不附着在模型上，完整双列快照仍拥有独立旧 KB 存储与原参数命名。
 
 编译性能比较必须分开首次编译与热身后的窗口耗时。不同 batch 形状、冻结/反传模式或输入 stride 可能触发重新编译；单个 kernel 编译成功不代表完整 P/C/F 可训练。完整验证入口：
 

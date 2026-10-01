@@ -1,0 +1,7 @@
+# Hardware-independent remote profile; budgets remain inherited from full.yaml.
+extends: full.yaml
+training:
+  num_envs: 16
+optimization:
+  ctm_compile: reduce-overhead
+  encoder_microbatch_images: 200

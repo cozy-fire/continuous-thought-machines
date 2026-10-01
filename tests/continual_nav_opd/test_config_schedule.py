@@ -16,13 +16,14 @@ class ConfigTests(unittest.TestCase):
         self.full=load_config('tasks/continual_nav_opd/configs/full.yaml')
 
     def test_profiles_budgets_and_stage_order(self):
-        for profile,total,envs in [('full',50976384,8),('rtx5090_32gb',50976384,16),('smoke',1664,2)]:
+        for profile,total,envs in [('full',50976384,8),('remote_config',50976384,16),('smoke',1664,2)]:
             c=load_config(f'tasks/continual_nav_opd/configs/{profile}.yaml')
             stages=expand_stages(c)
             self.assertEqual(len(stages),12)
             self.assertEqual(sum(s.env_steps for s in stages),total)
             self.assertEqual(budget_summary(c)['total'],total)
             self.assertEqual(c.training.num_envs,envs)
+            self.assertEqual(c.optimization.ctm_compile, "reduce-overhead" if profile == "remote_config" else "disabled")
             self.assertEqual([(s.visit,s.task,s.phase) for s in stages],[(v,t,p) for v in range(2) for t in ('maze_medium','fourrooms') for p in ('P','C','F')])
         self.assertEqual(budget_summary(self.full),dict(P=36400000,C=14560000,F=16384,total=50976384,stage_count=12))
 

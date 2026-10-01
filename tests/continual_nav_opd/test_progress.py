@@ -208,6 +208,10 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual((result.transitions,result.eligible_target_steps,result.optimizer_updates,result.windows),(6,6,2,2))
         self.assertEqual(result.next_transition_id,56)
         self.assertEqual([e['transitions'] for e in events],[4,6])
+        for event in events:
+            self.assertAlmostEqual(sum(event['action_fractions']),1.)
+            self.assertIn('episode_mean_return',event)
+            self.assertIn('episode_success_rate',event)
         self.assertEqual(sum(result.statistics['action_counts']),6)
         self.assertFalse(any(p.requires_grad for p in result.policy.parameters()))
         with self.assertRaises(ValueError): run_progress(self.envs,student,MazeTeacher(),config,3,self.rng,self.shuffle)

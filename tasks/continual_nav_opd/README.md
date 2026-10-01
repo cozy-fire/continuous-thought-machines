@@ -108,7 +108,7 @@ python -m tasks.continual_nav_opd.verify_stage --stage 05 --device cuda:0 --outp
 python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/smoke.yaml --device cuda:0 --seed 0 --run-dir scientific-evidence/continual_nav_opd/new_smoke --wandb-mode disabled
 
 # Formal command, to execute only when explicitly authorized.
-python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/rtx5090_32gb.yaml --seed 0 --run-dir runs/continual_nav_opd/new_seed0 --wandb-mode online
+python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/remote_config.yaml --seed 0 --run-dir runs/continual_nav_opd/new_seed0 --wandb-mode online
 
 # Exact same config, seed and device override as the original run.
 python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/smoke.yaml --device cuda:0 --seed 0 --run-dir scientific-evidence/continual_nav_opd/new_smoke --wandb-mode disabled --resume

@@ -8,6 +8,7 @@ from ..contracts import FisherState
 from ..models import frozen_copy
 from ..data.compress import CompressCollector
 from .sequence import update_window
+from .behavior import IntervalBehavior
 from .fisher import validate_fisher, ewc_loss, policy_hash
 
 
@@ -39,10 +40,12 @@ def run_compress_stage(envs,dual_teacher,kb,fisher,config,steps,action_rng,minib
     opt=config.optimization.optimizer
     optimizer=torch.optim.Adam(kb.parameters(),lr=opt.lr,betas=opt.betas,eps=opt.eps,weight_decay=opt.weight_decay)
     collector=CompressCollector(envs,teacher,kb,action_rng,identity)
+    behavior=IntervalBehavior(slots)
     consumed=updates=windows=0; sums={}; counts=np.zeros(5,dtype=np.int64)
     reward=0.; successes=timeouts=moves=turns=0; started=time.perf_counter()
     while consumed<steps:
         window=collector.collect(min(config.optimization.learning_steps,(steps-consumed)//slots),start_transition_id+consumed)
+        behavior.add(window)
         metrics=update_window(kb,window.batch,optimizer,config,minibatch_rng,lambda:ewc_loss(kb,fisher,config.ewc.lambda_))
         collector.detach_live_state()
         size=window.batch.valid_mask.numel()
@@ -63,6 +66,7 @@ def run_compress_stage(envs,dual_teacher,kb,fisher,config,steps,action_rng,minib
                        'optimizer_updates':updates,'eligible_target_steps':consumed,'windows':windows,
                        **{k:v if k.endswith('_seconds') else v/consumed for k,v in sums.items()},
                        'action_counts':counts.tolist(),'reward_sum':reward,'successes':successes,'timeouts':timeouts,
+                       **behavior.flush(),
                        'displacement_rate':moves/consumed if collector.task=='fourrooms' else None,
                        'turn_rate':turns/consumed if collector.task=='fourrooms' else None,
                        'elapsed_seconds':time.perf_counter()-started})

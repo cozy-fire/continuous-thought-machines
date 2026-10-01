@@ -113,7 +113,7 @@ class EvaluationLoggingTests(unittest.TestCase):
             logger.close()
             namespaces=[next(k for k in event if k.endswith('/success_rate')) for event in logged]
             self.assertEqual(len(set(namespaces)),3)
-            self.assertEqual([next(v for k,v in event.items() if k.endswith('/kl')) for event in logged],[.125]*3)
+            self.assertFalse(any(k.endswith('/kl') for event in logged for k in event))
             self.assertEqual(module.init.call_args.kwargs['config']['sequence_protocol'],'rollout_state_v1')
             run.finish.assert_called_once_with(exit_code=0)
 
