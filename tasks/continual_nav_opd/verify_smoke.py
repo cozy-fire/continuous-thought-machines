@@ -76,12 +76,13 @@ def audit_run(root: Path, config, seed: int) -> dict:
             'fisher_parameters': len(payload['fisher'].importance), 'finalized': True}
 
 
-def verify(output_dir, device='cuda:0', seed=0):
+def verify(output_dir, device='cuda:0', seed=0, compile_mode='disabled'):
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(2)
     config = load_config(REPO_ROOT/'tasks/continual_nav_opd/configs/smoke.yaml')
-    config = replace(config, training=replace(config.training, device=device))
+    config = replace(config, training=replace(config.training, device=device),
+                     optimization=replace(config.optimization,ctm_compile=compile_mode))
     start = time.perf_counter()
     commands = [('git_commit', ['git', '-c', f'safe.directory={REPO_ROOT.as_posix()}', 'rev-parse', 'HEAD']),
                 ('git_dirty', ['git', '-c', f'safe.directory={REPO_ROOT.as_posix()}', 'status', '--short'])]
@@ -149,8 +150,9 @@ def main():
     parser.add_argument('--output-dir', required=True)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--ctm-compile',choices=['disabled','default','reduce-overhead'],default='disabled')
     args = parser.parse_args()
-    verify(args.output_dir, args.device, args.seed)
+    verify(args.output_dir, args.device, args.seed,args.ctm_compile)
 
 
 if __name__ == '__main__':

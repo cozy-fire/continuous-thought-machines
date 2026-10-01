@@ -7,11 +7,34 @@ from tasks.continual_nav.envs.maze import MazeEnv as RGBMazeEnv
 from tasks.continual_nav.envs.fourrooms import FourRoomsEnv as RGBFourRoomsEnv
 from tasks.continual_nav.envs.common import pixels, validate_action
 from ..contracts import ObservationPair, EnvStep
+from .map_cache import MazeMapCache, shared_map_cache
 
 
 class MazeEnv(RGBMazeEnv):
+    def __init__(self, root, entries, *, seed=0, map_cache=None, map_data=None):
+        super().__init__(root, entries, seed=seed)
+        self.map_cache, self.map_data = map_cache, map_data
+
     def reset(self, **kwargs):
         try:
+            if self.map_cache is not None or self.map_data is not None:
+                if set(kwargs)-{'seed','options'}:
+                    raise TypeError('unexpected Maze reset arguments')
+                if kwargs.get('options'):
+                    raise ValueError('Maze reset options are not supported')
+                # Preserve Gym's seed initialization and exactly one map-selection draw.
+                import gymnasium as gym
+                seed = kwargs.get('seed')
+                gym.Env.reset(self, seed=seed if seed is not None else self._pending_seed)
+                self._pending_seed = None
+                self.entry = self.entries[int(self.np_random.integers(len(self.entries)))]
+                data = self.map_data if self.map_data is not None else self.map_cache.get(self.root, self.entry)
+                self.base_rgb, self.agent_pos, self.goal_pos = data
+                self.walls = np.all(self.base_rgb == 0, axis=-1)
+                self.step_count = 0
+                self.episode_id += 1
+                self._done = False
+                return self._observe(), self._info(False)
             return super().reset(**kwargs)
         except (ValueError, OSError) as exc:
             entry = getattr(self, "entry", None)
@@ -97,14 +120,17 @@ class SyncVectorEnv:
             env.close()
 
 
-def make_env(config, task, split, *, manifest=None, seed=0, evaluation_seeds=()):
+def make_env(config, task, split, *, manifest=None, seed=0, evaluation_seeds=(), map_cache=None):
     if task == "maze_medium":
         if manifest is None:
             raise ValueError("Maze requires its verified manifest")
         from ..config import REPO_ROOT
         root = Path(config.environment.maze_root)
-        return MazeEnv(root if root.is_absolute() else REPO_ROOT / root,
-                       manifest.entries(split, panel=split != "train"), seed=seed)
+        root = root if root.is_absolute() else REPO_ROOT / root
+        entries = manifest.entries(split, panel=split != "train")
+        if config.environment.map_cache == 'memory' and map_cache is None:
+            map_cache = shared_map_cache(root, entries)
+        return MazeEnv(root, entries, seed=seed, map_cache=map_cache)
     if task == "fourrooms":
         return FourRoomsEnv(split=split, seed=seed, evaluation_seeds=tuple(evaluation_seeds))
     raise ValueError(f"unknown task: {task}")

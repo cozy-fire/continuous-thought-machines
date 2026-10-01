@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass, fields, is_dataclass
+from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
 from copy import deepcopy
 import hashlib
 import json
@@ -29,6 +29,7 @@ class EnvironmentConfig:
     reward: str
     maze_root: str
     tile_size: int
+    map_cache: str = "disk"
 
 @dataclass(frozen=True)
 class VisionConfig:
@@ -103,6 +104,8 @@ class OptimizationConfig:
     optimizer: OptimizerConfig
     lr_schedule: str
     max_grad_norm: float
+    e3_cache: bool = False
+    ctm_compile: str = "disabled"
 
 @dataclass(frozen=True)
 class DistillConfig:
@@ -207,9 +210,10 @@ def _convert(raw, kind, location):
     if is_dataclass(kind):
         hints = get_type_hints(kind)
         names = {f.name: ("lambda" if f.name == "lambda_" else f.name) for f in fields(kind)}
-        if not isinstance(raw, dict) or set(raw) != set(names.values()):
+        required = {names[f.name] for f in fields(kind) if f.default is MISSING}
+        if not isinstance(raw, dict) or not required <= set(raw) or not set(raw) <= set(names.values()):
             raise ValueError(f"{location}: missing or unknown fields; expected {sorted(names.values())}")
-        return kind(**{name: _convert(raw[key], hints[name], f"{location}.{key}") for name, key in names.items()})
+        return kind(**{name: _convert(raw[key], hints[name], f"{location}.{key}") for name, key in names.items() if key in raw})
     if get_origin(kind) is tuple:
         types = get_args(kind)
         if not isinstance(raw, (tuple, list)) or len(raw) != len(types):
@@ -236,6 +240,7 @@ def validate_config(c: Config) -> None:
     require(c.task_order == TASKS, "task_order must be maze_medium, fourrooms")
     require(c.observation == ObservationConfig((3,84,84), "uint8_to_float_div255", 5), "invalid student interface")
     require(c.environment.max_steps == 300 and c.environment.reward == "success_time_discount" and c.environment.tile_size == 8 and bool(c.environment.maze_root), "invalid environment")
+    require(c.environment.map_cache in ("memory", "disk"), "invalid map cache mode")
     require(c.vision == VisionConfig("resnet34-2", False, "groupnorm32"), "invalid visual architecture")
     require(c.ctm == CTMConfig(512,128,2,40,"two_linear_glu_blocks",16,True,False,"first-last",32,32,0.0), "invalid CTM architecture")
     require(c.attention == AttentionConfig(4,10000.0,(10,10)), "invalid attention")
@@ -248,6 +253,7 @@ def validate_config(c: Config) -> None:
         require(min(budget.progress_steps, budget.compress_steps) > 0 and budget.progress_steps % t.num_envs == 0 and budget.compress_steps % t.num_envs == 0, f"{task}: budgets must be positive/divisible by slots")
     require(c.fisher.collect_steps % t.num_envs == 0, "F budget must divide by slots")
     require(0 < opt.learning_steps <= 50 and opt.minibatches > 0 and t.num_envs % opt.minibatches == 0 and opt.update_epochs == 1 and opt.encoder_microbatch_images > 0, "invalid sequence/minibatch settings")
+    require(type(opt.e3_cache) is bool and opt.ctm_compile in ('disabled','default','reduce-overhead'), "invalid E3/CTM compile settings")
     require(opt.optimizer == OptimizerConfig("Adam",1e-4,(0.9,0.999),1e-5,0.0) and opt.lr_schedule == "constant" and opt.max_grad_norm == 0.5, "invalid Adam/clipping settings")
     require(c.distill.temperature == 1 and c.ewc == EWCConfig(250.0,0.3), "invalid distillation/EWC")
     require(c.teachers.maze_medium == MazeTeacherConfig("shortest_path_bfs","bfs_grid_v1",(0,1,2,3),"one_hot") and bool(c.teachers.fourrooms.checkpoint), "invalid teacher protocol")
@@ -268,7 +274,13 @@ def resolved_dict(config: Config) -> dict:
 
 
 def config_hash(config: Config) -> str:
-    return hashlib.sha256(json.dumps(resolved_dict(config),sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
+    return raw_config_hash(resolved_dict(config))
+
+
+def raw_config_hash(raw: dict) -> str:
+    # Historical inference artifacts hash their original fields, before new defaults.
+    # Stage-boundary restoration still requires the current config AND source hashes.
+    return hashlib.sha256(json.dumps(raw,sort_keys=True,separators=(",",":"),allow_nan=False).encode()).hexdigest()
 
 
 def load_config(path: str | Path) -> Config:

@@ -8,19 +8,19 @@ import torch
 from .envs.evaluation import EvaluationPool
 from .config import REPO_ROOT,load_config
 from .data import MazeManifest
-from .envs import MazeEnv,FourRoomsEnv
+from .envs import MazeEnv,FourRoomsEnv,MazeMapCache
 from .models import StandalonePolicy,DualPolicy,frozen_copy,select_state,replace_slots,load_snapshot
 from .checkpoint import isolated_rng,atomic_json,verify_artifact,load_boundary,verify_reference
 
 
 def create_panel_env(spec):
-    task,split,root,entry=spec
-    if task=='maze_medium': return MazeEnv(root,(entry,))
+    task,split,root,entry=spec[:4]
+    if task=='maze_medium': return MazeEnv(root,(entry,),map_data=spec[4] if len(spec)==5 else None)
     if task=='fourrooms': return FourRoomsEnv(split=split,evaluation_seeds=(entry,))
     raise ValueError('unknown panel task')
 
 
-def panels(config,manifest,task,split):
+def panels(config,manifest,task,split,map_cache=None):
     if split not in ('validation','test'): raise ValueError('evaluation split must be validation/test')
     if task=='maze_medium':
         root=Path(config.environment.maze_root)
@@ -32,10 +32,14 @@ def panels(config,manifest,task,split):
         start=getattr(config.evaluation,'fourrooms_'+split+'_seed_start')
         entries=range(start,start+count)
     else: raise ValueError('unknown panel task')
+    if task=='maze_medium' and config.environment.map_cache=='memory':
+        cache=map_cache if map_cache is not None else MazeMapCache(root,entries)
+        # Only decoded CPU pixels/positions cross the worker pipe, never models or CUDA.
+        return [(task,split,root,entry,cache.get(root,entry)) for entry in entries]
     return [(task,split,root,entry) for entry in entries]
 
 
-def evaluate_policy(policy,config,manifest,split='validation',tasks=None,backend=None,num_envs=None,identity=None,*,factory=create_panel_env):
+def evaluate_policy(policy,config,manifest,split='validation',tasks=None,backend=None,num_envs=None,identity=None,*,factory=create_panel_env,map_cache=None):
     tasks=tuple(config.task_order if tasks is None else tasks)
     if not tasks or len(set(tasks))!=len(tasks) or not set(tasks)<=set(config.task_order): raise ValueError('invalid task subset')
     backend=config.evaluation.backend if backend is None else backend
@@ -48,7 +52,7 @@ def evaluate_policy(policy,config,manifest,split='validation',tasks=None,backend
     with isolated_rng(),torch.no_grad():
         snapshot=frozen_copy(policy); device=next(snapshot.parameters()).device
         for task in tasks:
-            specs=panels(config,manifest,task,split); size=min(num_envs,len(specs)); results=[None]*len(specs)
+            specs=panels(config,manifest,task,split,map_cache); size=min(num_envs,len(specs)); results=[None]*len(specs)
             state=snapshot.initial_state(size); active={}; next_index=0
             with EvaluationPool(size,backend,factory=factory) as pool:
                 def assign(slots):

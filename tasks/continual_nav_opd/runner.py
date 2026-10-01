@@ -11,7 +11,7 @@ import yaml
 from .config import REPO_ROOT,resolved_dict,config_hash
 from .schedule import expand_stages
 from .data import build_manifest,MazeManifest
-from .envs import SyncVectorEnv,make_env
+from .envs import SyncVectorEnv,make_env,MazeMapCache
 from .models import StandalonePolicy,DualPolicy,save_snapshot,load_snapshot
 from .teachers import MazeTeacher,FourRoomsTeacher
 from .checkpoint import (atomic_json,reference,verify_reference,source_manifest,rng_state,restore_rng,
@@ -72,8 +72,14 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
         save_boundary(root,payload)
     logger=EventLogger(root,config,seed,wandb_mode,resume)
     failed=True; completed=0; committed_index=payload['next_index']
+    map_cache=None
     try:
         if payload['finalized']: failed=False; return payload
+        if config.environment.map_cache=='memory':
+            entries=manifest.entries('train')+manifest.entries('validation',panel=True)+manifest.entries('test',panel=True)
+            map_cache=MazeMapCache(REPO_ROOT/config.environment.maze_root,entries)
+            logger.emit({'event':'map_cache','family':'pnc','maps':len(map_cache.indices),
+                         'cache_bytes':map_cache.images.nbytes,'load_seconds':map_cache.load_seconds})
         for index in range(payload['next_index'],len(stages)):
             stage=stages[index]; attempt=uuid.uuid4().hex; trigger('stage_start',stage)
             identity={'family':stage.family,'visit':stage.visit,'stage':stage.key,'phase':stage.phase,'task':stage.task,'attempt_id':attempt}
@@ -81,7 +87,7 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
             def log_window(event):
                 logger.emit({**identity,**event,'event':'training','global_env_steps':before_steps+event['stage_env_steps'],
                              'global_optimizer_updates':before_updates+event['optimizer_updates']})
-            envs=SyncVectorEnv([make_env(config,stage.task,'train',manifest=manifest,seed=seed+index*1000+slot)
+            envs=SyncVectorEnv([make_env(config,stage.task,'train',manifest=manifest,seed=seed+index*1000+slot,map_cache=map_cache)
                                for slot in range(config.training.num_envs)])
             policy=None
             try:
@@ -120,7 +126,7 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
                 eid=f'{index:03d}_{attempt}_validation'
                 report=evaluate_policy(policy,config,manifest,identity={**identity,'evaluation_id':eid,
                          'policy_type':'active' if stage.phase=='P' else 'kb','active_source':stage.task if stage.phase=='P' else None,
-                         'global_env_steps':payload['global_env_steps']})
+                         'global_env_steps':payload['global_env_steps']},map_cache=map_cache)
                 path=root/'evaluation'/f'{eid}.json'; atomic_json(path,report)
                 payload['evaluations'][stage.key]={'reference':reference(root,path),'policy_type':report['policy_type'],'visit':stage.visit,
                                                    'task':stage.task,'success_rates':{task:r['success_rate'] for task,r in report['tasks'].items()}}
@@ -151,7 +157,7 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
                 failed=False; return payload
         trigger('before_finalization')
         report=evaluate_policy(kb,config,manifest,split='test',identity={'family':'pnc','visit':config.pnc.visits-1,'phase':'final',
-                    'evaluation_id':'final_test','policy_type':'kb','active_source':None,'global_env_steps':payload['global_env_steps']})
+                    'evaluation_id':'final_test','policy_type':'kb','active_source':None,'global_env_steps':payload['global_env_steps']},map_cache=map_cache)
         trigger('final_evaluation_complete')
         atomic_json(root/'evaluation/final_test.json',report)
         for task,metrics in report['tasks'].items():
@@ -170,6 +176,8 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
         logger.emit({'event':'finalized','family':'pnc','phase':'final','policy_type':'kb','global_env_steps':payload['global_env_steps'],'next_index':payload['next_index']})
         failed=False; return payload
     finally:
+        # Release decoded maps on both normal completion and interrupted stages.
+        if map_cache is not None: map_cache.close()
         if failed:
             logger.emit({'event':'run_interrupted','family':'pnc','next_uncommitted_index':committed_index,
                          'note':'Resume uses latest committed boundary; partial stage data is not reused.'})

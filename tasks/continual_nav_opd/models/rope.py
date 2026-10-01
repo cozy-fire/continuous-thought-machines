@@ -59,18 +59,27 @@ class SpatialAttention(nn.Module):
         self.output = nn.Linear(width, width)
         self.rope = SpatialRoPE(self.head_dim, theta=theta, query_position=query_position)
 
-    def forward(self, fmap: Tensor, action_sync: Tensor, *, return_weights: bool = False):
+    def prepare(self, fmap: Tensor) -> tuple[Tensor, Tensor]:
+        """Prepare observation-dependent K/V once, preserving their autograd graph."""
         batch = fmap.shape[0]
         tokens = self.token_input(fmap.flatten(2).transpose(1, 2))
+        k = self.k(tokens).reshape(batch, -1, self.heads, self.head_dim).transpose(1, 2)
+        v = self.v(tokens).reshape(batch, -1, self.heads, self.head_dim).transpose(1, 2)
+        k = rotate_pairs(k, self.rope.key_cos, self.rope.key_sin)
+        return k, v
+
+    def forward_prepared(self, prepared: tuple[Tensor, Tensor], action_sync: Tensor,
+                         *, return_weights: bool = False):
+        k, v = prepared
+        batch = k.shape[0]
         query = self.query_input(action_sync).unsqueeze(1)
-
-        def heads(x: Tensor) -> Tensor:
-            return x.reshape(batch, -1, self.heads, self.head_dim).transpose(1, 2)
-
-        q, k, v = heads(self.q(query)), heads(self.k(tokens)), heads(self.v(tokens))
-        # Rotate projected Q/K, never V or the inputs to a later unrotated projection.
-        q, k = self.rope(q, k)
+        q = self.q(query).reshape(batch, -1, self.heads, self.head_dim).transpose(1, 2)
+        # Rebuild state-dependent Q every tick. K was rotated during preparation; V is never rotated.
+        q = rotate_pairs(q, self.rope.query_cos, self.rope.query_sin)
         weights = (q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)).softmax(-1)
         attended = (weights @ v).transpose(1, 2).reshape(batch, self.width)
         output = self.output(attended)
         return (output, weights) if return_weights else output
+
+    def forward(self, fmap: Tensor, action_sync: Tensor, *, return_weights: bool = False):
+        return self.forward_prepared(self.prepare(fmap), action_sync, return_weights=return_weights)

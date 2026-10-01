@@ -45,13 +45,22 @@ class StandalonePolicy(nn.Module):
         return (torch.cat([self.encoder(part) for part in rgb.split(microbatch)], dim=0),)
 
     def _step_features(self, features: tuple[Tensor, ...], state: CTMState,
-                       episode_start: Tensor) -> tuple[Tensor, CTMState]:
+                       episode_start: Tensor, prepared_sync=None) -> tuple[Tensor, CTMState]:
         if not isinstance(state, CTMState):
             raise TypeError("StandalonePolicy requires CTMState")
         state = reset_state(state, episode_start, self.initial_state(features[0].shape[0]))
+        prepared_attention = None
+        if self.config.optimization.e3_cache:
+            prepared_attention = self.controller.attention.prepare(features[0])
+            if prepared_sync is None:
+                prepared_sync = self._prepare_sequence()
         for _ in range(self.controller.ticks):
-            state, _ = self.controller.tick(features[0], state)
-        return self.actor(self.controller.readout(state)), state
+            state, _ = self.controller.tick(features[0], state, attention_prepared=prepared_attention,
+                                            sync_prepared=prepared_sync[0] if prepared_sync else None)
+        return self.actor(self.controller.readout(state, prepared_sync[1] if prepared_sync else None)), state
+
+    def _prepare_sequence(self):
+        return self.controller.prepare_sync() if self.config.optimization.e3_cache else None
 
     def step(self, rgb: Tensor, state: CTMState, episode_start: Tensor) -> tuple[Tensor, CTMState]:
         _validate_rgb(rgb, 4)
@@ -120,21 +129,37 @@ class DualPolicy(nn.Module):
         return kb_features, active_features
 
     def _step_features(self, features: tuple[Tensor, ...], state: DualState,
-                       episode_start: Tensor) -> tuple[Tensor, DualState]:
+                       episode_start: Tensor, prepared_sync=None) -> tuple[Tensor, DualState]:
         if not isinstance(state, DualState):
             raise TypeError("DualPolicy requires DualState")
         state = reset_state(state, episode_start, self.initial_state(features[0].shape[0]))
         kb_state, active_state = state.kb, state.active
         ready = self._kb_ready_enabled
+        kb_attention = active_attention = None
+        if self.config.optimization.e3_cache:
+            with torch.no_grad():
+                kb_attention = self.kb.controller.attention.prepare(features[0])
+            active_attention = self.active.controller.attention.prepare(features[1])
+            if prepared_sync is None:
+                prepared_sync = self._prepare_sequence()
         for _ in range(self.active.controller.ticks):
             # KB advances FIRST: lateral uses its new post activation from this same tick.
             # Its own encoder is frozen; Active features never enter the KB path.
             with torch.no_grad():
-                kb_state, kb_post = self.kb.controller.tick(features[0], kb_state)
+                kb_state, kb_post = self.kb.controller.tick(features[0], kb_state, attention_prepared=kb_attention,
+                    sync_prepared=prepared_sync[0][0] if prepared_sync else None)
             lateral = self.adapter(kb_post) if ready else None
-            active_state, _ = self.active.controller.tick(features[1], active_state, lateral)
-        logits = self.active.actor(self.active.controller.readout(active_state))
+            active_state, _ = self.active.controller.tick(features[1], active_state, lateral, attention_prepared=active_attention,
+                sync_prepared=prepared_sync[1][0] if prepared_sync else None)
+        logits = self.active.actor(self.active.controller.readout(active_state, prepared_sync[1][1] if prepared_sync else None))
         return logits, DualState(kb_state, active_state)
+
+    def _prepare_sequence(self):
+        if not self.config.optimization.e3_cache:
+            return None
+        with torch.no_grad():
+            kb_sync = self.kb.controller.prepare_sync()
+        return kb_sync, self.active.controller.prepare_sync()
 
     def step(self, rgb: Tensor, state: DualState, episode_start: Tensor) -> tuple[Tensor, DualState]:
         _validate_rgb(rgb, 4)
@@ -164,13 +189,16 @@ def _sequence(policy: StandalonePolicy | DualPolicy, rgb: Tensor, state: PolicyS
             raise ValueError("sequence masks must be bool [L,B] on the image device")
     if isinstance(policy, DualPolicy) != isinstance(state, DualState):
         raise TypeError("sequence initial_state must belong to the learning policy")
+    # This cache belongs to THIS forward only. Its differentiable decay weights
+    # accumulate all tick gradients; neither models nor collectors retain the graph.
+    prepared_sync = policy._prepare_sequence()
     if not force_generic and (dense or bool(valid_mask.all())):
         # Full windows have no padding: avoid per-tick slot selection and state scatter.
         encoded = policy._encode(rgb.flatten(0, 1), encoder_chunk_images) if encoder_chunk_images is not None else policy._encode(rgb.flatten(0, 1))
         features = tuple(f.reshape(length, batch, *f.shape[1:]) for f in encoded)
         outputs = []
         for t in range(length):
-            logits, state = policy._step_features(tuple(f[t] for f in features), state, episode_start[t])
+            logits, state = policy._step_features(tuple(f[t] for f in features), state, episode_start[t], prepared_sync)
             outputs.append(logits)
         return PolicySequenceOutput(torch.stack(outputs), state)
     # Encode ONLY valid new observations. Microbatching changes image batching, not CTM time.
@@ -189,7 +217,7 @@ def _sequence(policy: StandalonePolicy | DualPolicy, rgb: Tensor, state: PolicyS
         if indices.numel():
             output, proposed = policy._step_features(tuple(f[t].index_select(0, indices) for f in features),
                                                      select_state(state, indices),
-                                                     episode_start[t].index_select(0, indices))
+                                                     episode_start[t].index_select(0, indices), prepared_sync)
             state = replace_slots(state, indices, proposed)
             logits = logits.index_copy(0, indices, output)
         # Padding neither advances nor resets either column. No detach/burn-in occurs here.

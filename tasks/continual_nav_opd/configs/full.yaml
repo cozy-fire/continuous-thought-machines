@@ -11,6 +11,8 @@ environment:
   reward: success_time_discount
   maze_root: data/mazes/medium
   tile_size: 8
+  # Validate/decode required maps once; resets read immutable CPU arrays.
+  map_cache: memory
 vision:
   backbone: resnet34-2
   pretrained: false
@@ -52,6 +54,9 @@ fisher:
   collect_steps: 4096
   scored_samples: 1024
 optimization:
+  # E3 caches live only within a forward. Compilation is an explicit experiment.
+  e3_cache: true
+  ctm_compile: disabled
   learning_steps: 50
   minibatches: 4
   update_epochs: 1

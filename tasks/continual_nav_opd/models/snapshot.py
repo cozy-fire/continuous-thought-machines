@@ -1,7 +1,7 @@
 """Complete inference snapshots; stage-level optimizer/RNG checkpoints belong to 06."""
 from pathlib import Path
 import torch
-from ..config import parse_config, resolved_dict, config_hash
+from ..config import parse_config, resolved_dict, config_hash, raw_config_hash
 from .policy import StandalonePolicy, DualPolicy, frozen_copy
 
 
@@ -25,7 +25,7 @@ def load_snapshot(path: str | Path, device: str | torch.device = "cpu") -> Stand
             "v3_complete_inference", "ctm_pnc_opd", 3, "rollout_state_v1"):
         raise ValueError("incompatible inference artifact identity")
     config = parse_config(artifact["config"])
-    if config_hash(config) != artifact["config_hash"]:
+    if raw_config_hash(artifact["config"]) != artifact["config_hash"]:
         raise ValueError("inference configuration hash mismatch")
     # Rebuild independent parameter storage; never reattach a newer live KB at load time.
     with torch.random.fork_rng(devices=[]):

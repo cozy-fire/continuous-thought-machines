@@ -79,3 +79,21 @@ C 采集的 Encoder 分块固定为 `min(num_envs, encoder_microbatch_images)`�
 默认 `--timing-mode events`：CUDA 分项为当前 stream 的事件区间，包括主机提交工作造成的空隙，不代表纯 kernel 时间；CPU 环境/BFS仍为墙钟。窗口结束统一解析事件；动作所需 CPU 下载仍会等待。`--timing-mode synchronized` 可诊断前后同步的墙钟区间，增加开销。事件携带 `timing_mode`；不同模式的分项不直接作为提速比较。性能诊断入口 `profile_training` 固定使用 synchronized，外层窗口/阶段墙钟用于同负载比较。CPU运行两种模式均使用墙钟。
 
 本次受检源码改变，旧开发 run 不允许续训；旧完整 v3 inference artifact 的配置和参数键保持可读。不要重写旧 run 的源码哈希绕过检查。
+
+## E3、内存地图与 CTM 编译
+
+正式配置默认 `optimization.e3_cache: true`、`environment.map_cache: memory`。E3 对同一观察、同一列的两个 tick 复用 Attention 的 token/K/V；Q 每 tick 重算。同步衰减权重只在一次序列 forward 内共享，保留梯度，不跨 Adam 更新。没有改变预算、教师、Loss、初态、reset 或参数键。
+
+Runner 启动时校验并解码训练地图和固定 validation/test 面板，保存连续 `uint8` CPU 数组，各训练槽共享。reset 只读取内存，不再打开 PNG。评估子进程接收解码后的 CPU 图片与起终点，不读取地图文件。缓存不进入 checkpoint；结束或异常退出释放，恢复时重新校验加载。地图加载失败直接报错，不退回磁盘。`map_cache` 事件记录 `maps`、`cache_bytes`、`load_seconds`。独立工具的并行槽通过弱引用池共享缓存，没有全局强引用长期保留图片。
+
+教师模型在阶段入口加载后常驻 GPU，窗口训练不读取权重文件。checkpoint、源码/引用完整性校验和日志仍保留磁盘操作；不能为了省 I/O 跳过这些边界。需要磁盘对照时设置 `environment.map_cache: disk`。
+
+`optimization.ctm_compile` 支持 `disabled`（默认）、`default` 和 `reduce-overhead`。只编译 CTM tick 的张量核心，Encoder、Python 校验、状态容器和计时不在编译区域。编译失败直接抛出错误，禁止通过 `suppress_errors=True` 静默切回 eager。编译后的 callable 不附着在模型上，完整双列快照仍拥有独立旧 KB 存储与原参数命名。
+
+编译性能比较必须分开首次编译与热身后的窗口耗时。不同 batch 形状、冻结/反传模式或输入 stride 可能触发重新编译；单个 kernel 编译成功不代表完整 P/C/F 可训练。完整验证入口：
+
+```bash
+python -m tasks.continual_nav_opd.verify_smoke --device cuda:0 --ctm-compile default --output-dir <new-directory>
+```
+
+Windows 本地编译需要匹配 PyTorch 的 `triton-windows`、`PYTHONUTF8=1`，并把 `TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR` 指向可写目录。本轮测试环境是 PyTorch 2.13/CUDA 12.6 与 triton-windows 3.7.1.post27；不能直接据此断言 Linux RTX5090 的提速。旧推理产物按原始配置字段校验哈希，再补运行选项默认值；旧训练恢复仍受当前源码与配置校验限制。

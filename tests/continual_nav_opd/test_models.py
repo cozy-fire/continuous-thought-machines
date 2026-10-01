@@ -132,9 +132,9 @@ class ModelTests(unittest.TestCase):
         ]
         new_posts, seen_features = [], []
         original = dual.kb.controller.tick
-        def tick(fmap,state,lateral=None):
+        def tick(fmap,state,lateral=None,**kwargs):
             seen_features.append(fmap)
-            result = original(fmap,state,lateral)
+            result = original(fmap,state,lateral,**kwargs)
             new_posts.append(result[1].clone())
             return result
         try:
