@@ -17,7 +17,7 @@ wandb login
 
 ## 预算与正式启动
 
-基础与 remote_config 配置均为两个 visits、每 visit Maze P/C/F 后 FourRooms P/C/F，12 阶段。Maze 每 P=3,200,000、C=1,280,000；FourRooms 每 P=15,000,000、C=6,000,000；每 F=4,096 环境步、1,024 个唯一评分样本。总环境步=50,976,384，不包含评估。remote_config 使用64训练槽、8环境 minibatches、视觉 microbatch=200图片；基础配置8槽。remote_config 每完整窗口3,200环境步，每次更新400条样本；总更新127,408次，比旧16槽/4 minibatch的254,800次约减半，FourRooms P的尾窗口使总数比精确一半多8次。两任务均从第一观察开始教学，没有预热、burn-in、TA或PPO。
+基础与 remote_config 配置均为两个 visits、每 visit Maze P/C/F 后 FourRooms P/C/F，12 阶段。Maze 每 P=3,200,000、C=1,280,000；FourRooms 每 P=15,000,000、C=6,000,000；每 F=4,096 环境步、1,024 个唯一评分样本。总环境步=50,976,384，不包含评估。remote_config 使用32训练槽、4环境 minibatches、视觉 microbatch=200图片；基础配置8槽。remote_config 每完整窗口1,600环境步，每次更新400条样本；总更新127,400次，是旧16槽/4 minibatch的254,800次的一半。相较64槽/8 minibatch的127,408次，仅消除了FourRooms P尾窗口多出的8次更新。两任务均从第一观察开始教学，没有预热、burn-in、TA或PPO。
 
 下面命令仅作为交接说明，需用户授权后在目标机器执行。`run-dir` 必须不存在：
 
@@ -88,7 +88,7 @@ Runner 启动时校验并解码训练地图和固定 validation/test 面板，�
 
 教师模型在阶段入口加载后常驻 GPU，窗口训练不读取权重文件。checkpoint、源码/引用完整性校验和日志仍保留磁盘操作；不能为了省 I/O 跳过这些边界。需要磁盘对照时设置 `environment.map_cache: disk`。
 
-`optimization.ctm_compile` 支持 `disabled`、`default` 和 `reduce-overhead`。基础 `full.yaml` 默认为 `disabled`；与 GPU 型号无关的 `remote_config.yaml` 默认使用 `reduce-overhead`，使用 64 个训练槽、8 个环境 minibatch 及视觉 microbatch 200，预算继承基础配置。只编译 CTM tick 的张量核心，Encoder、Python 校验、状态容器和计时不在编译区域。编译失败直接抛出错误，禁止通过 `suppress_errors=True` 静默切回 eager。编译后的 callable 不附着在模型上，完整双列快照仍拥有独立旧 KB 存储与原参数命名。
+`optimization.ctm_compile` 支持 `disabled`、`default` 和 `reduce-overhead`。基础 `full.yaml` 默认为 `disabled`；与 GPU 型号无关的 `remote_config.yaml` 默认使用 `reduce-overhead`，使用 32 个训练槽、4 个环境 minibatch 及视觉 microbatch 200，预算继承基础配置。只编译 CTM tick 的张量核心，Encoder、Python 校验、状态容器和计时不在编译区域。编译失败直接抛出错误，禁止通过 `suppress_errors=True` 静默切回 eager。编译后的 callable 不附着在模型上，完整双列快照仍拥有独立旧 KB 存储与原参数命名。
 
 编译性能比较必须分开首次编译与热身后的窗口耗时。不同 batch 形状、冻结/反传模式或输入 stride 可能触发重新编译；单个 kernel 编译成功不代表完整 P/C/F 可训练。完整验证入口：
 
