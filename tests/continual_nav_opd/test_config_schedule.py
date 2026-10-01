@@ -16,7 +16,7 @@ class ConfigTests(unittest.TestCase):
         self.full=load_config('tasks/continual_nav_opd/configs/full.yaml')
 
     def test_profiles_budgets_and_stage_order(self):
-        for profile,total,envs in [('full',50976384,8),('remote_config',50976384,16),('smoke',1664,2)]:
+        for profile,total,envs in [('full',50976384,8),('remote_config',50976384,64),('smoke',1664,2)]:
             c=load_config(f'tasks/continual_nav_opd/configs/{profile}.yaml')
             stages=expand_stages(c)
             self.assertEqual(len(stages),12)
@@ -26,6 +26,16 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(c.optimization.ctm_compile, "reduce-overhead" if profile == "remote_config" else "disabled")
             self.assertEqual([(s.visit,s.task,s.phase) for s in stages],[(v,t,p) for v in range(2) for t in ('maze_medium','fourrooms') for p in ('P','C','F')])
         self.assertEqual(budget_summary(self.full),dict(P=36400000,C=14560000,F=16384,total=50976384,stage_count=12))
+
+    def test_remote_update_budget(self):
+        from math import ceil
+        c=load_config('tasks/continual_nav_opd/configs/remote_config.yaml')
+        self.assertEqual(c.optimization.minibatches,8)
+        self.assertEqual(c.optimization.encoder_microbatch_images,200)
+        self.assertEqual(c.optimization.learning_steps,50)
+        updates=sum(ceil(s.env_steps/(c.training.num_envs*c.optimization.learning_steps))*
+                    c.optimization.minibatches for s in expand_stages(c) if s.phase in ('P','C'))
+        self.assertEqual(updates,127408)
 
     def test_strict_fields_types_and_protocol(self):
         for path,value in [('training.num_envs',3),('pnc.visits',0),('optimization.minibatches',3),('optimization.learning_steps',0),('schema_version',2),('sequence_protocol','other'),('distill.temperature',2),('teachers.maze_medium.type','neural'),('teachers.maze_medium.tie_break_order',[3,2,1,0]),('training.seed',True),('optimization.optimizer.lr',float('nan'))]:
