@@ -81,7 +81,7 @@ def run_progress(envs, student: DualPolicy, expert, config: Config, steps: int,
             distance_sum += float(window.distances.sum())
         for key in window.timing:
             timing[key] += window.timing[key]
-        if on_window is not None and (windows % config.logging.interval_windows == 0 or consumed == steps):
+        if on_window is not None and (windows == 1 or windows % config.logging.interval_windows == 0 or consumed == steps):
             elapsed = time.perf_counter()-started
             on_window({"method":config.method,"schema_version":3,"sequence_protocol":config.sequence_protocol,
                        "phase":"P","task":collector.task,"policy_type":"active",

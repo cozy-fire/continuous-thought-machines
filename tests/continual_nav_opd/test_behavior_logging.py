@@ -1,9 +1,14 @@
 """Chart whitelist and episode accounting across rollout/log boundaries."""
 from types import SimpleNamespace
+from contextlib import redirect_stdout
+import io
+import json
+import tempfile
 import unittest
 import torch
+from tasks.continual_nav_opd.config import load_config
 from tasks.continual_nav_opd.learning.behavior import IntervalBehavior
-from tasks.continual_nav_opd.wandb_logging import chart_values, TRAIN_METRICS, EVALUATION_METRICS
+from tasks.continual_nav_opd.wandb_logging import EventLogger, chart_values, TRAIN_METRICS, EVALUATION_METRICS
 
 
 def window(rewards, terms, truncs, actions):
@@ -12,6 +17,24 @@ def window(rewards, terms, truncs, actions):
 
 
 class BehaviorLoggingTests(unittest.TestCase):
+    def test_completed_training_event_is_printed_and_persisted_without_wandb(self):
+        config = load_config('tasks/continual_nav_opd/configs/smoke.yaml')
+        event = dict(event='training', stage='pnc/v0/maze_medium/P', phase='P',
+                     task='maze_medium', global_env_steps=1600, stage_env_steps=1600,
+                     optimizer_updates=4, kl=1.2, total_loss=1.2, agreement=.4,
+                     elapsed_seconds=12.)
+        with tempfile.TemporaryDirectory() as root, redirect_stdout(io.StringIO()) as stdout:
+            logger = EventLogger(root, config, 0)
+            logger.emit({'event': 'map_cache'})
+            logger.emit(event)
+            logger.close()
+            self.assertEqual(json.loads(stdout.getvalue()), event)
+            from pathlib import Path
+            for name in ('events.jsonl', 'metrics.jsonl'):
+                rows = [json.loads(line) for line in (Path(root)/name).read_text().splitlines()]
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(rows[-1]['kl'], 1.2)
+
     def test_full_episode_return_survives_flush_and_slots_reset_independently(self):
         stats = IntervalBehavior(2)
         stats.add(window([[1., 2.]], [[False, False]], [[False, True]], [[0, 1]]))

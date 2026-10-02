@@ -61,7 +61,7 @@ def run_compress_stage(envs,dual_teacher,kb,fisher,config,steps,action_rng,minib
             for infos in window.info:
                 moves+=sum(info['agent_pos_before']!=info['agent_pos_after'] for info in infos)
                 turns+=sum(info['agent_dir_before']!=info['agent_dir_after'] for info in infos)
-        if on_window and (windows%config.logging.interval_windows==0 or consumed==steps):
+        if on_window and (windows==1 or windows%config.logging.interval_windows==0 or consumed==steps):
             on_window({'phase':'C','policy_type':'kb','task':collector.task,'stage_env_steps':consumed,'transitions':consumed,
                        'ticks':collector.ticks,'memory_ticks':config.ctm.memory_length,
                        'optimizer_updates':updates,'eligible_target_steps':consumed,'windows':windows,

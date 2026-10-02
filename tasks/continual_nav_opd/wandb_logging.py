@@ -54,6 +54,12 @@ class EventLogger:
         text=json.dumps(event,ensure_ascii=False,allow_nan=False)+'\n'
         for name in ('events.jsonl','metrics.jsonl'):
             with (self.root/name).open('a',encoding='utf-8') as stream: stream.write(text)
+        if event.get('event') == 'training':
+            # Publish completed updates to stdout as well as JSONL/W&B. Flush so a
+            # background launch log exposes the first real window immediately.
+            fields = ('event','stage','phase','task','global_env_steps','stage_env_steps',
+                      'optimizer_updates','kl','total_loss','agreement','elapsed_seconds')
+            print(json.dumps({k:event[k] for k in fields if k in event},allow_nan=False),flush=True)
         if self.run is not None:
             values = chart_values(event)
             if values:

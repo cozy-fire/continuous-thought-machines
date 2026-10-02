@@ -105,3 +105,16 @@ python -m tasks.continual_nav_opd.verify_smoke --device cuda:0 --ctm-compile def
 ```
 
 Windows 本地编译需要匹配 PyTorch 的 `triton-windows`、`PYTHONUTF8=1`，并把 `TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR` 指向可写目录。本轮测试环境是 PyTorch 2.13/CUDA 12.6 与 triton-windows 3.7.1.post27；不能直接据此断言 Linux RTX5090 的提速。推理产物按原始配置字段校验哈希，再补可选运行选项默认值；两任务 ticks 映射是必需字段，不做旧全局 ticks 迁移。训练恢复仍受当前源码与配置校验限制。
+
+## 本地 8 GiB GPU 的32槽入口
+
+在conda的ctm环境及仓库根目录执行以下命令。此入口仍是完整正式预算，不是本轮连续窗口诊断的短预算；只有用户明确要求完整本地训练时才启动。
+
+```powershell
+$env:TORCHINDUCTOR_COMPILE_THREADS='1'
+python -u -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/local32_8gb.yaml --device cuda:0 --seed 0 --run-dir <new-run-directory>
+```
+
+CLI具体参数以 `python -m tasks.continual_nav_opd.train --help` 为准。新profile使用default编译，避免reduce-overhead的CUDA Graph树管理；不修改remote_config。环境序列microbatch=1仍完整重放50观察、按原8槽组累积梯度，每窗口4次更新，不通过减少ticks、窗口长度或增加Adam步数降低显存。配置/源码哈希发生变化时必须创建新run，不绕过旧checkpoint恢复检查。
+
+后台日志应能看到首个完成窗口的 `event=training` JSON，包含环境步、KL、动作一致率、更新次数和耗时；随后按日志间隔及阶段末打印。首窗口含编译开销，因此不能以尚未出现Loss判断进程失败。若长时间无日志，分别检查采集、编译及学习，而不是只看进程存活。

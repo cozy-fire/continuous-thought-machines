@@ -81,7 +81,7 @@ P 内新建统一 Adam，参数恰为 Active Encoder／Controller／Actor 和 Ad
 
 返回 `ProgressResult` 包含 `transitions`、`optimizer_updates`、`eligible_target_steps`、`next_transition_id`、`windows`、`statistics` 和完整冻结 P 结束 `policy`，可供 C 使用。成功 P 必须满足 `eligible_target_steps == transitions == steps`。环境生命周期由调用方管理，异常时调用方也需关闭环境。
 
-`on_window` 每 `logging.interval_windows` 个窗口及阶段末接收累计统计：有效样本加权 KL／动作一致率／教师与学生熵、裁剪前梯度范数及分项、动作计数、教学步／环境步／更新数、真实 reward 和结束计数。耗时分别记录环境 step、教师查询、学生采集 forward、学习 forward（视觉编码＋时序 CTM）、backward 和裁剪／optimizer；CUDA 边界同步计时。`learner_seconds` 包含整体学习耗时，与各分项有包含关系，不可相加当总耗时。Runner 将同一统计写入本地事件与 W&B；本地验证关闭 W&B。
+`on_window` 在首个完整更新窗口、每 `logging.interval_windows` 个窗口及阶段末接收累计统计：有效样本加权 KL／动作一致率／教师与学生熵、裁剪前梯度范数及分项、动作计数、教学步／环境步／更新数、真实 reward 和结束计数。耗时分别记录环境 step、教师查询、学生采集 forward、学习 forward（视觉编码＋时序 CTM）、backward 和裁剪／optimizer；CUDA 边界同步计时。`learner_seconds` 包含整体学习耗时，与各分项有包含关系，不可相加当总耗时。Runner 将同一统计写入本地事件与 W&B；本地验证关闭 W&B。
 
 ```powershell
 python -m unittest discover -s tests/continual_nav_opd -p test_progress.py
@@ -143,3 +143,11 @@ python -m tasks.continual_nav_opd.visualize --checkpoint scientific-evidence/con
 `python -m tasks.continual_nav_opd.verify_smoke --device cuda:0 --output-dir <新目录>` 实际运行两任务、两 visits 的12阶段，包含首P边界恢复、最终幂等恢复、完整产物校验、serial/subprocess对照和两任务Active媒体核验。独立单元测试仍需另行执行。
 
 `python -m tasks.continual_nav_opd.profile_training --device cuda:0 --num-envs 2 --microbatch 8 --minibatches 1 --output-dir <另一新目录>` 使用真实教师测量采集、学习与逐样本Fisher，记录视觉/CTM前向、视觉反向、优化器和显存。同步诊断存在计时开销；本机结果不能代表RTX5090实测。正式启动、恢复、输入产物和异常边界见 [运行手册](RUNBOOK.md)。
+
+## 本地 32 槽与环境序列 microbatch
+
+`configs/local32_8gb.yaml` 继承 `remote_config.yaml` 的全部预算、32 个采集槽、50 张新观察/窗口和4个环境 minibatches；仅设置 `ctm_compile: default` 和 `sequence_microbatch_envs: 1`。后者的单位是**环境槽**，与 `encoder_microbatch_images` 的图片单位不同。每个原更新组仍含8槽×50观察=400条样本；分8次完整序列反传后，统一裁剪并执行一次Adam更新，每窗口仍4次更新。序列完整保留50张观察及其递归图，不截断时间轴；Maze每张75ticks，FourRooms每张2ticks，M=40内部ticks。
+
+`sequence_microbatch_envs: 0` 保持整组重放。非零时，KL梯度按各分块有效样本数/整组有效样本数累积；完整KB的EWC每次Adam更新只加入一次。采集状态、窗口起点和教师标签语义保持不变。GroupNorm不使用跨样本统计，但浮点求和顺序会变化，不承诺逐位数值相同。
+
+每个完成的训练日志事件会立即刷新到stdout，同时保留完整本地JSONL与既有W&B图表。默认首窗口打印一次，之后每10窗口及阶段末打印；编译和未完成的窗口不会打印训练Loss。Windows本地编译设置 `TORCHINDUCTOR_COMPILE_THREADS=1`，避免编译子进程使用不受支持的 `pass_fds`。

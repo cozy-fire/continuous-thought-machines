@@ -200,7 +200,8 @@ class ProgressTests(unittest.TestCase):
             run_progress(self.envs,self.student,MazeTeacher(),self.config,0,self.rng,self.shuffle)
 
     def test_exact_tail_budget_and_cumulative_logging(self):
-        config=replace(self.config,optimization=replace(self.config.optimization,learning_steps=2))
+        config=replace(self.config,optimization=replace(self.config.optimization,learning_steps=2),
+                       logging=replace(self.config.logging,interval_windows=10))
         student=DualPolicy(config,StandalonePolicy(config))
         events=[]
         result=run_progress(self.envs,student,MazeTeacher(),config,6,self.rng,self.shuffle,

@@ -117,6 +117,9 @@ class OptimizationConfig:
     max_grad_norm: float
     e3_cache: bool = False
     ctm_compile: str = "disabled"
+    # Zero replays the full optimizer group; nonzero splits only independent
+    # environment sequences and accumulates gradients before one Adam step.
+    sequence_microbatch_envs: int = 0
 
 @dataclass(frozen=True)
 class DistillConfig:
@@ -267,6 +270,8 @@ def validate_config(c: Config) -> None:
     require(c.fisher.collect_steps % t.num_envs == 0, "F budget must divide by slots")
     require(0 < opt.learning_steps <= 50 and opt.minibatches > 0 and t.num_envs % opt.minibatches == 0 and opt.update_epochs == 1 and opt.encoder_microbatch_images > 0, "invalid sequence/minibatch settings")
     require(type(opt.e3_cache) is bool and opt.ctm_compile in ('disabled','default','reduce-overhead'), "invalid E3/CTM compile settings")
+    require(type(opt.sequence_microbatch_envs) is int and 0 <= opt.sequence_microbatch_envs <= t.num_envs,
+            "sequence microbatch must be 0 (disabled) or a positive environment-slot count within num_envs")
     require(opt.optimizer == OptimizerConfig("Adam",1e-4,(0.9,0.999),1e-5,0.0) and opt.lr_schedule == "constant" and opt.max_grad_norm == 0.5, "invalid Adam/clipping settings")
     require(c.distill.temperature == 1 and c.ewc == EWCConfig(250.0,0.3), "invalid distillation/EWC")
     require(c.teachers.maze_medium == MazeTeacherConfig("shortest_path_bfs","bfs_grid_v1",(0,1,2,3),"one_hot") and bool(c.teachers.fourrooms.checkpoint), "invalid teacher protocol")
