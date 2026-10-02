@@ -11,7 +11,7 @@ python -m unittest discover -s tests/continual_nav_opd -p test_config_schedule.p
 python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/full.yaml --dry-run
 ```
 
-`full.yaml` 定义正式预算，`remote_config.yaml` 只覆盖执行设置。两者均展开为 12 阶段、50,976,384 环境步；smoke 为 12 阶段、1,664 环境步。三个配置均使用 `ctm.ticks_by_task: {maze_medium: 75, fourrooms: 2}` 和 `memory_length: 40`。`dry-run` 输出任务 ticks、记忆长度和带 ticks 的完整阶段表。未知字段、身份不兼容或预算无法整除环境槽数时明确失败。`dry-run` 不加载数据或教师，也不创建训练 run 或连接 W&B。实际训练必须提供 `--seed` 和 `--run-dir`。
+`full.yaml` 定义正式预算，`remote_config.yaml` 只覆盖执行设置。两者均展开为 12 阶段、50,976,384 环境步；smoke 为 12 阶段、1,664 环境步。三个配置均使用 `ctm.ticks_by_task: {maze_medium: 5, fourrooms: 2}` 和 `memory_length: 40`。`dry-run` 输出任务 ticks、记忆长度和带 ticks 的完整阶段表。未知字段、身份不兼容或预算无法整除环境槽数时明确失败。`dry-run` 不加载数据或教师，也不创建训练 run 或连接 W&B。实际训练必须提供 `--seed` 和 `--run-dir`。
 
 唯一序列协议是 `rollout_state_v1`：在本窗口第一张新观察处理前，保存学习策略当前状态的 `detach().clone()`，随后重放本窗口全部新观察。采集状态跨窗口保留，仅在真正的 episode 边界按槽 reset。没有教师预热、历史观察 burn-in 或首步标签屏蔽。
 
@@ -51,9 +51,9 @@ output = dual.sequence(rollout_rgb_u8, initial_state, rollout_episode_start, val
                        task="maze_medium")
 ```
 
-图像、state 和 mask Tensor 必须位于策略设备。`step` 输入 `uint8 [B,3,84,84]`；`sequence` 只接收当前窗口的 `[L,B,3,84,84]` 新观察，`1 <= L <= 50`，返回 `PolicySequenceOutput(logits=[L,B,5], state=...)`。两入口必须显式传入 `task`，一次调用只能处理同一任务；未知任务立即报错。任务仅选择递归次数，不进入 Encoder、Attention、CTM 或 Actor 的输入。重放使用传入起点，不重新初始化或隐式 detach。仅有效观察进入视觉 microbatch，随后按原时间顺序推进 CTM：Maze 每张观察 75 ticks，FourRooms 2 ticks。padding 输出零 logits，不改变任何列的 state。`select_state` 和 `detach_clone_state` 为 minibatch 与窗口起点建立独立存储。
+图像、state 和 mask Tensor 必须位于策略设备。`step` 输入 `uint8 [B,3,84,84]`；`sequence` 只接收当前窗口的 `[L,B,3,84,84]` 新观察，`1 <= L <= 50`，返回 `PolicySequenceOutput(logits=[L,B,5], state=...)`。两入口必须显式传入 `task`，一次调用只能处理同一任务；未知任务立即报错。任务仅选择递归次数，不进入 Encoder、Attention、CTM 或 Actor 的输入。重放使用传入起点，不重新初始化或隐式 detach。仅有效观察进入视觉 microbatch，随后按原时间顺序推进 CTM：Maze 每张观察 5 ticks，FourRooms 2 ticks。padding 输出零 logits，不改变任何列的 state。`select_state` 和 `detach_clone_state` 为 minibatch 与窗口起点建立独立存储。
 
-KB 在两个任务间共享全部权重和相同参数形状。P 双列、C 双列教师与 KB 学生、F、validation/test 和可视化均按当前环境任务选择同一预算；跨任务评估按评估任务选择，不能沿用 Active 来源任务的 ticks。切换任务创建独立 episode 状态。40 tick 窗口在 FourRooms 约覆盖 20 次观察，在 Maze 一次观察结束时直接存放当前观察最后 40 tick 的激活；旧信息只能经递归间接延续。50 观察训练窗口对应每列 3,750 个 Maze tick，记忆窗口不截断该计算图。
+KB 在两个任务间共享全部权重和相同参数形状。P 双列、C 双列教师与 KB 学生、F、validation/test 和可视化均按当前环境任务选择同一预算；跨任务评估按评估任务选择，不能沿用 Active 来源任务的 ticks。切换任务创建独立 episode 状态。40 tick 窗口在 FourRooms 约覆盖 20 次观察，在 Maze 约覆盖 8 次观察；更早的信息只能经递归间接延续。50 观察训练窗口对应每列 250 个 Maze tick，记忆窗口不截断该计算图。
 
 每列独立拥有 ResNet34-2／GroupNorm32，以及可学习 `start_pre`／`start_post` `[512,40]` trace，分别对应原 CTM 的 `start_trace`／`start_activated_trace` 角色。学习列在有效 reset 位置恢复初态时保留初态参数梯度；从第一张有效图起即可训练 Encoder，没有 TA 冻结开关或历史图像前缀。完整 KB 参数前缀固定为 `encoder/controller/actor`，Dual 为 `kb/active/adapter`。
 
@@ -146,7 +146,7 @@ python -m tasks.continual_nav_opd.visualize --checkpoint scientific-evidence/con
 
 ## 本地 32 槽与环境序列 microbatch
 
-`configs/local32_8gb.yaml` 继承 `remote_config.yaml` 的全部预算、32 个采集槽、50 张新观察/窗口和4个环境 minibatches；仅设置 `ctm_compile: default` 和 `sequence_microbatch_envs: 1`。后者的单位是**环境槽**，与 `encoder_microbatch_images` 的图片单位不同。每个原更新组仍含8槽×50观察=400条样本；分8次完整序列反传后，统一裁剪并执行一次Adam更新，每窗口仍4次更新。序列完整保留50张观察及其递归图，不截断时间轴；Maze每张75ticks，FourRooms每张2ticks，M=40内部ticks。
+`configs/local32_8gb.yaml` 继承 `remote_config.yaml` 的全部预算、32 个采集槽、50 张新观察/窗口和4个环境 minibatches；仅设置 `ctm_compile: default` 和 `sequence_microbatch_envs: 1`。后者的单位是**环境槽**，与 `encoder_microbatch_images` 的图片单位不同。每个原更新组仍含8槽×50观察=400条样本；分8次完整序列反传后，统一裁剪并执行一次Adam更新，每窗口仍4次更新。序列完整保留50张观察及其递归图，不截断时间轴；Maze每张5ticks，FourRooms每张2ticks，M=40内部ticks。
 
 `sequence_microbatch_envs: 0` 保持整组重放。非零时，KL梯度按各分块有效样本数/整组有效样本数累积；完整KB的EWC每次Adam更新只加入一次。采集状态、窗口起点和教师标签语义保持不变。GroupNorm不使用跨样本统计，但浮点求和顺序会变化，不承诺逐位数值相同。
 

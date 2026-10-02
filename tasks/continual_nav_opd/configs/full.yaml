@@ -22,7 +22,7 @@ ctm:
   d_input: 128
   # Execution budgets share all weights. Both columns use the current task's ticks.
   ticks_by_task:
-    maze_medium: 75
+    maze_medium: 5
     fourrooms: 2
   # Internal ticks, not a fixed number of environment observations.
   memory_length: 40

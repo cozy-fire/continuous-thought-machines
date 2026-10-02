@@ -35,7 +35,7 @@ class TaskTickModelTests(unittest.TestCase):
     def test_shared_kb_counts_and_memory_shapes(self):
         pointers = {n:p.data_ptr() for n,p in self.kb.named_parameters()}
         before = policy_hash(self.kb)
-        for task, count in (('maze_medium',75), ('fourrooms',2)):
+        for task, count in (('maze_medium',5), ('fourrooms',2)):
             with torch.no_grad(), patch.object(self.kb.controller,'tick',wraps=self.kb.controller.tick) as calls:
                 logits, state = self.kb.step(self.rgb,self.kb.initial_state(1),torch.ones(1,dtype=torch.bool),task=task)
             self.assertEqual(calls.call_count,count)
@@ -49,7 +49,7 @@ class TaskTickModelTests(unittest.TestCase):
 
     def test_dual_same_tick_laterals_for_each_task(self):
         dual = DualPolicy(self.config,self.kb,kb_ready=True)
-        for task, count in (('maze_medium',75), ('fourrooms',2)):
+        for task, count in (('maze_medium',5), ('fourrooms',2)):
             produced, received = [], []
             original = dual.kb.controller.tick
             def record(*args,**kwargs):
@@ -73,7 +73,7 @@ class TaskTickModelTests(unittest.TestCase):
         before = policy_hash(dual.kb)
         images = torch.stack([self.rgb,self.rgb.flip(-1),self.rgb.flip(-2)])
         starts = torch.tensor([[True],[False],[True]])
-        for task, ticks in (('maze_medium',75), ('fourrooms',2)):
+        for task, ticks in (('maze_medium',5), ('fourrooms',2)):
             origin = detach_clone_state(dual.initial_state(1))
             state = detach_clone_state(origin)
             with torch.no_grad():
@@ -141,7 +141,7 @@ class TaskTickReplayTests(unittest.TestCase):
 
     def test_wrong_collected_budget_rejected_before_update_or_fisher(self):
         batch=CompressCollector(self.envs,self.teacher,self.kb,self.rng,'fixture').collect(1,0).batch
-        self.assertEqual((batch.task,batch.ticks),('maze_medium',75))
+        self.assertEqual((batch.task,batch.ticks),('maze_medium',5))
         optimizer=torch.optim.Adam(self.kb.parameters(),lr=1e-4)
         for bad in (replace(batch,ticks=2),replace(batch,task='fourrooms')):
             with patch.object(optimizer,'step',side_effect=AssertionError('wrong-budget update')):

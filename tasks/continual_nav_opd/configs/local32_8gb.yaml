@@ -1,7 +1,7 @@
 # 32 collection slots and the original 400-observation Adam batch on an 8-GiB GPU.
 extends: remote_config.yaml
 optimization:
-  # Default Inductor compilation avoids CUDA Graph trees across 3750 Maze ticks.
+  # Default Inductor compilation avoids CUDA Graph tree management during replay.
   ctm_compile: default
   # Replay full 50-observation sequences one environment at a time; accumulate
   # gradients across all eight environments before clipping and stepping Adam.

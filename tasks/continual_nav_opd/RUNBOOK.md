@@ -82,11 +82,11 @@ C 采集的 Encoder 分块固定为 `min(num_envs, encoder_microbatch_images)`�
 
 ## 按任务执行 ticks
 
-`full.yaml` 中 `ctm.ticks_by_task.maze_medium: 75`、`ctm.ticks_by_task.fourrooms: 2` 是统一来源；remote 和 smoke 继承它。`memory_length: 40` 固定为内部 tick 数。训练环境步、visit、窗口长度、minibatch、Adam 更新次数及 Loss 均未改变。KB 权重在任务间共享；两列内部逐 tick 对齐，不为任务创建不同 KB。
+`full.yaml` 中 `ctm.ticks_by_task.maze_medium: 5`、`ctm.ticks_by_task.fourrooms: 2` 是统一来源；remote 和 smoke 继承它。`memory_length: 40` 固定为内部 tick 数。训练环境步、visit、窗口长度、minibatch、Adam 更新次数及 Loss 均未改变。KB 权重在任务间共享；两列内部逐 tick 对齐，不为任务创建不同 KB。
 
 P 采样及重放、C 双列教师与 KB 学生、F 使用环境任务的 ticks。每个任务报告记录 `ticks` 与 `memory_ticks`；跨任务评估和可视化使用评估任务的 ticks，与 Active 来源任务无关。执行预算记录在本地事件及 W&B run 配置中，不新增 ticks 曲线。直接调用 `step`／`sequence` 必须传 `task=`；不要临时修改 `controller.ticks`，该属性已移除。任务切换使用新的环境和状态，不能将一任务的 live trace 直接移交另一任务。
 
-较长 ticks 会增大递归反传图；50 张观察在 Maze 中展开 3,750 tick／列。原 2-tick 性能与显存数据不能用于预测新负载。正式远端 profile 的显存可行性须在目标 GPU 实测，不能把小预算 smoke 作为大 batch 的保证。
+较长 ticks 会增大递归反传图；50 张观察在 Maze 中展开 250 tick／列。2-tick 或 75-tick 性能与显存数据不能直接用于预测当前 5-tick 负载。正式远端 profile 的显存可行性须在目标 GPU 实测，不能把小预算 smoke 作为大 batch 的保证。
 
 ## E3、内存地图与 CTM 编译
 
