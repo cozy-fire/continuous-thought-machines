@@ -38,10 +38,21 @@ class VisionConfig:
     norm: str
 
 @dataclass(frozen=True)
+class TaskTicks:
+    maze_medium: int
+    fourrooms: int
+
+    def for_task(self, task: str) -> int:
+        if task not in TASKS:
+            raise ValueError(f"unknown CTM execution task: {task!r}")
+        return getattr(self, task)
+
+
+@dataclass(frozen=True)
 class CTMConfig:
     d_model: int
     d_input: int
-    ticks: int
+    ticks_by_task: TaskTicks
     memory_length: int
     synapse: str
     nlm_hidden: int
@@ -242,7 +253,9 @@ def validate_config(c: Config) -> None:
     require(c.environment.max_steps == 300 and c.environment.reward == "success_time_discount" and c.environment.tile_size == 8 and bool(c.environment.maze_root), "invalid environment")
     require(c.environment.map_cache in ("memory", "disk"), "invalid map cache mode")
     require(c.vision == VisionConfig("resnet34-2", False, "groupnorm32"), "invalid visual architecture")
-    require(c.ctm == CTMConfig(512,128,2,40,"two_linear_glu_blocks",16,True,False,"first-last",32,32,0.0), "invalid CTM architecture")
+    require(c.ctm == CTMConfig(512,128,c.ctm.ticks_by_task,40,"two_linear_glu_blocks",16,True,False,"first-last",32,32,0.0), "invalid CTM architecture")
+    require(all(type(c.ctm.ticks_by_task.for_task(task)) is int and c.ctm.ticks_by_task.for_task(task) > 0
+                for task in TASKS), "task ticks must be positive integers")
     require(c.attention == AttentionConfig(4,10000.0,(10,10)), "invalid attention")
     t, opt = c.training, c.optimization
     require(t.seed >= 0 and t.num_envs > 0 and (t.device == "cpu" or re_cuda_device(t.device)), "invalid training seed/slots/device")
@@ -304,6 +317,7 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     print(json.dumps(dict(method=config.method,schema=config.schema_version,sequence_protocol=config.sequence_protocol,
+                          ticks_by_task=asdict(config.ctm.ticks_by_task),memory_ticks=config.ctm.memory_length,
                           config_hash=config_hash(config),budget=budget_summary(config)),indent=2))
 
 if __name__ == "__main__":

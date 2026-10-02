@@ -12,6 +12,7 @@ import torch
 from tasks.continual_nav_opd.config import load_config
 from tasks.continual_nav_opd.contracts import ObservationPair,CTMState,DualState
 from tasks.continual_nav_opd.models import StandalonePolicy,DualPolicy
+from tasks.continual_nav_opd.models.ctm import Controller
 from tasks.continual_nav_opd.evaluate import evaluate_policy
 from tasks.continual_nav_opd.wandb_logging import EventLogger
 
@@ -35,14 +36,16 @@ def failing_factory(spec): raise RuntimeError('controlled worker failure')
 
 
 class CountingPolicy(StandalonePolicy):
-    def step(self,rgb,state,episode_start):
+    def step(self,rgb,state,episode_start,*,task):
+        self.config.ctm.ticks_by_task.for_task(task)
         pre=state.pre.clone(); pre[episode_start]=0; pre=pre+1
         logits=torch.zeros(len(rgb),5); logits[torch.arange(len(rgb)),(pre[:,0,0].long()-1)%5]=1
         return logits,CTMState(pre,pre.clone())
 
 
 class CountingDual(DualPolicy):
-    def step(self,rgb,state,episode_start):
+    def step(self,rgb,state,episode_start,*,task):
+        self.config.ctm.ticks_by_task.for_task(task)
         pre=state.active.pre.clone(); pre[episode_start]=0; pre=pre+1
         logits=torch.zeros(len(rgb),5); logits[torch.arange(len(rgb)),(pre[:,0,0].long()-1)%5]=1
         return logits,DualState(CTMState(pre.clone(),pre.clone()),CTMState(pre,pre.clone()))
@@ -81,6 +84,32 @@ class EvaluationLoggingTests(unittest.TestCase):
         self.assertEqual(expected[:2],actual[:2]); torch.testing.assert_close(expected[2],actual[2],atol=0,rtol=0)
         self.assertEqual(modes,[m.training for m in policy.modules()])
         for n,v in policy.state_dict().items(): torch.testing.assert_close(v,before[n],atol=0,rtol=0)
+
+    def test_cross_task_shared_kb_selects_evaluation_budget(self):
+        policy=StandalonePolicy(self.config)
+        batches=[]; counts={'maze_medium':0,'fourrooms':0}; context=[None]
+        original_step,original_tick=StandalonePolicy.step,Controller.tick
+        def step(instance,rgb,state,episode_start,*,task):
+            context[0]=task; batches.append(task)
+            return original_step(instance,rgb,state,episode_start,task=task)
+        def tick(instance,*args,**kwargs):
+            counts[context[0]]+=1
+            return original_tick(instance,*args,**kwargs)
+        def small_panels(config,manifest,task,split,map_cache):
+            return [(task,split,None,i) for i in range(3)]
+        before={n:v.clone() for n,v in policy.state_dict().items()}
+        with patch('tasks.continual_nav_opd.evaluate.panels',side_effect=small_panels), \
+             patch('tasks.continual_nav.envs.evaluation.shortest_path',return_value=1), \
+             patch.object(StandalonePolicy,'step',step),patch.object(Controller,'tick',tick):
+            report=evaluate_policy(policy,self.config,None,backend='serial',num_envs=2,factory=panel_factory)
+        for task in self.config.task_order:
+            ticks=self.config.ctm.ticks_by_task.for_task(task)
+            self.assertEqual(counts[task],ticks*batches.count(task))
+            self.assertEqual(report['tasks'][task]['ticks'],ticks)
+            self.assertEqual(report['tasks'][task]['memory_ticks'],40)
+            self.assertEqual([r['panel_index'] for r in report['tasks'][task]['results']],[0,1,2])
+        for name,value in policy.state_dict().items():
+            torch.testing.assert_close(value,before[name],atol=0,rtol=0)
 
     def test_worker_failure_propagates_and_leaves_no_children(self):
         previous={p.pid for p in mp.active_children()}

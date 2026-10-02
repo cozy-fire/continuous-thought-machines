@@ -20,7 +20,11 @@ vision:
 ctm:
   d_model: 512
   d_input: 128
-  ticks: 2
+  # Execution budgets share all weights. Both columns use the current task's ticks.
+  ticks_by_task:
+    maze_medium: 75
+    fourrooms: 2
+  # Internal ticks, not a fixed number of environment observations.
   memory_length: 40
   synapse: two_linear_glu_blocks
   nlm_hidden: 16

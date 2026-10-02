@@ -78,11 +78,19 @@ C 采集的 Encoder 分块固定为 `min(num_envs, encoder_microbatch_images)`�
 
 默认 `--timing-mode events`：CUDA 分项为当前 stream 的事件区间，包括主机提交工作造成的空隙，不代表纯 kernel 时间；CPU 环境/BFS仍为墙钟。窗口结束统一解析事件；动作所需 CPU 下载仍会等待。`--timing-mode synchronized` 可诊断前后同步的墙钟区间，增加开销。事件携带 `timing_mode`；不同模式的分项不直接作为提速比较。性能诊断入口 `profile_training` 固定使用 synchronized，外层窗口/阶段墙钟用于同负载比较。CPU运行两种模式均使用墙钟。
 
-本次受检源码改变，旧开发 run 不允许续训；旧完整 v3 inference artifact 的配置和参数键保持可读。不要重写旧 run 的源码哈希绕过检查。
+受检源码和任务执行配置改变，旧开发 run 不允许续训。新完整 v3 inference artifact 在哈希配置中保存两任务 ticks，加载时恢复该映射；缺少 `ticks_by_task` 的旧全局 `ticks: 2` 产物明确拒绝，读取旧实验需使用其对应源码版本。不要重写旧 run 的源码哈希绕过检查。
+
+## 按任务执行 ticks
+
+`full.yaml` 中 `ctm.ticks_by_task.maze_medium: 75`、`ctm.ticks_by_task.fourrooms: 2` 是统一来源；remote 和 smoke 继承它。`memory_length: 40` 固定为内部 tick 数。训练环境步、visit、窗口长度、minibatch、Adam 更新次数及 Loss 均未改变。KB 权重在任务间共享；两列内部逐 tick 对齐，不为任务创建不同 KB。
+
+P 采样及重放、C 双列教师与 KB 学生、F 使用环境任务的 ticks。每个任务报告记录 `ticks` 与 `memory_ticks`；跨任务评估和可视化使用评估任务的 ticks，与 Active 来源任务无关。执行预算记录在本地事件及 W&B run 配置中，不新增 ticks 曲线。直接调用 `step`／`sequence` 必须传 `task=`；不要临时修改 `controller.ticks`，该属性已移除。任务切换使用新的环境和状态，不能将一任务的 live trace 直接移交另一任务。
+
+较长 ticks 会增大递归反传图；50 张观察在 Maze 中展开 3,750 tick／列。原 2-tick 性能与显存数据不能用于预测新负载。正式远端 profile 的显存可行性须在目标 GPU 实测，不能把小预算 smoke 作为大 batch 的保证。
 
 ## E3、内存地图与 CTM 编译
 
-正式配置默认 `optimization.e3_cache: true`、`environment.map_cache: memory`。E3 对同一观察、同一列的两个 tick 复用 Attention 的 token/K/V；Q 每 tick 重算。同步衰减权重只在一次序列 forward 内共享，保留梯度，不跨 Adam 更新。没有改变预算、教师、Loss、初态、reset 或参数键。
+正式配置默认 `optimization.e3_cache: true`、`environment.map_cache: memory`。E3 对同一观察、同一列的全部 tick 复用 Attention 的 token/K/V；Q 每 tick 重算。同步衰减权重只在一次序列 forward 内共享，保留梯度，不跨 Adam 更新。缓存不会绕过任务 ticks，教师、Loss、初态、reset 和参数键保持原定义。
 
 Runner 启动时校验并解码训练地图和固定 validation/test 面板，保存连续 `uint8` CPU 数组，各训练槽共享。reset 只读取内存，不再打开 PNG。评估子进程接收解码后的 CPU 图片与起终点，不读取地图文件。缓存不进入 checkpoint；结束或异常退出释放，恢复时重新校验加载。地图加载失败直接报错，不退回磁盘。`map_cache` 事件记录 `maps`、`cache_bytes`、`load_seconds`。独立工具的并行槽通过弱引用池共享缓存，没有全局强引用长期保留图片。
 
@@ -96,4 +104,4 @@ Runner 启动时校验并解码训练地图和固定 validation/test 面板，�
 python -m tasks.continual_nav_opd.verify_smoke --device cuda:0 --ctm-compile default --output-dir <new-directory>
 ```
 
-Windows 本地编译需要匹配 PyTorch 的 `triton-windows`、`PYTHONUTF8=1`，并把 `TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR` 指向可写目录。本轮测试环境是 PyTorch 2.13/CUDA 12.6 与 triton-windows 3.7.1.post27；不能直接据此断言 Linux RTX5090 的提速。旧推理产物按原始配置字段校验哈希，再补运行选项默认值；旧训练恢复仍受当前源码与配置校验限制。
+Windows 本地编译需要匹配 PyTorch 的 `triton-windows`、`PYTHONUTF8=1`，并把 `TRITON_CACHE_DIR`、`TORCHINDUCTOR_CACHE_DIR` 指向可写目录。本轮测试环境是 PyTorch 2.13/CUDA 12.6 与 triton-windows 3.7.1.post27；不能直接据此断言 Linux RTX5090 的提速。推理产物按原始配置字段校验哈希，再补可选运行选项默认值；两任务 ticks 映射是必需字段，不做旧全局 ticks 迁移。训练恢复仍受当前源码与配置校验限制。

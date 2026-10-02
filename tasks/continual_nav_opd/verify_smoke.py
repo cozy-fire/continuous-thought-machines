@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
@@ -48,6 +48,8 @@ def audit_run(root: Path, config, seed: int) -> dict:
     if len(completed) != 12 or [e['stage'] for e in completed] != [s.key for s in stages]:
         raise ValueError('missing, duplicate or out-of-order stages')
     for stage, event in zip(stages, completed):
+        if event.get('ticks') != config.ctm.ticks_by_task.for_task(stage.task) or event.get('memory_ticks') != 40:
+            raise ValueError('stage execution budget is wrong')
         stats = event['statistics']
         if stage.phase == 'F':
             if stats['scored_samples'] != 8 or len(set(stats['selected_ids'])) != 8:
@@ -64,6 +66,8 @@ def audit_run(root: Path, config, seed: int) -> dict:
         if set(report['tasks']) != set(config.task_order):
             raise ValueError('incomplete task panel')
         for task, metrics in report['tasks'].items():
+            if metrics.get('ticks') != config.ctm.ticks_by_task.for_task(task) or metrics.get('memory_ticks') != 40:
+                raise ValueError('evaluation execution budget is wrong')
             if len(metrics['results']) != config.evaluation.validation_episodes:
                 raise ValueError('incomplete episode panel')
         reports[key] = {task: value['success_rate'] for task, value in report['tasks'].items()}
@@ -73,6 +77,8 @@ def audit_run(root: Path, config, seed: int) -> dict:
     if set(payload['fisher'].importance) != set(dict(policy.named_parameters())):
         raise ValueError('Fisher does not cover the complete model')
     return {'stages': 12, 'transitions': 1664, 'updates': 20, 'validation': reports,
+            'ticks_by_task': asdict(config.ctm.ticks_by_task),
+            'memory_ticks': config.ctm.memory_length,
             'fisher_parameters': len(payload['fisher'].importance), 'finalized': True}
 
 

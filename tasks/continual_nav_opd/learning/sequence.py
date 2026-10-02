@@ -38,6 +38,8 @@ def gradient_norm(parameters) -> float:
 def update_window(student, batch: SequenceBatch, optimizer, config, minibatch_rng: np.random.Generator, regularizer=None) -> dict:
     if (batch.valid_mask & ~batch.target_mask).any():
         raise ValueError("a real observation is missing its required target")
+    if student.config != config or batch.ticks != config.ctm.ticks_by_task.for_task(batch.task):
+        raise ValueError('rollout/model execution budget mismatch')
     slots = batch.obs.shape[1]
     if slots % config.optimization.minibatches:
         raise ValueError("environment slots must divide into minibatches")
@@ -68,7 +70,7 @@ def update_window(student, batch: SequenceBatch, optimizer, config, minibatch_rn
         with timer.measure('learner_forward_seconds'):
             output = student.sequence(batch.obs.index_select(1,indices).to(device), state,
                                       batch.episode_start.index_select(1,indices).to(device),
-                                      None if bool(valid.all()) else valid.to(device))
+                                      None if bool(valid.all()) else valid.to(device), task=batch.task)
             selected_logits = output.logits[mask]
             metrics = distribution_metrics(selected_logits, target_cpu.to(device), check_inputs=False)
             loss = metrics["kl"].mean()

@@ -41,7 +41,7 @@ def visualize(checkpoint,policy_type,task,panel_index,output_dir,split='validati
                         target=teacher.predict(obs.teacher_obs[None],teacher_state,start); teacher_state=target.state; probs=target.probabilities[0].cpu().tolist()
                 else: probs=None
                 rgb=torch.from_numpy(obs.student_rgb[None]).to(device)
-                logits,state=policy.step(rgb,state,torch.tensor(start,device=device))
+                logits,state=policy.step(rgb,state,torch.tensor(start,device=device),task=task)
                 action=int(logits.argmax(-1)[0]); obs,reward,term,trunc,info=env.step(action); total+=reward; step+=1
                 row={'step':step,'action':action,'action_name':action_names[action],'reward':reward,'cumulative_reward':total,
                      'terminated':term,'truncated':trunc,'success':bool(info['success']),
@@ -62,6 +62,7 @@ def visualize(checkpoint,policy_type,task,panel_index,output_dir,split='validati
                 media.seek(media.n_frames-1); media.load()
             with Image.open(output/'reward.png') as media: media.verify()
             atomic_json(output/'trajectory.json',{'task':task,'split':split,'panel_index':panel_index,'checkpoint':str(Path(checkpoint).resolve()),
+                        'ticks':config.ctm.ticks_by_task.for_task(task),'memory_ticks':config.ctm.memory_length,
                         'policy_type':policy_type,'active_key':active_key,'teacher_diagnostics':teacher_diagnostics,
                         'frames':len(frames),'actions':len(rows),'success':bool(info['success']),'return':total,'rows':rows})
         finally: env.close()

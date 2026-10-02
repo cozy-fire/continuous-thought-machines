@@ -20,6 +20,9 @@ class CompressCollector:
         self.num_envs=len(envs.envs)
         self.obs,infos=envs.reset()
         self.task=infos[0]['task_key']
+        if {info['task_key'] for info in infos} != {self.task} or teacher.config != kb.config:
+            raise ValueError('C requires one task and matching teacher/KB execution budgets')
+        self.ticks=kb.config.ctm.ticks_by_task.for_task(self.task)
         self.starts=np.ones(self.num_envs,dtype=bool)
         self.state=detach_clone_state(kb.initial_state(self.num_envs))
         self.teacher_state=detach_clone_state(teacher.initial_state(self.num_envs))
@@ -36,7 +39,7 @@ class CompressCollector:
             rgb=torch.from_numpy(self.obs.student_rgb.copy())
             reset=torch.from_numpy(self.starts.copy())
             with timer.measure('expert_forward_seconds'):
-                teacher_logits,self.teacher_state=self.teacher.step(rgb.to(self.device),self.teacher_state,reset.to(self.device))
+                teacher_logits,self.teacher_state=self.teacher.step(rgb.to(self.device),self.teacher_state,reset.to(self.device),task=self.task)
                 probs=teacher_logits.softmax(-1).detach().cpu()
             validate_targets(probs,torch.ones(self.num_envs,dtype=torch.bool),self.num_envs)
             action=torch.multinomial(probs.to(self.action_rng.device),1,generator=self.action_rng).squeeze(-1).cpu()
@@ -55,14 +58,14 @@ class CompressCollector:
             # convolution roundoff enough to amplify through recurrent state and Adam.
             chunk = min(self.num_envs, self.kb.config.optimization.encoder_microbatch_images)
             output = self.kb.sequence(image_stack.to(self.device), initial, start_stack.to(self.device),
-                                      encoder_chunk_images=chunk)
+                                      task=self.task,encoder_chunk_images=chunk)
             self.state = output.state
             kb_logits = output.logits.detach().cpu()
         timing = timer.finish()
         valid=torch.ones(length,self.num_envs,dtype=torch.bool)
         batch=SequenceBatch(image_stack,start_stack,valid,valid.clone(),torch.stack(targets),
                             torch.stack(actions),torch.arange(start_transition_id,start_transition_id+length*self.num_envs).reshape(length,self.num_envs),
-                            initial,self.source_snapshot_id)
+                            initial,self.source_snapshot_id,self.task,self.ticks)
         return CollectedWindow(batch,kb_logits,torch.stack(rewards),torch.stack(terms),torch.stack(truncs),infos,timing,None)
 
     def detach_live_state(self):

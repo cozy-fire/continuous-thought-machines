@@ -55,6 +55,8 @@ class SequenceBatch:
     transition_ids: Tensor  # Only padding uses -1.
     initial_state: PolicyState  # Detached independent copy BEFORE first observation.
     source_snapshot_id: str
+    task: TaskKey  # External execution context only; never encoded as a model input.
+    ticks: int  # Actual collection budget, checked before gradient replay.
 
     @property
     def loss_mask(self):

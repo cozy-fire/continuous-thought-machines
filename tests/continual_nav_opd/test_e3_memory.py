@@ -52,7 +52,7 @@ class CacheTests(unittest.TestCase):
             with patch.object(controller.attention,'prepare',wraps=controller.attention.prepare) as keys, \
                  patch.object(controller.action_sync,'prepare',wraps=controller.action_sync.prepare) as action, \
                  patch.object(controller.out_sync,'prepare',wraps=controller.out_sync.prepare) as output:
-                _sequence(policy,rgb,policy.initial_state(2),torch.zeros(3,2,dtype=torch.bool),torch.ones(3,2,dtype=torch.bool))
+                _sequence(policy,rgb,policy.initial_state(2),torch.zeros(3,2,dtype=torch.bool),torch.ones(3,2,dtype=torch.bool), task='fourrooms')
                 self.assertEqual(keys.call_count,3)
                 self.assertEqual(action.call_count,1)
                 self.assertEqual(output.call_count,1)
@@ -105,8 +105,8 @@ class CacheTests(unittest.TestCase):
                 opt=torch.optim.Adam([p for p in cached.parameters() if p.requires_grad],lr=1e-4)
                 for iteration in range(2):
                     plain.load_state_dict(cached.state_dict()); plain.zero_grad(); cached.zero_grad()
-                    a=_sequence(cached,rgb,cached.initial_state(2),starts,valid)
-                    b=_sequence(plain,rgb,plain.initial_state(2),starts,valid)
+                    a=_sequence(cached,rgb,cached.initial_state(2),starts,valid, task='fourrooms')
+                    b=_sequence(plain,rgb,plain.initial_state(2),starts,valid, task='fourrooms')
                     torch.testing.assert_close(a.logits,b.logits,atol=2e-6,rtol=1e-5)
                     a.logits.square().sum().backward(); b.logits.square().sum().backward()
                     for (name,x),(_,y) in zip(cached.named_parameters(),plain.named_parameters()):

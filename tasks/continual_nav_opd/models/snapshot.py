@@ -9,6 +9,8 @@ def save_snapshot(policy: StandalonePolicy | DualPolicy, path: str | Path) -> No
     if type(policy) not in (StandalonePolicy, DualPolicy):
         raise TypeError("only complete v3 policies can be exported")
     config = policy.config
+    # The hashed config persists BOTH task budgets. State_dict alone cannot store
+    # an execution loop count; loading a legacy global-ticks config must fail.
     artifact = {"artifact_type": "v3_complete_inference", "method": config.method,
                 "schema_version": 3, "sequence_protocol": config.sequence_protocol,
                 "config": resolved_dict(config), "config_hash": config_hash(config),

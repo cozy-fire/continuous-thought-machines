@@ -39,7 +39,8 @@ class Controller(nn.Module):
         super().__init__()
         validate_config(config)
         c = config.ctm
-        self.d_model, self.memory, self.ticks = c.d_model, c.memory_length, c.ticks
+        # Tick count belongs to the caller's task protocol, never to recurrent weights.
+        self.d_model, self.memory = c.d_model, c.memory_length
         self.compile_mode = config.optimization.ctm_compile
         scale = math.sqrt(1 / (c.d_model + c.memory_length))
         self.start_pre = nn.Parameter(torch.empty(c.d_model, c.memory_length).uniform_(-scale, scale))

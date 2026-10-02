@@ -40,6 +40,7 @@ def panels(config,manifest,task,split,map_cache=None):
 
 
 def evaluate_policy(policy,config,manifest,split='validation',tasks=None,backend=None,num_envs=None,identity=None,*,factory=create_panel_env,map_cache=None):
+    if policy.config != config: raise ValueError('evaluation policy/config execution budget mismatch')
     tasks=tuple(config.task_order if tasks is None else tasks)
     if not tasks or len(set(tasks))!=len(tasks) or not set(tasks)<=set(config.task_order): raise ValueError('invalid task subset')
     backend=config.evaluation.backend if backend is None else backend
@@ -70,7 +71,8 @@ def evaluate_policy(policy,config,manifest,split='validation',tasks=None,backend
                     slots=sorted(active); indices=torch.tensor(slots,device=device)
                     rgb=torch.from_numpy(np.stack([active[s]['obs'].student_rgb for s in slots])).to(device)
                     starts=torch.tensor([active[s]['start'] for s in slots],dtype=torch.bool,device=device)
-                    logits,proposed=snapshot.step(rgb,select_state(state,indices),starts)
+                    # Cross-task inference keeps shared weights and resets task-local state.
+                    logits,proposed=snapshot.step(rgb,select_state(state,indices),starts,task=task)
                     if not torch.isfinite(logits).all(): raise ValueError('nonfinite evaluation logits')
                     state=replace_slots(state,indices,proposed)
                     actions=logits.argmax(-1).cpu().tolist()
@@ -91,7 +93,8 @@ def evaluate_policy(policy,config,manifest,split='validation',tasks=None,backend
                     assign(finished)
             if any(result is None for result in results): raise RuntimeError('incomplete evaluation panel')
             steps=sum(r['length'] for r in results)
-            reports[task]={'episodes':len(results),'success_rate':float(np.mean([r['success'] for r in results])),
+            reports[task]={'ticks':config.ctm.ticks_by_task.for_task(task),'memory_ticks':config.ctm.memory_length,
+                           'episodes':len(results),'success_rate':float(np.mean([r['success'] for r in results])),
                            'mean_return':float(np.mean([r['return'] for r in results])),
                            'mean_length':float(np.mean([r['length'] for r in results])),
                            'environment_steps':steps,'action_counts':np.sum([r['action_counts'] for r in results],axis=0).tolist(),

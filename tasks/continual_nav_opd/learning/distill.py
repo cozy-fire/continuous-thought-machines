@@ -63,6 +63,7 @@ def run_compress_stage(envs,dual_teacher,kb,fisher,config,steps,action_rng,minib
                 turns+=sum(info['agent_dir_before']!=info['agent_dir_after'] for info in infos)
         if on_window and (windows%config.logging.interval_windows==0 or consumed==steps):
             on_window({'phase':'C','policy_type':'kb','task':collector.task,'stage_env_steps':consumed,'transitions':consumed,
+                       'ticks':collector.ticks,'memory_ticks':config.ctm.memory_length,
                        'optimizer_updates':updates,'eligible_target_steps':consumed,'windows':windows,
                        **{k:v if k.endswith('_seconds') else v/consumed for k,v in sums.items()},
                        'action_counts':counts.tolist(),'reward_sum':reward,'successes':successes,'timeouts':timeouts,
@@ -74,5 +75,6 @@ def run_compress_stage(envs,dual_teacher,kb,fisher,config,steps,action_rng,minib
     if identity!=policy_hash(teacher): raise RuntimeError('C modified frozen teacher')
     stats={k:v if k.endswith('_seconds') else v/consumed for k,v in sums.items()}
     stats.update(elapsed_seconds=time.perf_counter()-started,action_counts=counts.tolist(),reward_sum=reward,successes=successes,timeouts=timeouts)
+    stats.update(ticks=collector.ticks,memory_ticks=config.ctm.memory_length)
     stats.update(displacement_rate=moves/consumed if collector.task=='fourrooms' else None,turn_rate=turns/consumed if collector.task=='fourrooms' else None)
     return CompressResult(consumed,updates,start_transition_id+consumed,identity,True,stats)

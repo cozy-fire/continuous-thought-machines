@@ -6,9 +6,9 @@
 
 学生只接收 $3\times84\times84$ RGB，不接收任务 ID 或教师专用观察。两任务统一为五维动作：Maze 为上、下、左、右、等待；FourRooms 为左转、右转、前进及两个等待槽。
 
-知识库 **KB** 与活动列 **Active** 各有独立的 ResNet34-2（GroupNorm）、空间 Attention、CTM 和 Actor。编码器输出 $128\times21\times21$ 空间特征；CTM 每次观察推进 2 ticks，保留 40 ticks 的神经元滑动记忆。Attention 根据神经元同步状态查询空间特征。
+知识库 **KB** 与活动列 **Active** 各有独立的 ResNet34-2（GroupNorm）、空间 Attention、CTM 和 Actor。编码器输出 $128\times21\times21$ 空间特征；共享 KB 在 Maze 每次观察执行 75 ticks，在 FourRooms 执行 2 ticks，神经元滑动记忆固定为 40 个内部 ticks。计算次数由外部任务上下文选择，不作为网络输入；它同时改变计算深度和历史观察在窗口中的保留范围。Attention 根据神经元同步状态查询空间特征。
 
-每个 tick 先推进 KB，再将其当前 post activation 经过可训练的门控 Adapter 输入 Active 的 synapse；侧向输入停止向 KB 反传。每个 P 开始时，Active 复制当前 KB 的视觉权重，随机初始化控制器、Actor 和 Adapter；完整旧 KB 冻结。首次 KB 尚无知识时关闭侧向连接。
+每个 tick 先推进 KB，再将其当前 post activation 经过可训练的门控 Adapter 输入 Active 的 synapse；两列使用当前任务相同的 ticks，侧向输入停止向 KB 反传。每个 P 开始时，Active 复制当前 KB 的视觉权重，随机初始化控制器、Actor 和 Adapter；完整旧 KB 冻结。首次 KB 尚无知识时关闭侧向连接。
 
 ## Progress：专一教师指导学生轨迹
 

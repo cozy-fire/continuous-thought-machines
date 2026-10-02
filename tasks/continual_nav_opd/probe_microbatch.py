@@ -38,7 +38,7 @@ def probe(output_dir, device='cuda:0'):
             if device.startswith('cuda'):
                 torch.cuda.synchronize(device); torch.cuda.reset_peak_memory_stats(device)
             start = time.perf_counter()
-            prediction = dual.sequence(images, dual.initial_state(4), starts)
+            prediction = dual.sequence(images, dual.initial_state(4), starts, task='maze_medium')
             loss = prediction.logits.log_softmax(-1)[..., 0].neg().mean()
             loss.backward()
             if device.startswith('cuda'):

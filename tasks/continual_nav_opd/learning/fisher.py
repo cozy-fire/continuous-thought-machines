@@ -49,6 +49,8 @@ def estimate_fisher(kb,windows,selected_ids):
         raise ValueError('Fisher requires unique nonempty transition IDs')
     lookup={}
     for batch in windows:
+        if batch.ticks != kb.config.ctm.ticks_by_task.for_task(batch.task):
+            raise ValueError('Fisher rollout execution budget mismatch')
         for t,b in batch.valid_mask.nonzero().tolist():
             key=int(batch.transition_ids[t,b])
             if key < 0 or key in lookup: raise ValueError('invalid or duplicate Fisher transition ID')
@@ -67,7 +69,7 @@ def estimate_fisher(kb,windows,selected_ids):
             origin=detach_clone_state(select_state(batch.initial_state,indices.to(batch.initial_state.pre.device)))
             origin=CTMState(origin.pre.to(device),origin.post.to(device))
             # Rebuild the full causal window for EACH sample; square BEFORE averaging.
-            output=kb.sequence(batch.obs[:,b:b+1].to(device),origin,batch.episode_start[:,b:b+1].to(device),batch.valid_mask[:,b:b+1].to(device))
+            output=kb.sequence(batch.obs[:,b:b+1].to(device),origin,batch.episode_start[:,b:b+1].to(device),batch.valid_mask[:,b:b+1].to(device),task=batch.task)
             score=output.logits[t,0].log_softmax(-1)[int(batch.actions[t,b])]
             grads=torch.autograd.grad(score,tuple(parameters.values()),allow_unused=True)
             for (name,_),grad in zip(parameters.items(),grads):
@@ -102,7 +104,11 @@ def run_fisher_stage(envs,kb,previous,config,steps,action_rng,fisher_rng,start_t
     slots=len(envs.envs)
     if steps<=0 or steps%slots or slots!=config.training.num_envs or config.fisher.scored_samples>steps:
         raise ValueError('invalid F budget')
-    started=time.perf_counter(); obs,_=envs.reset(); device=next(kb.parameters()).device
+    if kb.config != config: raise ValueError('F config mismatch')
+    started=time.perf_counter(); obs,infos=envs.reset(); device=next(kb.parameters()).device
+    tasks={info['task_key'] for info in infos}
+    if len(tasks)!=1: raise ValueError('F requires one task per rollout')
+    task=tasks.pop(); ticks=config.ctm.ticks_by_task.for_task(task)
     state=detach_clone_state(kb.initial_state(slots)); starts=np.ones(slots,dtype=bool)
     windows=[]; consumed=0; before=policy_hash(kb)
     while consumed<steps:
@@ -112,7 +118,7 @@ def run_fisher_stage(envs,kb,previous,config,steps,action_rng,fisher_rng,start_t
         with torch.no_grad():
             for _ in range(length):
                 rgb=torch.from_numpy(obs.student_rgb.copy()); reset=torch.from_numpy(starts.copy())
-                logits,state=kb.step(rgb.to(device),state,reset.to(device))
+                logits,state=kb.step(rgb.to(device),state,reset.to(device),task=task)
                 if not torch.isfinite(logits).all(): raise ValueError('nonfinite F sampling logits')
                 action=torch.multinomial(logits.softmax(-1).to(action_rng.device),1,generator=action_rng).squeeze(-1).cpu()
                 transition=envs.step(action.numpy()); obs,starts=transition.next_obs,transition.next_episode_start
@@ -120,7 +126,7 @@ def run_fisher_stage(envs,kb,previous,config,steps,action_rng,fisher_rng,start_t
         valid=torch.ones(length,slots,dtype=torch.bool)
         windows.append(SequenceBatch(torch.stack(images),torch.stack(reset_masks),valid,torch.zeros_like(valid),
                        torch.zeros(length,slots,5),torch.stack(actions),
-                       torch.arange(start_transition_id+consumed,start_transition_id+consumed+length*slots).reshape(length,slots),initial,before))
+                       torch.arange(start_transition_id+consumed,start_transition_id+consumed+length*slots).reshape(length,slots),initial,before,task,ticks))
         state=detach_clone_state(state); consumed+=length*slots
     selected=fisher_rng.choice(np.arange(start_transition_id,start_transition_id+steps),config.fisher.scored_samples,replace=False)
     synchronize(device); score_start=time.perf_counter()
@@ -130,4 +136,5 @@ def run_fisher_stage(envs,kb,previous,config,steps,action_rng,fisher_rng,start_t
     if before!=policy_hash(kb): raise RuntimeError('F changed KB')
     return {'fisher':result,'transitions':consumed,'optimizer_updates':0,'next_transition_id':start_transition_id+consumed,
             'scored_samples':len(selected),'selected_ids':selected.tolist(),'source_snapshot_id':before,
-            'statistics':{'scoring_seconds':score_seconds,'elapsed_seconds':time.perf_counter()-started}}
+            'statistics':{'task':task,'ticks':ticks,'memory_ticks':config.ctm.memory_length,
+                          'scoring_seconds':score_seconds,'elapsed_seconds':time.perf_counter()-started}}

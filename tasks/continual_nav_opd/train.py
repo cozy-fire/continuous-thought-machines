@@ -35,6 +35,7 @@ def main():
         return
     print(json.dumps(dict(method=config.method,schema_version=config.schema_version,
                          sequence_protocol=config.sequence_protocol,config_hash=config_hash(config),
+                         ticks_by_task=asdict(config.ctm.ticks_by_task),memory_ticks=config.ctm.memory_length,
                          budget=budget_summary(config),stages=[asdict(s) for s in expand_stages(config)]),indent=2))
 
 if __name__=="__main__":

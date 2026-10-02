@@ -43,7 +43,7 @@ def fake_fisher(envs,kb,previous,config,steps,action,rng,start,key):
 
 def fake_eval(policy,config,manifest,split='validation',identity=None,**kwargs):
     result={'episodes':2,'success_rate':0.,'environment_steps':4,'results':[{},{}]}
-    return {**identity,'split':split,'tasks':{t:result.copy() for t in config.task_order},'elapsed_seconds':.01,'environment_steps':8,'episodes_per_second':400.}
+    return {**identity,'split':split,'tasks':{t:{**result,'ticks':config.ctm.ticks_by_task.for_task(t),'memory_ticks':40} for t in config.task_order},'elapsed_seconds':.01,'environment_steps':8,'episodes_per_second':400.}
 
 
 class CheckpointScheduleTests(unittest.TestCase):
@@ -130,6 +130,12 @@ class CheckpointScheduleTests(unittest.TestCase):
         self.assertEqual(before,policy_hash(restored))
         self.assertNotEqual(restored.kb.actor[-1].bias.data_ptr(),current['kb']['actor.4.bias'].data_ptr())
         self.assertFalse(torch.equal(restored.kb.actor[-1].bias,current['kb']['actor.4.bias']))
+
+    def test_task_ticks_change_rejects_boundary_restore(self):
+        run(self.config,0,self.root,max_stages=1)
+        changed=replace(self.config,ctm=replace(self.config.ctm,ticks_by_task=replace(self.config.ctm.ticks_by_task,maze_medium=74)))
+        with self.assertRaisesRegex(ValueError,'config/source/seed/stages mismatch'):
+            load_boundary(self.root/'checkpoints/latest.json',changed,0)
 
 
 if __name__=='__main__': unittest.main()

@@ -23,6 +23,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(sum(s.env_steps for s in stages),total)
             self.assertEqual(budget_summary(c)['total'],total)
             self.assertEqual(c.training.num_envs,envs)
+            self.assertEqual(c.ctm.ticks_by_task.maze_medium,75)
+            self.assertEqual(c.ctm.ticks_by_task.fourrooms,2)
+            self.assertEqual(c.ctm.memory_length,40)
+            self.assertEqual([s.ticks for s in stages],[75]*3+[2]*3+[75]*3+[2]*3)
             self.assertEqual(c.optimization.ctm_compile, "reduce-overhead" if profile == "remote_config" else "disabled")
             self.assertEqual([(s.visit,s.task,s.phase) for s in stages],[(v,t,p) for v in range(2) for t in ('maze_medium','fourrooms') for p in ('P','C','F')])
         self.assertEqual(budget_summary(self.full),dict(P=36400000,C=14560000,F=16384,total=50976384,stage_count=12))
@@ -38,7 +42,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(updates,127400)
 
     def test_strict_fields_types_and_protocol(self):
-        for path,value in [('training.num_envs',3),('pnc.visits',0),('optimization.minibatches',3),('optimization.learning_steps',0),('schema_version',2),('sequence_protocol','other'),('distill.temperature',2),('teachers.maze_medium.type','neural'),('teachers.maze_medium.tie_break_order',[3,2,1,0]),('training.seed',True),('optimization.optimizer.lr',float('nan'))]:
+        for path,value in [('ctm.ticks_by_task.maze_medium',0),('ctm.ticks_by_task.fourrooms',-1),('ctm.ticks_by_task.maze_medium',True),('ctm.ticks_by_task.fourrooms',2.5),('ctm.memory_length',20),('training.num_envs',3),('pnc.visits',0),('optimization.minibatches',3),('optimization.learning_steps',0),('schema_version',2),('sequence_protocol','other'),('distill.temperature',2),('teachers.maze_medium.type','neural'),('teachers.maze_medium.tie_break_order',[3,2,1,0]),('training.seed',True),('optimization.optimizer.lr',float('nan'))]:
             raw=deepcopy(resolved_dict(self.full)); owner=raw
             parts=path.split('.')
             for key in parts[:-1]: owner=owner[key]
@@ -66,11 +70,12 @@ class ConfigTests(unittest.TestCase):
         batch=SequenceBatch(torch.zeros(2,1,3,84,84,dtype=torch.uint8),
                             torch.tensor([[True],[False]]),torch.tensor([[True],[False]]),
                             torch.ones(shape,dtype=torch.bool),torch.zeros(2,1,5),
-                            torch.zeros(shape,dtype=torch.int64),torch.tensor([[0],[-1]]),initial,'test')
+                            torch.zeros(shape,dtype=torch.int64),torch.tensor([[0],[-1]]),initial,'test','maze_medium',75)
         self.assertEqual(batch.loss_mask.tolist(),[[True],[False]])
         self.assertEqual(batch.obs.shape,(2,1,3,84,84))
         self.assertEqual(batch.teacher_probs.shape,(2,1,5))
         self.assertEqual(batch.initial_state.active.pre.shape,(1,512,40))
+        self.assertEqual((batch.task,batch.ticks),('maze_medium',75))
         self.assertFalse(batch.initial_state.active.pre.requires_grad)
         self.assertEqual({f.name for f in fields(FisherState)},
                          {'importance','theta_star','completed_compressions','sample_count','stage_key'})

@@ -38,7 +38,7 @@ class CompressFisherTests(unittest.TestCase):
     def test_independent_origins_full_replay_and_continuity(self):
         collector=CompressCollector(self.envs,self.teacher,self.kb,self.rng,policy_hash(self.teacher))
         window=collector.collect(2,10)
-        with torch.no_grad(): out=self.kb.sequence(window.batch.obs,window.batch.initial_state,window.batch.episode_start)
+        with torch.no_grad(): out=self.kb.sequence(window.batch.obs,window.batch.initial_state,window.batch.episode_start, task='maze_medium')
         torch.testing.assert_close(out.logits,window.student_logits,atol=2e-5,rtol=1e-5)
         self.assertNotEqual(collector.state.pre.data_ptr(),collector.teacher_state.kb.pre.data_ptr())
         previous=detach_clone_state(collector.state); second=collector.collect(1,14)
@@ -71,7 +71,7 @@ class CompressFisherTests(unittest.TestCase):
         window.actions[0]=torch.tensor([0,1])
         before=policy_hash(self.kb)
         result=estimate_fisher(self.kb,[window],[0,1])
-        out=self.kb.sequence(window.obs,window.initial_state,window.episode_start)
+        out=self.kb.sequence(window.obs,window.initial_state,window.episode_start, task='maze_medium')
         param=self.kb.actor[-1].bias
         score=out.logits.log_softmax(-1)[0]
         a=torch.autograd.grad(score[0,0],param,retain_graph=True)[0]

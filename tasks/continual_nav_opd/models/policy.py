@@ -5,7 +5,7 @@ from typing import TypeVar
 import torch
 from torch import Tensor, nn
 from ..config import Config, validate_config
-from ..contracts import CTMState, DualState, PolicyState, PolicySequenceOutput
+from ..contracts import CTMState, DualState, PolicyState, PolicySequenceOutput, TaskKey
 from .ctm import Controller
 from .vision import VisionEncoder
 from .state import reset_state, select_state, replace_slots
@@ -45,7 +45,7 @@ class StandalonePolicy(nn.Module):
         return (torch.cat([self.encoder(part) for part in rgb.split(microbatch)], dim=0),)
 
     def _step_features(self, features: tuple[Tensor, ...], state: CTMState,
-                       episode_start: Tensor, prepared_sync=None) -> tuple[Tensor, CTMState]:
+                       episode_start: Tensor, prepared_sync=None, *, ticks: int) -> tuple[Tensor, CTMState]:
         if not isinstance(state, CTMState):
             raise TypeError("StandalonePolicy requires CTMState")
         state = reset_state(state, episode_start, self.initial_state(features[0].shape[0]))
@@ -54,7 +54,7 @@ class StandalonePolicy(nn.Module):
             prepared_attention = self.controller.attention.prepare(features[0])
             if prepared_sync is None:
                 prepared_sync = self._prepare_sequence()
-        for _ in range(self.controller.ticks):
+        for _ in range(ticks):
             state, _ = self.controller.tick(features[0], state, attention_prepared=prepared_attention,
                                             sync_prepared=prepared_sync[0] if prepared_sync else None)
         return self.actor(self.controller.readout(state, prepared_sync[1] if prepared_sync else None)), state
@@ -62,13 +62,14 @@ class StandalonePolicy(nn.Module):
     def _prepare_sequence(self):
         return self.controller.prepare_sync() if self.config.optimization.e3_cache else None
 
-    def step(self, rgb: Tensor, state: CTMState, episode_start: Tensor) -> tuple[Tensor, CTMState]:
+    def step(self, rgb: Tensor, state: CTMState, episode_start: Tensor, *, task: TaskKey) -> tuple[Tensor, CTMState]:
         _validate_rgb(rgb, 4)
-        return self._step_features(self._encode(rgb), state, episode_start)
+        ticks = self.config.ctm.ticks_by_task.for_task(task)
+        return self._step_features(self._encode(rgb), state, episode_start, ticks=ticks)
 
     def sequence(self, rgb: Tensor, initial_state: CTMState, episode_start: Tensor,
-                 valid_mask: Tensor | None = None, *, encoder_chunk_images: int | None = None) -> PolicySequenceOutput:
-        return _sequence(self, rgb, initial_state, episode_start, valid_mask, encoder_chunk_images=encoder_chunk_images)
+                 valid_mask: Tensor | None = None, *, task: TaskKey, encoder_chunk_images: int | None = None) -> PolicySequenceOutput:
+        return _sequence(self, rgb, initial_state, episode_start, valid_mask, task=task, encoder_chunk_images=encoder_chunk_images)
 
 
 class LateralAdapter(nn.Module):
@@ -129,7 +130,7 @@ class DualPolicy(nn.Module):
         return kb_features, active_features
 
     def _step_features(self, features: tuple[Tensor, ...], state: DualState,
-                       episode_start: Tensor, prepared_sync=None) -> tuple[Tensor, DualState]:
+                       episode_start: Tensor, prepared_sync=None, *, ticks: int) -> tuple[Tensor, DualState]:
         if not isinstance(state, DualState):
             raise TypeError("DualPolicy requires DualState")
         state = reset_state(state, episode_start, self.initial_state(features[0].shape[0]))
@@ -142,7 +143,8 @@ class DualPolicy(nn.Module):
             active_attention = self.active.controller.attention.prepare(features[1])
             if prepared_sync is None:
                 prepared_sync = self._prepare_sequence()
-        for _ in range(self.active.controller.ticks):
+        # One external task budget advances BOTH columns; task is never a neural input.
+        for _ in range(ticks):
             # KB advances FIRST: lateral uses its new post activation from this same tick.
             # Its own encoder is frozen; Active features never enter the KB path.
             with torch.no_grad():
@@ -161,13 +163,14 @@ class DualPolicy(nn.Module):
             kb_sync = self.kb.controller.prepare_sync()
         return kb_sync, self.active.controller.prepare_sync()
 
-    def step(self, rgb: Tensor, state: DualState, episode_start: Tensor) -> tuple[Tensor, DualState]:
+    def step(self, rgb: Tensor, state: DualState, episode_start: Tensor, *, task: TaskKey) -> tuple[Tensor, DualState]:
         _validate_rgb(rgb, 4)
-        return self._step_features(self._encode(rgb), state, episode_start)
+        ticks = self.config.ctm.ticks_by_task.for_task(task)
+        return self._step_features(self._encode(rgb), state, episode_start, ticks=ticks)
 
     def sequence(self, rgb: Tensor, initial_state: DualState, episode_start: Tensor,
-                 valid_mask: Tensor | None = None, *, encoder_chunk_images: int | None = None) -> PolicySequenceOutput:
-        return _sequence(self, rgb, initial_state, episode_start, valid_mask, encoder_chunk_images=encoder_chunk_images)
+                 valid_mask: Tensor | None = None, *, task: TaskKey, encoder_chunk_images: int | None = None) -> PolicySequenceOutput:
+        return _sequence(self, rgb, initial_state, episode_start, valid_mask, task=task, encoder_chunk_images=encoder_chunk_images)
 
 
 def _validate_rgb(rgb: Tensor, rank: int) -> None:
@@ -176,8 +179,10 @@ def _validate_rgb(rgb: Tensor, rank: int) -> None:
 
 
 def _sequence(policy: StandalonePolicy | DualPolicy, rgb: Tensor, state: PolicyState,
-              episode_start: Tensor, valid_mask: Tensor | None, *, force_generic: bool = False, encoder_chunk_images: int | None = None) -> PolicySequenceOutput:
+              episode_start: Tensor, valid_mask: Tensor | None, *, task: TaskKey, force_generic: bool = False, encoder_chunk_images: int | None = None) -> PolicySequenceOutput:
     _validate_rgb(rgb, 5)
+    # Resolve once for the whole rollout; collection and replay must use the same budget.
+    ticks = policy.config.ctm.ticks_by_task.for_task(task)
     length, batch = rgb.shape[:2]
     if not 1 <= length <= 50:
         raise ValueError("sequence must contain 1..50 new observations")
@@ -198,7 +203,7 @@ def _sequence(policy: StandalonePolicy | DualPolicy, rgb: Tensor, state: PolicyS
         features = tuple(f.reshape(length, batch, *f.shape[1:]) for f in encoded)
         outputs = []
         for t in range(length):
-            logits, state = policy._step_features(tuple(f[t] for f in features), state, episode_start[t], prepared_sync)
+            logits, state = policy._step_features(tuple(f[t] for f in features), state, episode_start[t], prepared_sync, ticks=ticks)
             outputs.append(logits)
         return PolicySequenceOutput(torch.stack(outputs), state)
     # Encode ONLY valid new observations. Microbatching changes image batching, not CTM time.
@@ -217,7 +222,7 @@ def _sequence(policy: StandalonePolicy | DualPolicy, rgb: Tensor, state: PolicyS
         if indices.numel():
             output, proposed = policy._step_features(tuple(f[t].index_select(0, indices) for f in features),
                                                      select_state(state, indices),
-                                                     episode_start[t].index_select(0, indices), prepared_sync)
+                                                     episode_start[t].index_select(0, indices), prepared_sync, ticks=ticks)
             state = replace_slots(state, indices, proposed)
             logits = logits.index_copy(0, indices, output)
         # Padding neither advances nor resets either column. No detach/burn-in occurs here.

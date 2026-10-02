@@ -27,8 +27,8 @@ def state_tensors(state):
 
 class ForcedStudent(DualPolicy):
     """Controlled student distribution, intentionally different from its teacher."""
-    def step(self,rgb,state,episode_start):
-        _,state=super().step(rgb,state,episode_start)
+    def step(self,rgb,state,episode_start,*,task):
+        _,state=super().step(rgb,state,episode_start, task=task)
         logits=torch.full((len(rgb),5),-1000.,device=rgb.device)
         logits[:,4]=0.  # Student waits; BFS never waits.
         return logits,state
@@ -131,7 +131,7 @@ class ProgressTests(unittest.TestCase):
         collector=ProgressCollector(self.envs,self.student,MazeTeacher(),self.rng)
         first=collector.collect(2,0)
         with torch.no_grad():
-            replay=self.student.sequence(first.batch.obs,first.batch.initial_state,first.batch.episode_start)
+            replay=self.student.sequence(first.batch.obs,first.batch.initial_state,first.batch.episode_start, task='maze_medium')
         torch.testing.assert_close(replay.logits,first.student_logits,atol=2e-5,rtol=1e-5)
         self.assertEqual(int((replay.logits.argmax(-1)!=first.student_logits.argmax(-1)).sum()),0)
         for saved,live,played in zip(state_tensors(first.batch.initial_state),state_tensors(collector.state),state_tensors(replay.state)):
@@ -153,7 +153,7 @@ class ProgressTests(unittest.TestCase):
         optimizer=self.optimizer()
         def loss():
             with torch.no_grad():
-                output=self.student.sequence(batch.obs,batch.initial_state,batch.episode_start)
+                output=self.student.sequence(batch.obs,batch.initial_state,batch.episode_start, task='maze_medium')
                 return float(distribution_metrics(output.logits,batch.teacher_probs)['kl'].mean())
         initial=loss()
         old={n:t.clone() for n,t in self.student.kb.state_dict().items()}
@@ -174,7 +174,7 @@ class ProgressTests(unittest.TestCase):
         batch=replace(window.batch,valid_mask=valid,target_mask=valid)
         optimizer=self.optimizer(student)
         with torch.no_grad():
-            output=student.sequence(batch.obs,batch.initial_state,batch.episode_start,batch.valid_mask)
+            output=student.sequence(batch.obs,batch.initial_state,batch.episode_start,batch.valid_mask, task='maze_medium')
             expected=float(distribution_metrics(output.logits[valid],batch.teacher_probs[valid])['kl'].mean())
         metrics=update_window(student,batch,optimizer,config,self.shuffle)
         self.assertEqual((metrics['optimizer_updates'],metrics['empty_minibatches'],metrics['eligible_target_steps']),(1,1,2))
@@ -242,8 +242,8 @@ class ProgressTests(unittest.TestCase):
                 self._obs=pixels(native.get_frame(tile_size=8,agent_pov=True))
                 return self._pair(self._obs.copy()),info
         class ForwardStudent(DualPolicy):
-            def step(self,rgb,state,episode_start):
-                _,state=super().step(rgb,state,episode_start)
+            def step(self,rgb,state,episode_start,*,task):
+                _,state=super().step(rgb,state,episode_start, task=task)
                 logits=torch.full((len(rgb),5),-1000.)
                 logits[:,2]=0.
                 return logits,state

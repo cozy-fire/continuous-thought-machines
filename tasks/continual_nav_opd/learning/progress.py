@@ -85,6 +85,7 @@ def run_progress(envs, student: DualPolicy, expert, config: Config, steps: int,
             elapsed = time.perf_counter()-started
             on_window({"method":config.method,"schema_version":3,"sequence_protocol":config.sequence_protocol,
                        "phase":"P","task":collector.task,"policy_type":"active",
+                       "ticks":collector.ticks,"memory_ticks":config.ctm.memory_length,
                        "windows":windows,"transitions":consumed,"stage_env_steps":consumed,
                        "eligible_target_steps":targets,"optimizer_updates":updates,"empty_minibatches":empty,
                        "next_transition_id":start_transition_id+consumed,
@@ -102,6 +103,7 @@ def run_progress(envs, student: DualPolicy, expert, config: Config, steps: int,
         raise ValueError("P ended without complete real teaching targets")
     elapsed = time.perf_counter()-started
     statistics = {**{key:value/targets for key,value in sums.items()},**timing,
+                  "ticks":collector.ticks,"memory_ticks":config.ctm.memory_length,
                   "elapsed_seconds":elapsed,"action_counts":action_counts.tolist(),"reward_sum":total_reward,
                   "successes":successes,"timeouts":timeouts,"empty_minibatches":empty,
                   "displacement_rate":moves/consumed if collector.task=='fourrooms' else None,

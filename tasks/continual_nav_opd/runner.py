@@ -82,7 +82,8 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
                          'cache_bytes':map_cache.images.nbytes,'load_seconds':map_cache.load_seconds})
         for index in range(payload['next_index'],len(stages)):
             stage=stages[index]; attempt=uuid.uuid4().hex; trigger('stage_start',stage)
-            identity={'family':stage.family,'visit':stage.visit,'stage':stage.key,'phase':stage.phase,'task':stage.task,'attempt_id':attempt}
+            identity={'family':stage.family,'visit':stage.visit,'stage':stage.key,'phase':stage.phase,'task':stage.task,'attempt_id':attempt,
+                      'ticks':stage.ticks,'memory_ticks':config.ctm.memory_length}
             before_steps=payload['global_env_steps']; before_updates=payload['optimizer_updates']
             def log_window(event):
                 logger.emit({**identity,**event,'event':'training','global_env_steps':before_steps+event['stage_env_steps'],

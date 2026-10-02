@@ -94,9 +94,9 @@ def main():
                 rgb=torch.from_numpy(obs.student_rgb).to(device)
                 with torch.no_grad():
                     first,_=result.policy.step(rgb,result.policy.initial_state(config.training.num_envs),
-                                               torch.ones(config.training.num_envs,dtype=torch.bool,device=device))
+                                               torch.ones(config.training.num_envs,dtype=torch.bool,device=device),task=task)
                     actual,_=restored.step(rgb,restored.initial_state(config.training.num_envs),
-                                          torch.ones(config.training.num_envs,dtype=torch.bool,device=device))
+                                          torch.ones(config.training.num_envs,dtype=torch.bool,device=device),task=task)
                 torch.testing.assert_close(first,actual,atol=2e-5,rtol=1e-5)
                 with (folder/'events.jsonl').open('x',encoding='utf-8') as stream:
                     for event in events:

@@ -11,7 +11,7 @@ python -m unittest discover -s tests/continual_nav_opd -p test_config_schedule.p
 python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/full.yaml --dry-run
 ```
 
-`full.yaml` 定义正式预算，RTX5090 配置只覆盖执行设置。两者均展开为 12 阶段、50,976,384 环境步；smoke 为 12 阶段、1,664 环境步。未知字段、身份不兼容或预算无法整除环境槽数时明确失败。`dry-run` 不加载数据或教师，也不创建训练 run 或连接 W&B。实际训练必须提供 `--seed` 和 `--run-dir`。
+`full.yaml` 定义正式预算，`remote_config.yaml` 只覆盖执行设置。两者均展开为 12 阶段、50,976,384 环境步；smoke 为 12 阶段、1,664 环境步。三个配置均使用 `ctm.ticks_by_task: {maze_medium: 75, fourrooms: 2}` 和 `memory_length: 40`。`dry-run` 输出任务 ticks、记忆长度和带 ticks 的完整阶段表。未知字段、身份不兼容或预算无法整除环境槽数时明确失败。`dry-run` 不加载数据或教师，也不创建训练 run 或连接 W&B。实际训练必须提供 `--seed` 和 `--run-dir`。
 
 唯一序列协议是 `rollout_state_v1`：在本窗口第一张新观察处理前，保存学习策略当前状态的 `detach().clone()`，随后重放本窗口全部新观察。采集状态跨窗口保留，仅在真正的 episode 边界按槽 reset。没有教师预热、历史观察 burn-in 或首步标签屏蔽。
 
@@ -46,11 +46,14 @@ kb = StandalonePolicy(config).to(device)  # Trainable encoder/controller/actor, 
 dual = DualPolicy(config, kb, kb_ready=False)  # First P; live KB remains independent and trainable.
 state = dual.initial_state(batch_size)
 initial_state = detach_clone_state(state)  # Save BEFORE the rollout's first new image.
-logits, state = dual.step(rgb_u8, state, episode_start)
-output = dual.sequence(rollout_rgb_u8, initial_state, rollout_episode_start, valid_mask)
+logits, state = dual.step(rgb_u8, state, episode_start, task="maze_medium")
+output = dual.sequence(rollout_rgb_u8, initial_state, rollout_episode_start, valid_mask,
+                       task="maze_medium")
 ```
 
-图像、state 和 mask Tensor 必须位于策略设备。`step` 输入 `uint8 [B,3,84,84]`；`sequence` 只接收当前窗口的 `[L,B,3,84,84]` 新观察，`1 <= L <= 50`，返回 `PolicySequenceOutput(logits=[L,B,5], state=...)`。重放使用传入起点，不重新初始化或隐式 detach。仅有效观察进入视觉 microbatch，随后按原时间顺序推进 CTM，每张观察 2 ticks。padding 输出零 logits，不改变任何列的 state。`select_state` 和 `detach_clone_state` 为 minibatch 与窗口起点建立独立存储。
+图像、state 和 mask Tensor 必须位于策略设备。`step` 输入 `uint8 [B,3,84,84]`；`sequence` 只接收当前窗口的 `[L,B,3,84,84]` 新观察，`1 <= L <= 50`，返回 `PolicySequenceOutput(logits=[L,B,5], state=...)`。两入口必须显式传入 `task`，一次调用只能处理同一任务；未知任务立即报错。任务仅选择递归次数，不进入 Encoder、Attention、CTM 或 Actor 的输入。重放使用传入起点，不重新初始化或隐式 detach。仅有效观察进入视觉 microbatch，随后按原时间顺序推进 CTM：Maze 每张观察 75 ticks，FourRooms 2 ticks。padding 输出零 logits，不改变任何列的 state。`select_state` 和 `detach_clone_state` 为 minibatch 与窗口起点建立独立存储。
+
+KB 在两个任务间共享全部权重和相同参数形状。P 双列、C 双列教师与 KB 学生、F、validation/test 和可视化均按当前环境任务选择同一预算；跨任务评估按评估任务选择，不能沿用 Active 来源任务的 ticks。切换任务创建独立 episode 状态。40 tick 窗口在 FourRooms 约覆盖 20 次观察，在 Maze 一次观察结束时直接存放当前观察最后 40 tick 的激活；旧信息只能经递归间接延续。50 观察训练窗口对应每列 3,750 个 Maze tick，记忆窗口不截断该计算图。
 
 每列独立拥有 ResNet34-2／GroupNorm32，以及可学习 `start_pre`／`start_post` `[512,40]` trace，分别对应原 CTM 的 `start_trace`／`start_activated_trace` 角色。学习列在有效 reset 位置恢复初态时保留初态参数梯度；从第一张有效图起即可训练 Encoder，没有 TA 冻结开关或历史图像前缀。完整 KB 参数前缀固定为 `encoder/controller/actor`，Dual 为 `kb/active/adapter`。
 
@@ -62,9 +65,11 @@ output = dual.sequence(rollout_rgb_u8, initial_state, rollout_episode_start, val
 python -m unittest discover -s tests/continual_nav_opd -p test_models.py
 ```
 
+快照的哈希配置保存完整 `ticks_by_task` 映射，重载后仍可按两个任务各自的预算推理。旧 `ctm.ticks: 2` 配置和产物不自动迁移；阶段恢复同时检查配置、带 ticks 的阶段表及源码哈希。该改动不增加任何神经网络参数。
+
 ## 04：Progress 学生轨迹蒸馏
 
-`ProgressCollector(envs, student, expert, action_rng)` reset 环境并建立学生双列 state；FourRooms 教师维护另一份独立 state。`collect(length, start_transition_id)` 只保存本窗口新观察及起点，返回 `CollectedWindow`：其中 `batch` 是 `SequenceBatch`，其余字段为诊断用的采集 logits、reward、终止信息、耗时和 Maze 距离，不进入 Loss。`length` 的单位是每槽新环境步，上限 50。
+`ProgressCollector(envs, student, expert, action_rng)` reset 环境并建立学生双列 state；FourRooms 教师维护另一份独立 state。`collect(length, start_transition_id)` 只保存本窗口新观察及起点，返回 `CollectedWindow`：其中 `batch` 是 `SequenceBatch`，同时记录 `task` 与实际采集 `ticks`，重放或 Fisher 的预算不匹配则失败。其余字段为诊断用的采集 logits、reward、终止信息、耗时和 Maze 距离，不进入 Loss。`length` 的单位是每槽新环境步，上限 50。
 
 每次学生先读取 RGB，再由教师读取同一动作前状态；动作始终从学生五维概率采样。Maze 标签为 BFS 第一条边的 one-hot，FourRooms 为映射后的五维软目标。两任务全部真实观察均有目标，终止后改用新 episode 的 reset 观察。缺失目标、非法概率或非有限 Loss／梯度明确失败。
 

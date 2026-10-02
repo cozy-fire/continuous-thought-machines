@@ -69,7 +69,7 @@ class ModelTests(unittest.TestCase):
             fmap = self.kb.encoder(self.rgb)
             self.assertEqual(fmap.shape, (2,128,21,21))
             with patch.object(self.kb.controller, 'tick', wraps=self.kb.controller.tick) as tick:
-                logits, final = self.kb.step(self.rgb, initial, torch.ones(2, dtype=torch.bool))
+                logits, final = self.kb.step(self.rgb, initial, torch.ones(2, dtype=torch.bool), task='fourrooms')
                 self.assertEqual(tick.call_count, 2)
             self.assertEqual(logits.shape, (2,5))
             torch.testing.assert_close(final.pre[:,:,:-2], initial.pre[:,:,2:])
@@ -101,7 +101,7 @@ class ModelTests(unittest.TestCase):
             with torch.no_grad():
                 dual.adapter.gate.fill_(gate)
             output = dual.sequence(self.rgb[:1].unsqueeze(0), detach_clone_state(dual.initial_state(1)),
-                                   torch.ones(1,1,dtype=torch.bool))
+                                   torch.ones(1,1,dtype=torch.bool), task='fourrooms')
             F.cross_entropy(output.logits.flatten(0,1), torch.tensor([3])).backward()
             self.assertGrad(dual.active.encoder)
             self.assertGrad(dual.active.controller)
@@ -142,7 +142,7 @@ class ModelTests(unittest.TestCase):
                 # Make the visual paths distinguishable before inspecting their consumers.
                 next(dual.active.encoder.parameters()).add_(.1)
                 with patch.object(dual.kb.controller,'tick',side_effect=tick):
-                    dual.step(self.rgb, dual.initial_state(2), torch.ones(2,dtype=torch.bool))
+                    dual.step(self.rgb, dual.initial_state(2), torch.ones(2,dtype=torch.bool), task='fourrooms')
             self.assertEqual(len(new_posts),2)
             for received, produced in zip(adapter_inputs,new_posts):
                 torch.testing.assert_close(received,produced,atol=0,rtol=0)
@@ -157,8 +157,8 @@ class ModelTests(unittest.TestCase):
         dual = DualPolicy(self.config, self.kb, kb_ready=False)
         with torch.no_grad(), patch.object(dual.adapter,'forward',side_effect=AssertionError('unready lateral')):
             initial = dual.initial_state(2)
-            logits, state = dual.step(self.rgb,initial,torch.ones(2,dtype=torch.bool))
-            own_logits, own_state = dual.active.step(self.rgb,initial.active,torch.ones(2,dtype=torch.bool))
+            logits, state = dual.step(self.rgb,initial,torch.ones(2,dtype=torch.bool), task='fourrooms')
+            own_logits, own_state = dual.active.step(self.rgb,initial.active,torch.ones(2,dtype=torch.bool), task='fourrooms')
             torch.testing.assert_close(logits,own_logits,atol=0,rtol=0)
             self.assertStateClose(state.active,own_state)
 
@@ -171,18 +171,18 @@ class ModelTests(unittest.TestCase):
             with torch.no_grad():
                 collected=[]
                 for rgb, reset in zip(observations,starts):
-                    logits,state=policy.step(rgb,state,reset)
+                    logits,state=policy.step(rgb,state,reset, task='fourrooms')
                     collected.append(logits)
-                replay=policy.sequence(observations,origin,starts)
+                replay=policy.sequence(observations,origin,starts, task='fourrooms')
                 torch.testing.assert_close(replay.logits,torch.stack(collected),atol=3e-5,rtol=1e-4)
                 self.assertStateClose(replay.state,state)
-                first=policy.sequence(observations[:2],origin,starts[:2])
+                first=policy.sequence(observations[:2],origin,starts[:2], task='fourrooms')
                 saved=detach_clone_state(first.state)
-                second=policy.sequence(observations[2:],saved,starts[2:])
+                second=policy.sequence(observations[2:],saved,starts[2:], task='fourrooms')
                 self.assertStateClose(second.state,replay.state)
                 torch.testing.assert_close(second.logits,replay.logits[2:],atol=3e-5,rtol=1e-4)
                 # Slot 0 reset equals an independent fresh episode; slot 1 carries prior history.
-                single_logits,single_state=policy.step(observations[2,:1],policy.initial_state(1),torch.ones(1,dtype=torch.bool))
+                single_logits,single_state=policy.step(observations[2,:1],policy.initial_state(1),torch.ones(1,dtype=torch.bool), task='fourrooms')
                 torch.testing.assert_close(second.logits[0,:1],single_logits,atol=3e-5,rtol=1e-4)
                 self.assertStateClose(select_state(second.state,torch.tensor([0])),single_state)
 
@@ -193,26 +193,26 @@ class ModelTests(unittest.TestCase):
         for policy in (self.kb,DualPolicy(self.config,self.kb,kb_ready=True)):
             origin=detach_clone_state(policy.initial_state(2))
             with torch.no_grad():
-                output=policy.sequence(observations,origin,starts,valid)
-                expected_logits,expected_state=policy.step(observations[0,:1],select_state(origin,torch.tensor([0])),torch.ones(1,dtype=torch.bool))
+                output=policy.sequence(observations,origin,starts,valid, task='fourrooms')
+                expected_logits,expected_state=policy.step(observations[0,:1],select_state(origin,torch.tensor([0])),torch.ones(1,dtype=torch.bool), task='fourrooms')
                 self.assertStateClose(select_state(output.state,torch.tensor([0])),expected_state)
                 self.assertStateClose(select_state(output.state,torch.tensor([1])),select_state(origin,torch.tensor([1])))
                 torch.testing.assert_close(output.logits[0,:1],expected_logits,atol=3e-5,rtol=1e-4)
                 self.assertEqual(float(output.logits[~valid].abs().sum()),0.)
                 with patch.object(policy,'_encode',side_effect=AssertionError('padding encoder')):
-                    empty=policy.sequence(observations,origin,starts,torch.zeros_like(valid))
+                    empty=policy.sequence(observations,origin,starts,torch.zeros_like(valid), task='fourrooms')
                 self.assertStateClose(empty.state,origin)
         config=replace(self.config,optimization=replace(self.config.optimization,encoder_microbatch_images=1))
         micro=StandalonePolicy(config)
         micro.load_state_dict(self.kb.state_dict(),strict=True)
         with torch.no_grad():
-            a=self.kb.sequence(observations, self.kb.initial_state(2), starts)
-            b=micro.sequence(observations, micro.initial_state(2), starts)
+            a=self.kb.sequence(observations, self.kb.initial_state(2), starts, task='fourrooms')
+            b=micro.sequence(observations, micro.initial_state(2), starts, task='fourrooms')
             torch.testing.assert_close(a.logits,b.logits,atol=3e-5,rtol=1e-4)
             self.assertStateClose(a.state,b.state)
 
     def test_origin_detached_independent_and_standalone_visual_learning(self):
-        _, live=self.kb.step(self.rgb,self.kb.initial_state(2),torch.ones(2,dtype=torch.bool))
+        _, live=self.kb.step(self.rgb,self.kb.initial_state(2),torch.ones(2,dtype=torch.bool), task='fourrooms')
         saved=detach_clone_state(live)
         for original,copied in zip(tensors(live),tensors(saved)):
             self.assertFalse(copied.requires_grad)
@@ -220,7 +220,7 @@ class ModelTests(unittest.TestCase):
             self.assertNotEqual(original.data_ptr(),copied.data_ptr())
         old_saved=detach_clone_state(saved)
         self.kb.zero_grad(set_to_none=True)
-        output=self.kb.sequence(self.rgb.unsqueeze(0),saved,torch.zeros(1,2,dtype=torch.bool))
+        output=self.kb.sequence(self.rgb.unsqueeze(0),saved,torch.zeros(1,2,dtype=torch.bool), task='fourrooms')
         F.cross_entropy(output.logits.flatten(0,1),torch.tensor([0,1])).backward()
         self.assertGrad(self.kb.encoder)
         self.assertGrad(self.kb.controller)
@@ -246,11 +246,11 @@ class ModelTests(unittest.TestCase):
                 self.assertFalse(any(m.training for m in restored.modules()))
                 self.assertFalse(any(p.requires_grad for p in restored.parameters()))
                 with torch.no_grad():
-                    first,_=snapshot.step(self.rgb,snapshot.initial_state(2),torch.ones(2,dtype=torch.bool))
-                    actual,_=restored.step(self.rgb,restored.initial_state(2),torch.ones(2,dtype=torch.bool))
+                    first,_=snapshot.step(self.rgb,snapshot.initial_state(2),torch.ones(2,dtype=torch.bool), task='fourrooms')
+                    actual,_=restored.step(self.rgb,restored.initial_state(2),torch.ones(2,dtype=torch.bool), task='fourrooms')
                     torch.testing.assert_close(actual,first,atol=0,rtol=0)
                     next(policy.parameters()).add_(1)
-                    after,_=snapshot.step(self.rgb,snapshot.initial_state(2),torch.ones(2,dtype=torch.bool))
+                    after,_=snapshot.step(self.rgb,snapshot.initial_state(2),torch.ones(2,dtype=torch.bool), task='fourrooms')
                     torch.testing.assert_close(after,first,atol=0,rtol=0)
                 with self.assertRaises(FileExistsError):
                     save_snapshot(snapshot,path)
@@ -263,11 +263,11 @@ class ModelTests(unittest.TestCase):
         state=self.kb.initial_state(2)
         for rgb in (self.rgb.float(), self.rgb[:0], self.rgb[:,:,:83]):
             with self.assertRaises(ValueError):
-                self.kb.step(rgb,state,torch.ones(2,dtype=torch.bool))
+                self.kb.step(rgb,state,torch.ones(2,dtype=torch.bool), task='fourrooms')
         with self.assertRaises(ValueError):
-            self.kb.sequence(self.rgb.unsqueeze(0),state,torch.ones(1,2))
+            self.kb.sequence(self.rgb.unsqueeze(0),state,torch.ones(1,2), task='fourrooms')
         with self.assertRaises(TypeError):
-            self.kb.sequence(self.rgb.unsqueeze(0),DualState(state,state),torch.ones(1,2,dtype=torch.bool))
+            self.kb.sequence(self.rgb.unsqueeze(0),DualState(state,state),torch.ones(1,2,dtype=torch.bool), task='fourrooms')
 
 
 if __name__=='__main__':

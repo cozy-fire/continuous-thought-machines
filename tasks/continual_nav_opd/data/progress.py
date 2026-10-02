@@ -51,6 +51,7 @@ class ProgressCollector:
         if tasks != {expected} or not isinstance(expert, (MazeTeacher, FourRoomsTeacher)):
             raise ValueError("all environment slots must match the selected expert")
         self.task = expected
+        self.ticks = student.config.ctm.ticks_by_task.for_task(self.task)
         self.episode_start = np.ones(self.num_envs, dtype=bool)
         self.state = detach_clone_state(student.initial_state(self.num_envs))
         self.expert_state = expert.initial_state(self.num_envs) if isinstance(expert, FourRoomsTeacher) else None
@@ -69,7 +70,7 @@ class ProgressCollector:
             rgb = torch.from_numpy(self.obs.student_rgb.copy())
             reset = torch.from_numpy(self.episode_start.copy())
             with timer.measure('student_forward_seconds'):
-                logits, self.state = self.student.step(rgb.to(self.device), self.state, reset.to(self.device))
+                logits, self.state = self.student.step(rgb.to(self.device), self.state, reset.to(self.device), task=self.task)
                 logits_cpu = logits.detach().cpu()
             # Check the already-downloaded diagnostic tensor before executing an action.
             if not torch.isfinite(logits_cpu).all():
@@ -108,7 +109,7 @@ class ProgressCollector:
         batch = SequenceBatch(torch.stack(images), torch.stack(starts), torch.ones(shape, dtype=torch.bool),
                               torch.ones(shape, dtype=torch.bool), torch.stack(targets), torch.stack(actions),
                               torch.arange(start_transition_id, start_transition_id + length*self.num_envs).reshape(shape),
-                              initial, self.source_snapshot_id)
+                              initial, self.source_snapshot_id, self.task, self.ticks)
         return CollectedWindow(batch, torch.stack(logits_list), torch.stack(rewards), torch.stack(terms),
                                torch.stack(truncs), infos, timer.finish(), torch.stack(distances) if distances else None)
 

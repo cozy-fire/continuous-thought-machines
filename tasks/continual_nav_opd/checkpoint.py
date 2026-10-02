@@ -162,6 +162,8 @@ def load_boundary(latest,config,seed):
         if report.get('stage')!=key or report.get('policy_type')!=expected_policy or report.get('split')!='validation' or set(report.get('tasks',{}))!=set(config.task_order):
             raise ValueError('evaluation identity/task mismatch')
         for task,metrics in report['tasks'].items():
+            if metrics.get('ticks')!=config.ctm.ticks_by_task.for_task(task) or metrics.get('memory_ticks')!=config.ctm.memory_length:
+                raise ValueError('evaluation execution budget mismatch')
             expected_count=config.evaluation.validation_episodes
             if metrics.get('episodes')!=expected_count or len(metrics.get('results',[]))!=expected_count:
                 raise ValueError('incomplete evaluation panel')
