@@ -21,6 +21,9 @@ from .envs import SyncVectorEnv, make_env
 from .models import StandalonePolicy, DualPolicy, VisionEncoder, Controller
 from .teachers import MazeTeacher, FourRoomsTeacher
 from .learning.progress import run_progress
+from .data.maze_curriculum import MazeStateTable
+from .learning.maze_progress import run_maze_progress
+from .envs.map_cache import MazeMapCache
 from .learning.distill import run_compress_stage
 from .learning.fisher import run_fisher_stage
 
@@ -121,6 +124,8 @@ def profile(output_dir, device='cuda:0', slots=2, microbatch=8, minibatches=1):
     timer = Timings(device); initialization = time.perf_counter()
     manifest = build_manifest(REPO_ROOT/config.environment.maze_root, validation_count=512,
                               validation_episodes=2, test_episodes=2, drift_episodes=2)
+    cache=MazeMapCache(REPO_ROOT/config.environment.maze_root,manifest.train+manifest.validation+manifest.test)
+    table=MazeStateTable(cache,manifest.train[:config.maze_progress.pool_sizes[-1]])
     if device.startswith('cuda'):
         torch.cuda.init()
         torch.cuda.reset_peak_memory_stats(device)
@@ -130,7 +135,7 @@ def profile(output_dir, device='cuda:0', slots=2, microbatch=8, minibatches=1):
     try:
         for task_index, task in enumerate(config.task_order):
             task_init = time.perf_counter()
-            envs = SyncVectorEnv([make_env(config, task, 'train', manifest=manifest, seed=task_index*100+i) for i in range(slots)])
+            envs = SyncVectorEnv([make_env(config, task, 'train', manifest=manifest, seed=task_index*100+i,map_cache=cache) for i in range(slots)])
             dual = DualPolicy(config, kb, kb_ready=task_index > 0)
             expert = MazeTeacher() if task == 'maze_medium' else FourRoomsTeacher(REPO_ROOT/config.teachers.fourrooms.checkpoint, device=device)
             task_init = time.perf_counter()-task_init
@@ -141,7 +146,8 @@ def profile(output_dir, device='cuda:0', slots=2, microbatch=8, minibatches=1):
                     # Leaf multi-grad hooks support backward(), not autograd.grad().
                     # Remove them before F's exact per-sample autograd.grad calls.
                     with timer.encoder_backward(dual.active, kb):
-                        p = run_progress(envs, dual, expert, config, steps, action, np.random.default_rng(101+task_index))
+                        p = (run_maze_progress(table,dual,config,action,np.random.default_rng(101+task_index)) if task=='maze_medium' else
+                             run_progress(envs, dual, expert, config, steps, action, np.random.default_rng(101+task_index)))
                         c = run_compress_stage(envs, p.policy, kb, fisher, config, steps, action, np.random.default_rng(102+task_index))
                     timer.context = 'F/collection'
                     f = run_fisher_stage(envs, kb, fisher, config, config.fisher.collect_steps, action,

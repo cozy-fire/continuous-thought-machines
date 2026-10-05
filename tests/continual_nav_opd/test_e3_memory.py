@@ -20,28 +20,20 @@ from tests.continual_nav_opd.test_teachers_envs import maze_image
 
 
 class CacheTests(unittest.TestCase):
-    def test_optional_runtime_config_and_old_inference_hash(self):
+    def test_v4_requires_memory_maps_and_rejects_v3_inference(self):
         config=load_config('tasks/continual_nav_opd/configs/smoke.yaml')
         raw=resolved_dict(config)
         del raw['environment']['map_cache']
-        del raw['optimization']['e3_cache'],raw['optimization']['ctm_compile']
-        legacy=parse_config(raw)
-        self.assertFalse(legacy.optimization.e3_cache)
-        self.assertEqual(legacy.environment.map_cache,'disk')
+        with self.assertRaisesRegex(ValueError,'shared immutable map cache'): parse_config(raw)
         old=torch.get_num_threads(); torch.set_num_threads(2)
         try:
             with tempfile.TemporaryDirectory() as directory:
-                path=Path(directory)/'old.pt'; policy=StandalonePolicy(legacy)
+                path=Path(directory)/'old.pt'; policy=StandalonePolicy(config)
                 save_snapshot(policy,path)
                 artifact=torch.load(path,weights_only=True)
-                artifact.update(config=raw,config_hash=raw_config_hash(raw))
+                artifact.update(schema_version=3,artifact_type='v3_complete_inference',sequence_protocol='rollout_state_v1')
                 torch.save(artifact,path)
-                restored=load_snapshot(path)
-                for key,value in policy.state_dict().items():
-                    torch.testing.assert_close(value,restored.state_dict()[key],atol=0,rtol=0)
-                artifact['config']['environment']['map_cache']='memory'
-                torch.save(artifact,path)
-                with self.assertRaisesRegex(ValueError,'hash mismatch'): load_snapshot(path)
+                with self.assertRaisesRegex(ValueError,'incompatible inference'): load_snapshot(path)
         finally: torch.set_num_threads(old)
 
     def test_sequence_prepares_static_work_once(self):

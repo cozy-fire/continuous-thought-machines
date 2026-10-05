@@ -6,11 +6,13 @@ training:
 pnc:
   task_budgets:
     maze_medium:
-      progress_steps: 256
       compress_steps: 128
     fourrooms:
       progress_steps: 256
       compress_steps: 128
+maze_progress:
+  pool_sizes: [2, 4]
+  pool_updates: [1, 1]
 fisher:
   collect_steps: 32
   scored_samples: 8

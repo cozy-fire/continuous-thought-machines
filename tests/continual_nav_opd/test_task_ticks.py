@@ -128,7 +128,7 @@ class TaskTickModelTests(unittest.TestCase):
         raw=resolved_dict(self.config)
         del raw['ctm']['ticks_by_task']['fourrooms']
         with self.assertRaises(ValueError): parse_config(raw)
-        changed=replace(self.config,ctm=replace(self.config.ctm,ticks_by_task=replace(self.config.ctm.ticks_by_task,maze_medium=74)))
+        changed=replace(self.config,ctm=replace(self.config.ctm,ticks_by_task=replace(self.config.ctm.ticks_by_task,fourrooms=3)))
         self.assertNotEqual(config_hash(changed),config_hash(self.config))
         other=StandalonePolicy(changed)
         self.assertEqual({n:p.shape for n,p in other.named_parameters()},{n:p.shape for n,p in self.kb.named_parameters()})

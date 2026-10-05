@@ -8,7 +8,9 @@ import numpy as np
 import torch
 from .config import REPO_ROOT,load_config,resolved_dict,config_hash
 from .data import build_manifest
-from .envs import SyncVectorEnv,make_env
+from .envs import SyncVectorEnv,make_env,MazeMapCache
+from .data.maze_curriculum import MazeStateTable
+from .learning.maze_progress import run_maze_progress
 from .models import StandalonePolicy,DualPolicy,save_snapshot,load_snapshot
 from .teachers import MazeTeacher,FourRoomsTeacher
 from .teachers.fourrooms import file_sha256
@@ -53,6 +55,8 @@ def main():
                                 validation_episodes=config.evaluation.validation_episodes,
                                 test_episodes=config.evaluation.test_episodes,drift_episodes=2)
         manifest.save(output/'maze_manifest.json')
+        cache=MazeMapCache(REPO_ROOT/config.environment.maze_root,manifest.train+manifest.validation+manifest.test)
+        table=MazeStateTable(cache,manifest.train[:config.maze_progress.pool_sizes[-1]])
         write_json(output/'resolved_config.json',resolved_dict(config))
         results={}
         for index,task in enumerate(config.task_order):
@@ -69,7 +73,7 @@ def main():
                 write_json(folder/'fourrooms_teacher.json',expert.metadata)
             before_kb, before_active=state_hash(student.kb),state_hash(student.active)
             before_expert=expert.parameter_hash() if isinstance(expert,FourRoomsTeacher) else expert.source_snapshot_id
-            envs=SyncVectorEnv([make_env(config,task,'train',manifest=manifest,seed=config.training.seed+i)
+            envs=SyncVectorEnv([make_env(config,task,'train',manifest=manifest,seed=config.training.seed+i,map_cache=cache)
                                 for i in range(config.training.num_envs)])
             events=[]
             def on_window(event):
@@ -77,12 +81,17 @@ def main():
                 print(json.dumps({'task':task,'transitions':event['transitions'],
                                   'updates':event['optimizer_updates'],'kl':event['kl']}),flush=True)
             try:
-                result=run_progress(envs,student,expert,config,
+                if task=='maze_medium':
+                    result=run_maze_progress(table,student,config,torch.Generator().manual_seed(100+index),
+                                             np.random.default_rng(200+index),on_window=on_window)
+                    assert result.optimizer_updates==2 and result.eligible_target_steps==result.transitions
+                else:
+                    result=run_progress(envs,student,expert,config,
                                     getattr(config.pnc.task_budgets,task).progress_steps,
                                     torch.Generator(device='cpu').manual_seed(100+index),
                                     np.random.default_rng(200+index),on_window=on_window)
-                assert (result.transitions,result.eligible_target_steps,result.windows,result.optimizer_updates)==(256,256,3,3)
-                assert result.next_transition_id==256
+                    assert (result.transitions,result.eligible_target_steps,result.windows,result.optimizer_updates)==(256,256,3,3)
+                    assert result.next_transition_id==256
                 assert before_kb==state_hash(student.kb)
                 assert before_active!=state_hash(student.active)
                 after_expert=expert.parameter_hash() if isinstance(expert,FourRoomsTeacher) else expert.source_snapshot_id
@@ -118,11 +127,12 @@ def main():
         for task in config.task_order:
             events=[json.loads(line) for line in (output/task/'events.jsonl').read_text().splitlines()]
             fig,ax=plt.subplots()
-            ax.plot([e['transitions'] for e in events],[e['kl'] for e in events],marker='o')
-            ax.set(xlabel='Training environment transitions',ylabel='Valid-sample weighted cumulative KL',title=task+' P smoke')
+            x='optimizer_updates' if task=='maze_medium' else 'transitions'
+            ax.plot([e[x] for e in events],[e['kl'] for e in events],marker='o')
+            ax.set(xlabel='Adam updates' if task=='maze_medium' else 'Training environment transitions',ylabel='Valid-sample KL',title=task+' P smoke')
             fig.savefig(output/task/'kl.png',dpi=150,bbox_inches='tight')
             plt.close(fig)
-        write_json(output/'report.json',{'status':'passed','stage':'04','method':config.method,'schema_version':3,
+        write_json(output/'report.json',{'status':'passed','stage':'04','method':config.method,'schema_version':4,
                    'sequence_protocol':config.sequence_protocol,'config_hash':config_hash(config),
                    'device':str(device),'hardware':torch.cuda.get_device_name(device) if device.type=='cuda' else 'CPU',
                    'torch':torch.__version__,'results':results,

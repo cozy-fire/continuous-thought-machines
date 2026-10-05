@@ -80,8 +80,8 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class TaskBudget:
-    progress_steps: int
     compress_steps: int
+    progress_steps: int = 0  # FourRooms only; Maze P is counted in optimizer updates.
 
 @dataclass(frozen=True)
 class TaskBudgets:
@@ -92,6 +92,14 @@ class TaskBudgets:
 class PNCConfig:
     visits: int
     task_budgets: TaskBudgets
+
+@dataclass(frozen=True)
+class MazeProgressConfig:
+    pool_sizes: tuple[int, ...]
+    pool_updates: tuple[int, ...]
+    sequences_per_update: int
+    microbatch_sequences: int
+    decisions: int
 
 @dataclass(frozen=True)
 class FisherConfig:
@@ -174,6 +182,7 @@ class Config:
     attention: AttentionConfig
     training: TrainingConfig
     pnc: PNCConfig
+    maze_progress: MazeProgressConfig
     fisher: FisherConfig
     optimization: OptimizationConfig
     distill: DistillConfig
@@ -230,6 +239,10 @@ def _convert(raw, kind, location):
         return kind(**{name: _convert(raw[key], hints[name], f"{location}.{key}") for name, key in names.items() if key in raw})
     if get_origin(kind) is tuple:
         types = get_args(kind)
+        if len(types) == 2 and types[1] is Ellipsis:
+            if not isinstance(raw, (tuple, list)) or not raw:
+                raise ValueError(f"{location}: expected a nonempty sequence")
+            return tuple(_convert(v, types[0], location) for v in raw)
         if not isinstance(raw, (tuple, list)) or len(raw) != len(types):
             raise ValueError(f"{location}: wrong tuple length")
         return tuple(_convert(v, t, location) for v, t in zip(raw, types))
@@ -250,15 +263,21 @@ def validate_config(c: Config) -> None:
     def require(ok, message):
         if not ok:
             raise ValueError(message)
-    require((c.method, c.schema_version, c.sequence_protocol) == (METHOD, 3, "rollout_state_v1"), "unsupported method/schema/sequence protocol")
+    require((c.method, c.schema_version, c.sequence_protocol) == (METHOD, 4, "maze_onpolicy5_v1"), "unsupported method/schema/sequence protocol")
     require(c.task_order == TASKS, "task_order must be maze_medium, fourrooms")
     require(c.observation == ObservationConfig((3,84,84), "uint8_to_float_div255", 5), "invalid student interface")
     require(c.environment.max_steps == 300 and c.environment.reward == "success_time_discount" and c.environment.tile_size == 8 and bool(c.environment.maze_root), "invalid environment")
-    require(c.environment.map_cache in ("memory", "disk"), "invalid map cache mode")
+    require(c.environment.map_cache == "memory", "v4 requires the shared immutable map cache")
     require(c.vision == VisionConfig("resnet34-2", False, "groupnorm32"), "invalid visual architecture")
     require(c.ctm == CTMConfig(512,128,c.ctm.ticks_by_task,40,"two_linear_glu_blocks",16,True,False,"first-last",32,32,0.0), "invalid CTM architecture")
     require(all(type(c.ctm.ticks_by_task.for_task(task)) is int and c.ctm.ticks_by_task.for_task(task) > 0
                 for task in TASKS), "task ticks must be positive integers")
+    require(c.ctm.ticks_by_task.maze_medium == 5, "Maze requires ticks=5")
+    m = c.maze_progress
+    require(len(m.pool_sizes) == len(m.pool_updates) and min(m.pool_sizes) > 0 and min(m.pool_updates) > 0
+            and all(a < b for a,b in zip(m.pool_sizes,m.pool_sizes[1:])), "invalid Maze curriculum")
+    require(m.decisions == 5 and m.sequences_per_update == 100 and m.microbatch_sequences == 5,
+            "Maze requires 100 independent five-decision sequences, microbatch5")
     require(c.attention == AttentionConfig(4,10000.0,(10,10)), "invalid attention")
     t, opt = c.training, c.optimization
     require(t.seed >= 0 and t.num_envs > 0 and (t.device == "cpu" or re_cuda_device(t.device)), "invalid training seed/slots/device")
@@ -266,7 +285,9 @@ def validate_config(c: Config) -> None:
     require(c.pnc.visits > 0 and c.fisher.collect_steps > 0 and 0 < c.fisher.scored_samples <= c.fisher.collect_steps, "invalid visits/Fisher")
     for task in TASKS:
         budget = getattr(c.pnc.task_budgets, task)
-        require(min(budget.progress_steps, budget.compress_steps) > 0 and budget.progress_steps % t.num_envs == 0 and budget.compress_steps % t.num_envs == 0, f"{task}: budgets must be positive/divisible by slots")
+        require(budget.compress_steps > 0 and budget.compress_steps % t.num_envs == 0, f"{task}: C budget must be positive/divisible by slots")
+        require((budget.progress_steps == 0 if task == 'maze_medium' else budget.progress_steps > 0 and budget.progress_steps % t.num_envs == 0),
+                f"{task}: P budget must use the task's counting protocol")
     require(c.fisher.collect_steps % t.num_envs == 0, "F budget must divide by slots")
     require(0 < opt.learning_steps <= 50 and opt.minibatches > 0 and t.num_envs % opt.minibatches == 0 and opt.update_epochs == 1 and opt.encoder_microbatch_images > 0, "invalid sequence/minibatch settings")
     require(type(opt.e3_cache) is bool and opt.ctm_compile in ('disabled','default','reduce-overhead'), "invalid E3/CTM compile settings")
@@ -310,10 +331,13 @@ def budget_summary(config: Config) -> dict:
     values = {phase:0 for phase in ("P","C","F")}
     for task in config.task_order:
         budget = getattr(config.pnc.task_budgets,task)
-        values["P"] += budget.progress_steps*config.pnc.visits
+        steps = sum(config.maze_progress.pool_updates)*config.maze_progress.sequences_per_update*5 if task == 'maze_medium' else budget.progress_steps
+        values["P"] += steps*config.pnc.visits
         values["C"] += budget.compress_steps*config.pnc.visits
         values["F"] += config.fisher.collect_steps*config.pnc.visits
-    return dict(**values,total=sum(values.values()),stage_count=6*config.pnc.visits)
+    return dict(**values,total=sum(values.values()),stage_count=6*config.pnc.visits,
+                env_steps_are_upper_bounds=True,maze_P_updates_per_visit=sum(config.maze_progress.pool_updates),
+                maze_P_updates=sum(config.maze_progress.pool_updates)*config.pnc.visits)
 
 
 def main():

@@ -1,6 +1,6 @@
 method: ctm_pnc_opd
-schema_version: 3
-sequence_protocol: rollout_state_v1
+schema_version: 4
+sequence_protocol: maze_onpolicy5_v1
 task_order: [maze_medium, fourrooms]
 observation:
   shape: [3, 84, 84]
@@ -49,11 +49,16 @@ pnc:
   visits: 2
   task_budgets:
     maze_medium:
-      progress_steps: 3200000
       compress_steps: 1280000
     fourrooms:
       progress_steps: 15000000
       compress_steps: 6000000
+maze_progress:
+  pool_sizes: [10, 40, 160, 640, 2560, 10240, 44488]
+  pool_updates: [2000, 2000, 2000, 1500, 1500, 1500, 1500]
+  sequences_per_update: 100
+  microbatch_sequences: 5
+  decisions: 5
 fisher:
   collect_steps: 4096
   scored_samples: 1024

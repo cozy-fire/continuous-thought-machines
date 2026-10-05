@@ -5,7 +5,9 @@ import numpy as np
 import torch
 from .config import REPO_ROOT,load_config,resolved_dict
 from .data import build_manifest
-from .envs import SyncVectorEnv,make_env
+from .envs import SyncVectorEnv,make_env,MazeMapCache
+from .data.maze_curriculum import MazeStateTable
+from .learning.maze_progress import run_maze_progress
 from .teachers import MazeTeacher,FourRoomsTeacher
 from .models import StandalonePolicy,DualPolicy,save_snapshot
 from .learning.progress import run_progress
@@ -22,15 +24,18 @@ def verify(device,output_dir):
     config=replace(config,training=replace(config.training,device=device))
     if device.startswith('cuda'): torch.cuda.init(); torch.cuda.reset_peak_memory_stats(device)
     manifest=build_manifest(REPO_ROOT/config.environment.maze_root,validation_count=512,validation_episodes=2,test_episodes=2,drift_episodes=2)
+    cache=MazeMapCache(REPO_ROOT/config.environment.maze_root,manifest.train+manifest.validation+manifest.test)
+    table=MazeStateTable(cache,manifest.train[:config.maze_progress.pool_sizes[-1]])
     kb=StandalonePolicy(config).to(device); fisher=None; ready=False; consumed=0; reports=[]
     try:
         for index,task in enumerate(config.task_order):
-            envs=SyncVectorEnv([make_env(config,task,'train',manifest=manifest,seed=index*10+i) for i in range(2)])
+            envs=SyncVectorEnv([make_env(config,task,'train',manifest=manifest,seed=index*10+i,map_cache=cache) for i in range(2)])
             rng=torch.Generator().manual_seed(4+index)
             expert=MazeTeacher() if task=='maze_medium' else FourRoomsTeacher(REPO_ROOT/config.teachers.fourrooms.checkpoint,device=device)
             try:
                 dual=DualPolicy(config,kb,kb_ready=ready)
-                p=run_progress(envs,dual,expert,config,256,rng,np.random.default_rng(index),consumed); consumed=p.next_transition_id
+                p=(run_maze_progress(table,dual,config,rng,np.random.default_rng(index),consumed) if task=='maze_medium' else
+                   run_progress(envs,dual,expert,config,256,rng,np.random.default_rng(index),consumed)); consumed=p.next_transition_id
                 teacher_hash=policy_hash(p.policy); before=policy_hash(kb)
                 c=run_compress_stage(envs,p.policy,kb,fisher,config,128,rng,np.random.default_rng(index+4),consumed); consumed=c.next_transition_id
                 assert before!=policy_hash(kb) and teacher_hash==policy_hash(p.policy)

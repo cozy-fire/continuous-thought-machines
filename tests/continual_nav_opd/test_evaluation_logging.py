@@ -126,13 +126,13 @@ class EvaluationLoggingTests(unittest.TestCase):
             root=Path(directory); self.assertFalse((root/'wandb_run.json').exists())
             event=json.loads((root/'events.jsonl').read_text())
             self.assertEqual(event['kl'],.2); self.assertEqual(event['active_source'],'fourrooms')
-            self.assertEqual(event['method'],'ctm_pnc_opd'); self.assertEqual(event['schema_version'],3)
+            self.assertEqual(event['method'],'ctm_pnc_opd'); self.assertEqual(event['schema_version'],4)
             self.assertEqual((root/'events.jsonl').read_bytes(),(root/'metrics.jsonl').read_bytes())
 
     def test_wandb_keeps_two_tasks_and_active_sources_separate(self):
         from types import SimpleNamespace
         logged=[]
-        run=SimpleNamespace(id='test',url='https://example.invalid/test',project='test',log=logged.append,finish=Mock())
+        run=SimpleNamespace(id='test',url='https://example.invalid/test',project='test',log=logged.append,finish=Mock(),define_metric=Mock())
         module=SimpleNamespace(init=Mock(return_value=run))
         with tempfile.TemporaryDirectory() as directory,patch.dict('sys.modules',{'wandb':module}):
             logger=EventLogger(directory,self.config,0,'online')
@@ -143,7 +143,7 @@ class EvaluationLoggingTests(unittest.TestCase):
             namespaces=[next(k for k in event if k.endswith('/success_rate')) for event in logged]
             self.assertEqual(len(set(namespaces)),3)
             self.assertFalse(any(k.endswith('/kl') for event in logged for k in event))
-            self.assertEqual(module.init.call_args.kwargs['config']['sequence_protocol'],'rollout_state_v1')
+            self.assertEqual(module.init.call_args.kwargs['config']['sequence_protocol'],'maze_onpolicy5_v1')
             run.finish.assert_called_once_with(exit_code=0)
 
 

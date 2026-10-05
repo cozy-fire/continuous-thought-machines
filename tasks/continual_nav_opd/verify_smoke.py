@@ -41,7 +41,11 @@ def audit_run(root: Path, config, seed: int) -> dict:
     stages = expand_stages(config)
     if not payload['finalized'] or payload['next_index'] != 12 or len(stages) != 12:
         raise ValueError('incomplete two-visit smoke')
-    if payload['global_env_steps'] != 1664 or payload['optimizer_updates'] != 20:
+    actual=sum(x['transitions'] for x in payload['stage_counters'].values())
+    expected_updates=sum(s.optimizer_updates or (0 if s.phase=='F' else
+        ((s.env_steps//config.training.num_envs+config.optimization.learning_steps-1)//config.optimization.learning_steps)*config.optimization.minibatches)
+        for s in stages)
+    if payload['global_env_steps'] != actual or payload['optimizer_updates'] != expected_updates:
         raise ValueError('unexpected smoke budget or update count')
     events = [json.loads(line) for line in (root/'events.jsonl').read_text(encoding='utf-8').splitlines()]
     completed = [e for e in events if e['event'] == 'stage_complete']
@@ -56,9 +60,10 @@ def audit_run(root: Path, config, seed: int) -> dict:
                 raise ValueError('Fisher IDs are incomplete/nonunique')
         else:
             windows = [e for e in events if e['event'] == 'training' and e['stage'] == stage.key]
-            if not windows or windows[-1]['eligible_target_steps'] != stage.env_steps:
+            expected_steps=payload['stage_counters'][stage.key]['transitions']
+            if not windows or windows[-1]['eligible_target_steps'] != expected_steps:
                 raise ValueError('first-step teaching or final target count is wrong')
-            if windows[-1]['optimizer_updates'] != (3 if stage.phase == 'P' else 2):
+            if windows[-1]['optimizer_updates'] != (stage.optimizer_updates or (3 if stage.phase == 'P' else 2)):
                 raise ValueError('unexpected stage optimizer count')
     reports = {}
     for key, entry in payload['evaluations'].items():
@@ -76,7 +81,7 @@ def audit_run(root: Path, config, seed: int) -> dict:
     policy, _, _, _ = load_for_evaluation(root/'exports/final.pt', device=config.training.device)
     if set(payload['fisher'].importance) != set(dict(policy.named_parameters())):
         raise ValueError('Fisher does not cover the complete model')
-    return {'stages': 12, 'transitions': 1664, 'updates': 20, 'validation': reports,
+    return {'stages': 12, 'transitions': actual, 'updates': expected_updates, 'validation': reports,
             'ticks_by_task': asdict(config.ctm.ticks_by_task),
             'memory_ticks': config.ctm.memory_length,
             'fisher_parameters': len(payload['fisher'].importance), 'finalized': True}
@@ -105,7 +110,18 @@ def verify(output_dir, device='cuda:0', seed=0, compile_mode='disabled'):
             if device.startswith('cuda'):
                 peaks.append((torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)))
         # Exercise a REAL P boundary resume. Already committed P/evaluation must not run again.
-        run(config, seed, root/'run', max_stages=1)
+        class PoolInterruption(RuntimeError): pass
+        def stop_after_pool(point,stage):
+            if point=='pool_complete': raise PoolInterruption('intentional pool-boundary power loss')
+        try:
+            run(config,seed,root/'run',hook=stop_after_pool)
+        except PoolInterruption:
+            partial,_=load_boundary(root/'run/checkpoints/latest.json',config,seed)
+            if partial['maze_progress']['next_pool']!=1 or partial['next_index']!=0:
+                raise ValueError('pool boundary not committed')
+        else:
+            raise ValueError('pool fault was not injected')
+        run(config, seed, root/'run', resume=True, max_stages=1)
         capture_peak()
         run(config, seed, root/'run', resume=True)
         capture_peak()

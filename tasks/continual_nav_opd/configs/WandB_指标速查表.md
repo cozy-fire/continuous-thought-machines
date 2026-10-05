@@ -1,4 +1,4 @@
-# v3 OPD：W&B 路径与指标速查表
+# v4 OPD：W&B 路径与指标速查表
 
 > 2026-10-01 更新：本文后续为原完整事件字段的详细说明，不再表示全部上传 W&B。当前上传白名单和新增区间行为指标以同目录 `WandB_指标筛选清单.md` 的“已执行的最终筛选”为准。本地完整事件字段仍保留。W&B 不再上传元数据图、累计动作次数/奖励/成功数量及性能图；validation/final test 的原评估指标全部保留。
 
@@ -65,7 +65,7 @@ P 的目标分布来自专一教师：Maze 为当前位置 BFS 最短路径首�
 |---|---|---|
 | `kl` | 学习重放时的 `KL(p_teacher || π_student)`，有效观察均值，单位 nat | P 学生为 Active，C 学生为 KB；是每次 minibatch 更新前计算的 Loss，再累计平均。Maze one-hot 下等于正确动作的负对数概率 |
 | `total_loss` | P：`kl`；C：`kl + ewc` | 无 PPO、Critic、任务奖励项、熵奖励或视觉特征匹配项；日志中的均值可有少量浮点舍入差异 |
-| `agreement` | `argmax(p_teacher) == argmax(π_student)` 的比例，范围 0–1 | 比较学习重放的贪心动作，不是实际采样动作一致率；也不是任务成功率。并列最大概率按 argmax 的首个索引处理 |
+| `agreement` | `argmax(p_teacher) == argmax(π_student)` 的比例，范围 0–1；仅 FourRooms P 和 C 保留 | Maze P 不再计算。比较学习重放的贪心动作，不是实际采样动作一致率；也不是任务成功率。并列最大概率按 argmax 的首个索引处理 |
 | `expert_entropy` | 目标分布熵 `−Σ p log p`，单位 nat | Maze one-hot 正常为 0；C 描述双列教师，不能与 P 的专一教师混为一谈 |
 | `student_entropy` | 学生五动作分布熵 `−Σ π log π`，单位 nat | 范围 0–ln(5)≈1.609；较低表示动作分布更集中。集中本身不证明正确或塌缩，要结合一致率和成功率 |
 | `ewc` | C 的 Online EWC 惩罚 `250/2 × Σ F_j(θ_j−θ*_j)²` | 已包含系数；覆盖完整 KB Encoder、CTM、Actor。P 恒为 0；首个 C 没有历史 Fisher 时为 0 |
@@ -161,11 +161,11 @@ P 后评估完整 Active，C 后评估 KB；每个策略分别评估两个任务
 | `next_index` | `stage_complete` / `finalized` | 已提交边界后的下一个阶段索引，12 表示所有训练阶段完成；完整结束还需 `finalized=true` 和最终产物校验 |
 | `next_uncommitted_index` | `run_interrupted` | 异常时下一未提交阶段的索引；恢复整段重做该阶段，不续接中途窗口 |
 | `visit` | 常规阶段事件 | 当前 visit 编号；不在路径中，因而不能自动隔离两轮曲线 |
-| `schema_version` | 所有事件 | 当前为 3；属于协议标识，不是性能指标 |
+| `schema_version` | 所有事件 | 当前为 4；属于协议标识，不是性能指标 |
 | `seed` | 所有事件 | 训练随机 seed，当前正式 run 为 0 |
 | `time_unix` | 所有事件 | 写入事件时的 Unix 秒时间戳；不是阶段耗时 |
 | `method` | 所有事件 | `ctm_pnc_opd` |
-| `sequence_protocol` | 所有事件 | `rollout_state_v1`，表示保存 rollout 初态后重放全部新观察的时序契约 |
+| `sequence_protocol` | 所有事件 | `maze_onpolicy5_v1`；Maze P独立五步课程，其他学习路径保留原rollout状态语义 |
 | `timing_mode` | 所有事件 | `events` 或 `synchronized` |
 | `event` | 所有事件 | `training` / `fisher` / `evaluation` / `memory` / `stage_complete` / `final_test` / `finalized` / `run_interrupted` |
 | `stage` | 常规阶段事件 | 如 `pnc/v0/maze_medium/P`，完整阶段身份，含 visit |
@@ -200,3 +200,9 @@ Logger 当前把所有顶层数字都上传为标量，把字符串也上传为�
 | EWC、逐样本 Fisher 与在线衰减 | `tasks/continual_nav_opd/learning/fisher.py` |
 | 固定面板、逐 episode 汇总与评估报告 | `tasks/continual_nav_opd/evaluate.py`：`evaluate_policy` |
 | GPU events/CPU 墙钟计时口径 | `tasks/continual_nav_opd/timing.py`：`WindowTimer` |
+
+## Maze P课程字段
+
+主横轴为累计`global_optimizer_updates`；环境决策数按终止mask实际计数。`pool_maps`/`pool_index`识别当前嵌套池，`pool_optimizer_updates`为池内已完成更新，`optimizer_updates`为该P累计更新。`update_valid_decisions`为本次100序列的有效动作数（100至500），`eligible_target_steps`为P累计有效数。`step_kl`/`step_valid_decisions`按1至5决策分别记录，空时间步的KL为null。`kl`为本次更新有效决策均值，阶段完成统计为整个P有效决策加权均值。Maze P 不计算整体或逐步动作一致率；地图池边界只保存checkpoint，没有独立评估前向。闭环固定面板仍在完整P/C阶段末及最终test执行。
+
+`initial_window_grad_norm`、`visual_grad_norm`和`grad_norm`为归一化后、裁剪前范数。`collect_seconds`/`replay_seconds`是本次完成更新的墙钟区间；后者含重放反向、裁剪和Adam。`state_table_bytes`、`map_cache.cache_bytes`、`maze_state_table.total_cache_bytes`为实际数组占用，单列CPU/GPU过程内存不能直接据此推断吞吐。训练序列目标到达数不是固定起点完整episode成功率。

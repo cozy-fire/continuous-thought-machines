@@ -1,4 +1,4 @@
-"""Atomic stage boundaries with strict v3 identity and run-relative SHA references."""
+"""Atomic Maze-pool/other-stage boundaries with strict v4 identity and SHA references."""
 from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
@@ -93,7 +93,7 @@ def save_boundary(root,payload):
             torch.save(payload,stream); stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary,path)
     finally: temporary.unlink(missing_ok=True)
-    marker={'schema_version':3,'checkpoint':reference(root,path),'next_index':payload['next_index'],'finalized':payload['finalized']}
+    marker={'schema_version':4,'checkpoint':reference(root,path),'next_index':payload['next_index'],'finalized':payload['finalized']}
     complete=Path(str(path)+'.complete.json'); atomic_json(complete,marker)
     # latest changes LAST; a crash can only leave an unreferenced complete boundary.
     atomic_json(directory/'latest.json',{'complete':reference(root,complete)})
@@ -102,7 +102,7 @@ def save_boundary(root,payload):
 
 REQUIRED={'artifact_type','schema_version','method','sequence_protocol','seed','config_hash','source','stages',
           'next_index','kb','kb_ready','fisher','global_env_steps','optimizer_updates','next_transition_id','rng',
-          'references','active_snapshots','evaluations','visit_reports','finalized','teacher_identity','data_hash'}
+          'references','active_snapshots','evaluations','visit_reports','finalized','teacher_identity','data_hash','stage_counters','maze_progress'}
 
 
 def load_boundary(latest,config,seed):
@@ -110,25 +110,49 @@ def load_boundary(latest,config,seed):
     index=json.loads(latest.read_text(encoding='utf-8'))
     if set(index)!={'complete'}: raise ValueError('invalid latest index')
     complete=verify_reference(root,index['complete']); marker=json.loads(complete.read_text(encoding='utf-8'))
-    if set(marker)!={'schema_version','checkpoint','next_index','finalized'} or marker['schema_version']!=3:
+    if set(marker)!={'schema_version','checkpoint','next_index','finalized'} or marker['schema_version']!=4:
         raise ValueError('invalid complete marker')
     path=verify_reference(root,marker['checkpoint'])
     # Stage payload is trusted local torch serialization, guarded by file SHA, never v2.
     payload=torch.load(path,map_location='cpu',weights_only=False)
     if not isinstance(payload,dict) or not REQUIRED<=set(payload): raise ValueError('missing checkpoint fields')
-    if (payload['artifact_type'],payload['schema_version'],payload['method'],payload['sequence_protocol'])!=('v3_stage_boundary',3,'ctm_pnc_opd','rollout_state_v1'):
+    if (payload['artifact_type'],payload['schema_version'],payload['method'],payload['sequence_protocol'])!=('v4_stage_boundary',4,'ctm_pnc_opd','maze_onpolicy5_v1'):
         raise ValueError('incompatible checkpoint identity')
     stages=[asdict(s) for s in expand_stages(config)]
     if payload['seed']!=seed or payload['config_hash']!=config_hash(config) or payload['source']!=source_manifest() or payload['stages']!=stages:
         raise ValueError('checkpoint config/source/seed/stages mismatch')
     if not 0<=payload['next_index']<=len(stages) or marker.get('next_index')!=payload['next_index'] or marker.get('finalized')!=payload['finalized']:
         raise ValueError('invalid checkpoint boundary')
-    expected=sum(s['env_steps'] for s in stages[:payload['next_index']])
+    completed=stages[:payload['next_index']]
+    if set(payload['stage_counters']) != {s['key'] for s in completed}:
+        raise ValueError('invalid completed-stage counters')
+    expected=expected_updates=0
+    for stage in completed:
+        counter=payload['stage_counters'][stage['key']]
+        updates=stage['optimizer_updates'] or (0 if stage['phase']=='F' else
+            ((stage['env_steps']//config.training.num_envs+config.optimization.learning_steps-1)//config.optimization.learning_steps)*config.optimization.minibatches)
+        steps=counter['transitions']
+        if counter['optimizer_updates']!=updates or (not stage['optimizer_updates'] and steps!=stage['env_steps']) or (
+                stage['optimizer_updates'] and not updates*100 <= steps <= updates*500):
+            raise ValueError('checkpoint stage budget mismatch')
+        expected+=steps
+        expected_updates+=updates
     if payload['global_env_steps']!=expected or payload['next_transition_id']!=expected or (payload['finalized'] and payload['next_index']!=len(stages)):
         raise ValueError('checkpoint budget/index mismatch')
-    expected_updates=sum(((s['env_steps']//config.training.num_envs+config.optimization.learning_steps-1)//config.optimization.learning_steps)
-                         *config.optimization.minibatches for s in stages[:payload['next_index']] if s['phase'] in ('P','C'))
     if payload['optimizer_updates']!=expected_updates: raise ValueError('checkpoint optimizer update count mismatch')
+    partial=payload['maze_progress']
+    if partial is not None:
+        if payload['next_index']==len(stages): raise ValueError('unexpected Maze progress after schedule')
+        stage=stages[payload['next_index']]
+        if not stage['optimizer_updates'] or partial['stage']!=stage['key'] or not 1<=partial['next_pool']<=len(config.maze_progress.pool_sizes):
+            raise ValueError('invalid Maze pool boundary')
+        updates=sum(config.maze_progress.pool_updates[:partial['next_pool']])
+        if partial['updates']!=updates or not updates*100<=partial['transitions']<=updates*500:
+            raise ValueError('invalid Maze pool counters')
+        if not partial['optimizer']['state'] or any(float(v['step'])!=updates for v in partial['optimizer']['state'].values()):
+            raise ValueError('invalid Maze Adam steps')
+        if any(v.is_floating_point() and not torch.isfinite(v).all() for v in partial['dual'].values()):
+            raise ValueError('nonfinite Maze boundary weights')
     for ref in payload['references'].values(): verify_reference(root,ref)
     if not {'config','provenance','manifest','maze_teacher','fourrooms_teacher'}<=set(payload['references']):
         raise ValueError('missing required artifact references')

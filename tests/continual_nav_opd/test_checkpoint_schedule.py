@@ -28,6 +28,16 @@ def fake_progress(envs,dual,expert,config,steps,action,shuffle,start,on_window):
     return SimpleNamespace(policy=frozen_copy(dual),transitions=steps,optimizer_updates=3,eligible_target_steps=steps,next_transition_id=start+steps,statistics={})
 
 
+def fake_maze_progress(table,dual,config,action,shuffle,start,on_window,on_pool,resume):
+    if resume:
+        return SimpleNamespace(policy=frozen_copy(dual),transitions=resume['transitions'],optimizer_updates=resume['updates'],eligible_target_steps=resume['transitions'],next_transition_id=start+resume['transitions'],statistics={})
+    with torch.no_grad(): dual.active.actor[-1].bias.add_(torch.rand(5)*.01)
+    torch.rand(2,generator=action); shuffle.permutation(2)
+    on_pool(dict(next_pool=1,transitions=200,updates=1,sums={},timing={},dual={n:p.detach().cpu().clone() for n,p in dual.state_dict().items()},
+                 optimizer={'state':{0:{'step':torch.tensor(1.)}},'param_groups':[]}))
+    return SimpleNamespace(policy=frozen_copy(dual),transitions=200,optimizer_updates=1,eligible_target_steps=200,next_transition_id=start+200,statistics={})
+
+
 def fake_compress(envs,teacher,kb,fisher,config,steps,action,shuffle,start,on_window):
     with torch.no_grad(): kb.actor[-1].bias.add_(torch.rand(5)*.01)
     torch.rand(2,generator=action); shuffle.permutation(2)
@@ -62,10 +72,11 @@ class CheckpointScheduleTests(unittest.TestCase):
             Image.fromarray(rgb).save(path)
             entries.append(MazeEntry(path.relative_to(maze_root).as_posix(),hashlib.sha256(path.read_bytes()).hexdigest()))
         manifest=MazeManifest((entries[0],),tuple(entries[1:3]),tuple(entries[3:]),tuple(entries[1:3]),tuple(entries[3:]),tuple(entries[1:3]))
-        self.config=replace(self.config,environment=replace(self.config.environment,maze_root=str(maze_root)))
+        self.config=replace(self.config,environment=replace(self.config.environment,maze_root=str(maze_root)),
+                            maze_progress=replace(self.config.maze_progress,pool_sizes=(1,),pool_updates=(1,)))
         stack=ExitStack(); self.addCleanup(stack.close)
         stack.enter_context(patch('tasks.continual_nav_opd.runner.build_manifest',return_value=manifest))
-        for name,target in [('run_progress',fake_progress),('run_compress_stage',fake_compress),('run_fisher_stage',fake_fisher),('evaluate_policy',fake_eval)]:
+        for name,target in [('run_maze_progress',fake_maze_progress),('run_progress',fake_progress),('run_compress_stage',fake_compress),('run_fisher_stage',fake_fisher),('evaluate_policy',fake_eval)]:
             stack.enter_context(patch('tasks.continual_nav_opd.runner.'+name,side_effect=target))
         stack.enter_context(patch('tasks.continual_nav_opd.runner.FourRoomsTeacher',return_value=object()))
 
@@ -73,7 +84,7 @@ class CheckpointScheduleTests(unittest.TestCase):
 
     def test_complete_schedule_and_idempotent_finalization(self):
         result=run(self.config,0,self.root)
-        self.assertEqual((result['next_index'],result['global_env_steps'],result['next_transition_id'],result['optimizer_updates']),(12,1664,1664,20))
+        self.assertEqual((result['next_index'],result['global_env_steps'],result['next_transition_id'],result['optimizer_updates']),(12,1552,1552,16))
         self.assertTrue(result['finalized']); self.assertEqual(len(result['evaluations']),8); self.assertEqual(len(result['active_snapshots']),4)
         self.assertEqual(len(result['visit_reports']),2); self.assertEqual(result['fisher'].completed_compressions,4)
         with patch('tasks.continual_nav_opd.runner.evaluate_policy',side_effect=AssertionError('duplicate test')):
@@ -133,9 +144,27 @@ class CheckpointScheduleTests(unittest.TestCase):
 
     def test_task_ticks_change_rejects_boundary_restore(self):
         run(self.config,0,self.root,max_stages=1)
-        changed=replace(self.config,ctm=replace(self.config.ctm,ticks_by_task=replace(self.config.ctm.ticks_by_task,maze_medium=74)))
+        changed=replace(self.config,ctm=replace(self.config.ctm,ticks_by_task=replace(self.config.ctm.ticks_by_task,fourrooms=3)))
         with self.assertRaisesRegex(ValueError,'config/source/seed/stages mismatch'):
             load_boundary(self.root/'checkpoints/latest.json',changed,0)
+
+    def test_pool_committed_before_p_snapshot_and_invalid_adam_rejected(self):
+        def stop(point,stage):
+            if point=='pool_complete': raise Interrupted('pool')
+        with self.assertRaises(Interrupted): run(self.config,0,self.root,hook=stop)
+        saved=self.load()
+        self.assertEqual(saved['next_index'],0)
+        self.assertEqual(saved['maze_progress']['next_pool'],1)
+        self.assertEqual(saved['active_snapshots'],{})
+        bad=__import__('copy').deepcopy(saved)
+        bad['maze_progress']['optimizer']['state'][0]['step']=torch.tensor(2.)
+        save_boundary(self.root,bad)
+        with self.assertRaisesRegex(ValueError,'Adam steps'): self.load()
+        save_boundary(self.root,saved)
+        result=run(self.config,0,self.root,resume=True,max_stages=1)
+        self.assertIsNone(result['maze_progress'])
+        self.assertEqual(result['stage_counters']['pnc/v0/maze_medium/P']['optimizer_updates'],1)
+        self.assertEqual(result['global_env_steps'],200)
 
 
 if __name__=='__main__': unittest.main()

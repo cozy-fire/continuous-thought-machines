@@ -1,4 +1,4 @@
-"""P/C/F stage commits and isolated evaluation; an interrupted stage is rerun whole."""
+"""Maze-pool and P/C/F commits; resume reruns only the uncommitted pool/stage."""
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -17,6 +17,8 @@ from .teachers import MazeTeacher,FourRoomsTeacher
 from .checkpoint import (atomic_json,reference,verify_reference,source_manifest,rng_state,restore_rng,
                          save_boundary,load_boundary,seal_artifact,verify_artifact)
 from .learning.progress import run_progress
+from .data.maze_curriculum import MazeStateTable
+from .learning.maze_progress import run_maze_progress
 from .learning.distill import run_compress_stage
 from .learning.fisher import run_fisher_stage,validate_fisher
 from .evaluate import evaluate_policy
@@ -59,16 +61,17 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
         # Load copied teacher once BEFORE the initial commit to verify native keys/config.
         native=FourRoomsTeacher(root/'teachers/fourrooms.pt',device='cpu'); del native
         source=source_manifest()
-        atomic_json(root/'provenance.json',{'seed':seed,'method':config.method,'schema_version':3,'sequence_protocol':config.sequence_protocol,
+        atomic_json(root/'provenance.json',{'seed':seed,'method':config.method,'schema_version':4,'sequence_protocol':config.sequence_protocol,
                     'config_hash':config_hash(config),'source':source,'hardware':torch.cuda.get_device_name(device) if device.type=='cuda' else 'CPU'})
         refs={name:reference(root,path) for name,path in {'config':config_path,'provenance':root/'provenance.json',
               'manifest':root/'maze_manifest.json','maze_teacher':root/'teachers/maze_teacher.json','fourrooms_teacher':root/'teachers/fourrooms.pt'}.items()}
         kb=StandalonePolicy(config).to(device)
-        payload={'artifact_type':'v3_stage_boundary','schema_version':3,'method':config.method,'sequence_protocol':config.sequence_protocol,
+        payload={'artifact_type':'v4_stage_boundary','schema_version':4,'method':config.method,'sequence_protocol':config.sequence_protocol,
                  'seed':seed,'config_hash':config_hash(config),'source':source,'stages':[asdict(s) for s in stages],
                  'next_index':0,'kb':kb.state_dict(),'kb_ready':False,'fisher':None,'global_env_steps':0,'optimizer_updates':0,'next_transition_id':0,
                  'rng':rng_state(action,minibatch,fisher_rng),'references':refs,'active_snapshots':{},'evaluations':{},'visit_reports':{},'finalized':False,
-                 'teacher_identity':{'maze':MazeTeacher().source_snapshot_id,'fourrooms':refs['fourrooms_teacher']['sha256']},'data_hash':refs['manifest']['sha256']}
+                 'teacher_identity':{'maze':MazeTeacher().source_snapshot_id,'fourrooms':refs['fourrooms_teacher']['sha256']},'data_hash':refs['manifest']['sha256'],
+                 'stage_counters':{},'maze_progress':None}
         save_boundary(root,payload)
     logger=EventLogger(root,config,seed,wandb_mode,resume)
     failed=True; completed=0; committed_index=payload['next_index']
@@ -76,10 +79,20 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
     try:
         if payload['finalized']: failed=False; return payload
         if config.environment.map_cache=='memory':
-            entries=manifest.entries('train')+manifest.entries('validation',panel=True)+manifest.entries('test',panel=True)
+            entries=manifest.entries('train')+manifest.entries('validation')+manifest.entries('test')
             map_cache=MazeMapCache(REPO_ROOT/config.environment.maze_root,entries)
             logger.emit({'event':'map_cache','family':'pnc','maps':len(map_cache.indices),
-                         'cache_bytes':map_cache.images.nbytes,'load_seconds':map_cache.load_seconds})
+                         'cache_bytes':map_cache.images.nbytes,'load_seconds':map_cache.load_seconds,
+                         'process_rss_bytes':map_cache.process_rss_bytes,'rss_delta_bytes':map_cache.rss_delta_bytes})
+        if config.maze_progress.pool_sizes[-1] > len(manifest.train):
+            raise ValueError('Maze curriculum exceeds distinct training manifest')
+        if config.maze_progress.pool_sizes[-1] == 44488 and len(manifest.train) != 44488:
+            raise ValueError('formal curriculum must cover the entire fixed training split')
+        maze_table=MazeStateTable(map_cache,manifest.train[:config.maze_progress.pool_sizes[-1]])
+        logger.emit({'event':'maze_state_table','maps':len(maze_table.entries),'nonterminal_positions':len(maze_table.start_ids),
+                     'table_bytes':maze_table.table_bytes,'build_seconds':maze_table.build_seconds,
+                     'process_rss_bytes':maze_table.process_rss_bytes,'rss_delta_bytes':maze_table.rss_delta_bytes,
+                     'total_cache_bytes':map_cache.images.nbytes+maze_table.table_bytes})
         for index in range(payload['next_index'],len(stages)):
             stage=stages[index]; attempt=uuid.uuid4().hex; trigger('stage_start',stage)
             identity={'family':stage.family,'visit':stage.visit,'stage':stage.key,'phase':stage.phase,'task':stage.task,'attempt_id':attempt,
@@ -88,16 +101,34 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
             def log_window(event):
                 logger.emit({**identity,**event,'event':'training','global_env_steps':before_steps+event['stage_env_steps'],
                              'global_optimizer_updates':before_updates+event['optimizer_updates']})
-            envs=SyncVectorEnv([make_env(config,stage.task,'train',manifest=manifest,seed=seed+index*1000+slot,map_cache=map_cache)
+            maze_p=stage.task=='maze_medium' and stage.phase=='P'
+            envs=None if maze_p else SyncVectorEnv([make_env(config,stage.task,'train',manifest=manifest,seed=seed+index*1000+slot,map_cache=map_cache)
                                for slot in range(config.training.num_envs)])
             policy=None
             try:
                 if stage.phase=='P':
                     dual=DualPolicy(config,kb,kb_ready=payload['kb_ready'])
-                    expert=MazeTeacher() if stage.task=='maze_medium' else FourRoomsTeacher(root/'teachers/fourrooms.pt',device=device)
-                    result=run_progress(envs,dual,expert,config,stage.env_steps,action,minibatch,payload['next_transition_id'],log_window)
-                    if result.eligible_target_steps!=stage.env_steps: raise ValueError('P target budget mismatch')
-                    policy=result.policy; del dual,expert
+                    if maze_p:
+                        partial=payload['maze_progress']
+                        if partial is not None:
+                            dual.load_state_dict(partial['dual'],strict=True)
+                            # Construction initializes trainable modules. Undo its RNG use.
+                            restore_rng(payload['rng'],action,minibatch,fisher_rng)
+                        def commit_pool(progress):
+                            payload['maze_progress']={**progress,'stage':stage.key}
+                            payload['rng']=rng_state(action,minibatch,fisher_rng)
+                            save_boundary(root,payload)
+                            logger.emit({**identity,'event':'maze_pool_complete','next_pool':progress['next_pool'],
+                                         'optimizer_updates':progress['updates'],'valid_decisions':progress['transitions']})
+                            trigger('pool_complete',stage)
+                        result=run_maze_progress(maze_table,dual,config,action,minibatch,payload['next_transition_id'],log_window,commit_pool,partial)
+                        if result.optimizer_updates!=stage.optimizer_updates: raise ValueError('Maze P update budget mismatch')
+                    else:
+                        expert=FourRoomsTeacher(root/'teachers/fourrooms.pt',device=device)
+                        result=run_progress(envs,dual,expert,config,stage.env_steps,action,minibatch,payload['next_transition_id'],log_window)
+                        if result.eligible_target_steps!=stage.env_steps: raise ValueError('P target budget mismatch')
+                        del expert
+                    policy=result.policy; del dual
                     path=root/'snapshots'/f'{index:03d}_{attempt}_active.pt'
                     ref=export_policy(policy,path,root,payload['references']['manifest'])
                     payload['active_snapshots'][stage.key]=ref
@@ -118,8 +149,10 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
                     statistics={**result['statistics'],'scored_samples':result['scored_samples'],'selected_ids':result['selected_ids']}
                     logger.emit({**identity,'event':'fisher','policy_type':'kb','global_env_steps':before_steps+stage.env_steps,
                                  'stage_env_steps':stage.env_steps,'scored_samples':result['scored_samples'],**result['statistics']})
-            finally: envs.close()
-            if transitions!=stage.env_steps: raise ValueError('stage budget mismatch')
+            finally:
+                if envs is not None: envs.close()
+            if not maze_p and transitions!=stage.env_steps: raise ValueError('stage budget mismatch')
+            payload['stage_counters'][stage.key]={'transitions':transitions,'optimizer_updates':updates}
             payload['global_env_steps']+=transitions; payload['optimizer_updates']+=updates; payload['next_transition_id']=next_id
             trigger('training_complete',stage)
             if policy is not None:
@@ -137,6 +170,7 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
                                  **{k:v for k,v in metrics.items() if k!='results'},'evaluation_seconds':report['elapsed_seconds']})
                 trigger('evaluation_complete',stage)
             payload['next_index']=index+1
+            payload['maze_progress']=None
             if index+1==len(stages) or stages[index+1].visit!=stage.visit:
                 chosen={s.key:payload['evaluations'][s.key] for s in stages[:index+1] if s.visit==stage.visit and s.phase in ('P','C')}
                 last_c=next(s.key for s in reversed(stages[:index+1]) if s.phase=='C')
@@ -181,5 +215,5 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
         if map_cache is not None: map_cache.close()
         if failed:
             logger.emit({'event':'run_interrupted','family':'pnc','next_uncommitted_index':committed_index,
-                         'note':'Resume uses latest committed boundary; partial stage data is not reused.'})
+                         'note':'Resume uses the last committed Maze pool or other task stage boundary.'})
         logger.close(failed)

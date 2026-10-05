@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 from weakref import WeakValueDictionary
 import numpy as np
+import psutil
 from tasks.continual_nav.envs.maze import load_map
 
 _shared = WeakValueDictionary()
@@ -20,6 +21,7 @@ def shared_map_cache(root, entries):
 
 class MazeMapCache:
     def __init__(self, root, entries):
+        resident_before = psutil.Process().memory_info().rss
         self.root = Path(root).resolve()
         entries = tuple(dict.fromkeys(entries))
         self.indices = {entry: i for i, entry in enumerate(entries)}
@@ -33,6 +35,8 @@ class MazeMapCache:
             self.positions.append((start, goal))
         self.images.flags.writeable = False
         self.load_seconds = time.perf_counter() - started
+        self.process_rss_bytes = psutil.Process().memory_info().rss
+        self.rss_delta_bytes = self.process_rss_bytes - resident_before
 
     def get(self, root, entry):
         if Path(root).resolve() != self.root:

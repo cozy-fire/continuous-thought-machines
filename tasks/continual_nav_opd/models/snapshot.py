@@ -7,12 +7,12 @@ from .policy import StandalonePolicy, DualPolicy, frozen_copy
 
 def save_snapshot(policy: StandalonePolicy | DualPolicy, path: str | Path) -> None:
     if type(policy) not in (StandalonePolicy, DualPolicy):
-        raise TypeError("only complete v3 policies can be exported")
+        raise TypeError("only complete v4 policies can be exported")
     config = policy.config
     # The hashed config persists BOTH task budgets. State_dict alone cannot store
     # an execution loop count; loading a legacy global-ticks config must fail.
-    artifact = {"artifact_type": "v3_complete_inference", "method": config.method,
-                "schema_version": 3, "sequence_protocol": config.sequence_protocol,
+    artifact = {"artifact_type": "v4_complete_inference", "method": config.method,
+                "schema_version": 4, "sequence_protocol": config.sequence_protocol,
                 "config": resolved_dict(config), "config_hash": config_hash(config),
                 "policy_type": "dual" if isinstance(policy, DualPolicy) else "standalone",
                 # Clone each tensor: the artifact includes both encoders and the P-time old KB.
@@ -24,7 +24,7 @@ def save_snapshot(policy: StandalonePolicy | DualPolicy, path: str | Path) -> No
 def load_snapshot(path: str | Path, device: str | torch.device = "cpu") -> StandalonePolicy | DualPolicy:
     artifact = torch.load(path, map_location="cpu", weights_only=True)
     if (artifact.get("artifact_type"), artifact.get("method"), artifact.get("schema_version"), artifact.get("sequence_protocol")) != (
-            "v3_complete_inference", "ctm_pnc_opd", 3, "rollout_state_v1"):
+            "v4_complete_inference", "ctm_pnc_opd", 4, "maze_onpolicy5_v1"):
         raise ValueError("incompatible inference artifact identity")
     config = parse_config(artifact["config"])
     if raw_config_hash(artifact["config"]) != artifact["config_hash"]:

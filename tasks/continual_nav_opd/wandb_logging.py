@@ -7,7 +7,10 @@ from .config import resolved_dict,config_hash
 from .timing import current_timing_mode
 
 TRAIN_METRICS = {'kl', 'total_loss', 'agreement', 'student_entropy', 'grad_norm',
-                 'global_env_steps', 'stage_env_steps', 'episode_mean_return', 'episode_success_rate'}
+                 'global_env_steps', 'stage_env_steps', 'episode_mean_return', 'episode_success_rate',
+                 'global_optimizer_updates','optimizer_updates','pool_maps','pool_optimizer_updates',
+                 'update_valid_decisions','eligible_target_steps','initial_window_grad_norm','visual_grad_norm',
+                 'collect_seconds','replay_seconds','state_table_bytes'}
 EVALUATION_METRICS = {'episodes', 'success_rate', 'mean_return', 'mean_length', 'environment_steps',
                       'displacement_rate', 'turn_rate', 'evaluation_seconds', 'global_env_steps'}
 
@@ -32,6 +35,10 @@ def chart_values(event: dict) -> dict:
     if list_key:
         for index, value in enumerate(event.get(list_key, [])):
             values[f'{namespace}/{list_key}/{index}'] = value
+    if event.get('task')=='maze_medium' and event.get('phase')=='P' and not evaluation:
+        for name in ('step_kl','step_valid_decisions'):
+            for index,value in enumerate(event.get(name,[])):
+                if value is not None: values[f'{namespace}/{name}/{index+1}'] = value
     return values
 
 
@@ -48,6 +55,8 @@ class EventLogger:
                                 id=old.get('id'),resume='must' if old and mode=='online' else None,
                                 config={**resolved_dict(config),'run_seed':seed,'config_hash':config_hash(config)})
             atomic_json(path,{'id':self.run.id,'url':self.run.url,'mode':mode,'project':self.run.project})
+            self.run.define_metric('global_optimizer_updates')
+            self.run.define_metric('pnc/P/maze_medium/*',step_metric='global_optimizer_updates')
 
     def emit(self,event):
         event={'time_unix':time.time(),**self.identity,**event}
@@ -63,6 +72,8 @@ class EventLogger:
         if self.run is not None:
             values = chart_values(event)
             if values:
+                if 'global_optimizer_updates' in event:
+                    values['global_optimizer_updates']=event['global_optimizer_updates']
                 self.run.log(values)
 
     def close(self,failed=False):
