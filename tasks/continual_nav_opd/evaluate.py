@@ -1,4 +1,4 @@
-"""Fixed-panel batched v3 inference; spawned workers contain environments only."""
+"""Offline fixed-panel stage inference; spawned workers contain environments only."""
 import argparse
 import json
 from pathlib import Path
@@ -6,11 +6,11 @@ import time
 import numpy as np
 import torch
 from .envs.evaluation import EvaluationPool
-from .config import REPO_ROOT,load_config
+from .config import REPO_ROOT,load_config,config_hash
 from .data import MazeManifest
 from .envs import MazeEnv,FourRoomsEnv,MazeMapCache
 from .models import StandalonePolicy,DualPolicy,frozen_copy,select_state,replace_slots,load_snapshot
-from .checkpoint import isolated_rng,atomic_json,verify_artifact,load_boundary,verify_reference
+from .checkpoint import isolated_rng,atomic_json,verify_artifact,load_boundary,verify_reference,reference,load_stage_index
 
 
 def create_panel_env(spec):
@@ -106,43 +106,70 @@ def evaluate_policy(policy,config,manifest,split='validation',tasks=None,backend
             'episodes_per_second':sum(r['episodes'] for r in reports.values())/elapsed}
 
 
-def load_for_evaluation(path,policy_type='kb',device='cpu',active_key=None):
+def load_for_evaluation(path,policy_type='kb',device='cpu',stage_key=None,*,identity=None,manifest_cache=None):
     path=Path(path).resolve()
+    if policy_type not in ('active','kb'): raise ValueError('unknown policy type')
+    expected_ref=None; expected_config=None; expected_manifest=None
     if path.name=='latest.json':
         root=path.parent.parent; config=load_config(root/'resolved_config.yaml')
         provenance=json.loads((root/'provenance.json').read_text(encoding='utf-8'))
         payload,_=load_boundary(path,config,provenance['seed'])
-        if policy_type=='kb':
-            with isolated_rng(): policy=StandalonePolicy(config).to(device)
-            policy.load_state_dict(payload['kb'],strict=True); policy=frozen_copy(policy)
-        else:
-            key=active_key or (list(payload['active_snapshots'])[-1] if payload['active_snapshots'] else None)
-            if key not in payload['active_snapshots']: raise ValueError('complete Active snapshot unavailable')
-            policy=load_snapshot(verify_artifact(verify_reference(root,payload['active_snapshots'][key])),device)
-        manifest=verify_reference(root,payload['references']['manifest'])
-    else:
-        policy=load_snapshot(verify_artifact(path),device); config=policy.config
-        metadata=json.loads(verify_artifact(str(path)+'.metadata.json').read_text(encoding='utf-8'))
-        root=(path.parent/metadata['run_root']).resolve()
-        manifest=verify_reference(root,metadata['manifest'])
+        keys=[s['key'] for s in payload['stages'][:payload['next_index']]
+              if (s['phase']=='P')==(policy_type=='active')]
+        stage_key=stage_key or (keys[-1] if keys else None)
+        if stage_key not in payload['stage_snapshots']: raise ValueError('complete stage snapshot unavailable')
+        expected_ref=payload['stage_snapshots'][stage_key]
+        expected_config=payload['config_hash']; expected_manifest=payload['references']['manifest']
+        path=verify_reference(root,expected_ref)
+    elif path.suffix=='.json':
+        index,root=load_stage_index(path)
+        if stage_key is None: raise ValueError('--stage-key is required for a stage index')
+        items=[s for s in index['stages'] if s['key']==stage_key]
+        if len(items)!=1: raise ValueError('stage not found in index')
+        item=items[0]
+        if item['policy_type']!=policy_type: raise ValueError('stage/policy type mismatch')
+        expected_ref=item['reference']; expected_config=index['config_hash']; expected_manifest=index['manifest']
+        path=verify_reference(root,expected_ref)
+    policy=load_snapshot(verify_artifact(path),device); config=policy.config
+    metadata=json.loads(verify_artifact(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+    metadata_root=(path.parent/metadata['run_root']).resolve()
+    if expected_ref is not None and metadata_root!=root: raise ValueError('snapshot/index run root mismatch')
+    root=metadata_root
+    if (stage_key is not None and metadata.get('stage')!=stage_key) or metadata.get('policy_type')!=policy_type:
+        raise ValueError('stage snapshot identity mismatch')
+    if expected_config is not None and (expected_config!=config_hash(config) or metadata['manifest']!=expected_manifest):
+        raise ValueError('snapshot/index config or manifest mismatch')
+    manifest=verify_reference(root,metadata['manifest'])
     if policy_type=='active' and not isinstance(policy,DualPolicy): raise ValueError('artifact does not contain a complete Active dual policy')
     if policy_type=='kb' and not isinstance(policy,StandalonePolicy): raise ValueError('artifact does not contain a KB policy')
+    if identity is not None:
+        identity.update({k:metadata[k] for k in ('stage','visit','task','phase','policy_type','global_env_steps','optimizer_updates')})
+        identity.update(checkpoint=reference(root,path),active_source=metadata['task'] if policy_type=='active' else None)
     maze_root=Path(config.environment.maze_root)
-    return policy,config,MazeManifest.load(manifest,maze_root if maze_root.is_absolute() else REPO_ROOT/maze_root),root
+    maze_root=(maze_root if maze_root.is_absolute() else REPO_ROOT/maze_root).resolve()
+    # A suite owns this cache for one invocation. References are still checked for every snapshot.
+    key=(str(manifest),metadata['manifest']['sha256'],str(maze_root))
+    if manifest_cache is None:
+        loaded_manifest=MazeManifest.load(manifest,maze_root)
+    else:
+        if key not in manifest_cache: manifest_cache[key]=MazeManifest.load(manifest,maze_root)
+        loaded_manifest=manifest_cache[key]
+    return policy,config,loaded_manifest,root
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint',required=True); parser.add_argument('--policy',choices=['kb','active'],default='kb')
-    parser.add_argument('--active-key'); parser.add_argument('--split',choices=['validation','test'],default='validation')
+    parser.add_argument('--stage-key',help='P, C or F key from exports/stages.json'); parser.add_argument('--split',choices=['validation','test'],default='validation')
     parser.add_argument('--tasks',nargs='+'); parser.add_argument('--backend',choices=['serial','subprocess'])
     parser.add_argument('--num-envs',type=int); parser.add_argument('--device',default='cpu'); parser.add_argument('--output',required=True)
     args=parser.parse_args(); output=Path(args.output)
     if output.exists(): raise FileExistsError(output)
     torch.set_num_threads(2)
-    policy,config,manifest,_=load_for_evaluation(args.checkpoint,args.policy,args.device,args.active_key)
+    identity={'evaluation_id':output.stem}
+    policy,config,manifest,_=load_for_evaluation(args.checkpoint,args.policy,args.device,args.stage_key,identity=identity)
     report=evaluate_policy(policy,config,manifest,args.split,args.tasks,args.backend,args.num_envs,
-                           {'evaluation_id':output.stem,'policy_type':args.policy,'active_source':args.active_key})
+                           identity)
     atomic_json(output,report)
 
 

@@ -102,7 +102,22 @@ def save_boundary(root,payload):
 
 REQUIRED={'artifact_type','schema_version','method','sequence_protocol','seed','config_hash','source','stages',
           'next_index','kb','kb_ready','fisher','global_env_steps','optimizer_updates','next_transition_id','rng',
-          'references','active_snapshots','evaluations','visit_reports','finalized','teacher_identity','data_hash','stage_counters','maze_progress'}
+          'references','stage_snapshots','finalized','teacher_identity','data_hash','stage_counters','maze_progress'}
+
+
+def load_stage_index(path):
+    """Portable inference inventory; does not require training source or resume checkpoints."""
+    path=verify_artifact(Path(path).resolve())
+    index=json.loads(path.read_text(encoding='utf-8'))
+    if (index.get('artifact_type'),index.get('schema_version'))!=('v4_stage_index',4):
+        raise ValueError('incompatible stage index')
+    if not isinstance(index.get('stages'),list) or not index['stages']:
+        raise ValueError('empty stage index')
+    keys=[s['key'] for s in index['stages']]
+    if len(set(keys))!=len(keys): raise ValueError('duplicate stage index keys')
+    root=(path.parent/index['run_root']).resolve()
+    verify_reference(root,index['manifest'])
+    return index,root
 
 
 def load_boundary(latest,config,seed):
@@ -116,8 +131,10 @@ def load_boundary(latest,config,seed):
     # Stage payload is trusted local torch serialization, guarded by file SHA, never v2.
     payload=torch.load(path,map_location='cpu',weights_only=False)
     if not isinstance(payload,dict) or not REQUIRED<=set(payload): raise ValueError('missing checkpoint fields')
-    if (payload['artifact_type'],payload['schema_version'],payload['method'],payload['sequence_protocol'])!=('v4_stage_boundary',4,'ctm_pnc_opd','maze_onpolicy5_v1'):
+    if (payload['artifact_type'],payload['schema_version'],payload['method'],payload['sequence_protocol'])!=('v4_training_boundary',4,'ctm_pnc_opd','maze_onpolicy5_v1'):
         raise ValueError('incompatible checkpoint identity')
+    if {'evaluations','visit_reports','active_snapshots'} & set(payload):
+        raise ValueError('incompatible evaluation-coupled checkpoint')
     stages=[asdict(s) for s in expand_stages(config)]
     if payload['seed']!=seed or payload['config_hash']!=config_hash(config) or payload['source']!=source_manifest() or payload['stages']!=stages:
         raise ValueError('checkpoint config/source/seed/stages mismatch')
@@ -161,15 +178,13 @@ def load_boundary(latest,config,seed):
     if type(payload['finalized']) is not bool or type(payload['kb_ready']) is not bool or payload['optimizer_updates']<0:
         raise ValueError('invalid checkpoint counters/flags')
     completed=stages[:payload['next_index']]
-    pkeys={s['key'] for s in completed if s['phase']=='P'}
-    evalkeys={s['key'] for s in completed if s['phase'] in ('P','C')}
-    if set(payload['active_snapshots'])!=pkeys or set(payload['evaluations'])!=evalkeys:
-        raise ValueError('missing stage snapshot/evaluation records')
+    if set(payload['stage_snapshots'])!={s['key'] for s in completed}:
+        raise ValueError('missing completed-stage snapshots')
     if payload['kb_ready']!=any(s['phase']=='C' for s in completed): raise ValueError('invalid KB readiness')
     fcount=sum(s['phase']=='F' for s in completed)
     if (payload['fisher'] is None)!=(fcount==0) or (payload['fisher'] is not None and payload['fisher'].completed_compressions!=fcount):
         raise ValueError('Fisher stage counter mismatch')
-    required_final={'final_test','final_policy','final_sidecar','final_metadata','final_metadata_sidecar'}
+    required_final={'final_policy','final_sidecar','final_metadata','final_metadata_sidecar','stage_index','stage_index_sidecar'}
     if payload['finalized'] and not required_final<=set(payload['references']):
         raise ValueError('finalized checkpoint is missing final artifacts')
     if payload['teacher_identity']['maze']!=MazeTeacher().source_snapshot_id:
@@ -178,18 +193,23 @@ def load_boundary(latest,config,seed):
     if descriptor.read_bytes()!=MazeTeacher().descriptor_bytes(): raise ValueError('Maze descriptor/source mismatch')
     if payload['teacher_identity']['fourrooms']!=payload['references']['fourrooms_teacher']['sha256'] or payload['data_hash']!=payload['references']['manifest']['sha256']:
         raise ValueError('teacher/data identity mismatch')
-    for ref in payload['active_snapshots'].values(): verify_reference(root,ref)
-    for key,item in payload['evaluations'].items():
-        report_path=verify_reference(root,item['reference'])
-        report=json.loads(report_path.read_text(encoding='utf-8'))
-        expected_policy='active' if key in pkeys else 'kb'
-        if report.get('stage')!=key or report.get('policy_type')!=expected_policy or report.get('split')!='validation' or set(report.get('tasks',{}))!=set(config.task_order):
-            raise ValueError('evaluation identity/task mismatch')
-        for task,metrics in report['tasks'].items():
-            if metrics.get('ticks')!=config.ctm.ticks_by_task.for_task(task) or metrics.get('memory_ticks')!=config.ctm.memory_length:
-                raise ValueError('evaluation execution budget mismatch')
-            expected_count=config.evaluation.validation_episodes
-            if metrics.get('episodes')!=expected_count or len(metrics.get('results',[]))!=expected_count:
-                raise ValueError('incomplete evaluation panel')
-    for ref in payload['visit_reports'].values(): verify_reference(root,ref)
+    for stage in completed:
+        key=stage['key']; path=verify_reference(root,payload['stage_snapshots'][key])
+        # References seal both weights and identity metadata. Every phase must be independently deployable.
+        for suffix,name in [('.sha256.json','sidecar'),('.metadata.json','metadata'),('.metadata.json.sha256.json','metadata_sidecar')]:
+            ref=payload['references'].get(key+'/'+name)
+            if ref is None or verify_reference(root,ref)!=Path(str(path)+suffix):
+                raise ValueError('missing/mismatched stage snapshot metadata')
+        metadata=json.loads(Path(str(path)+'.metadata.json').read_text(encoding='utf-8'))
+        expected_identity={k:stage[k] for k in ('visit','task','phase')}
+        expected_identity.update(stage=key,policy_type='active' if stage['phase']=='P' else 'kb',
+                                 stage_counters=payload['stage_counters'][key],manifest=payload['references']['manifest'])
+        if any(metadata.get(k)!=v for k,v in expected_identity.items()) or (path.parent/metadata['run_root']).resolve()!=root:
+            raise ValueError('stage snapshot identity mismatch')
+    if payload['finalized']:
+        index,index_root=load_stage_index(verify_reference(root,payload['references']['stage_index']))
+        expected_index=[{**s,'policy_type':'active' if s['phase']=='P' else 'kb',
+                         'counters':payload['stage_counters'][s['key']],'reference':payload['stage_snapshots'][s['key']]} for s in stages]
+        if index_root!=root or index['config_hash']!=payload['config_hash'] or index['manifest']!=payload['references']['manifest'] or index['stages']!=expected_index:
+            raise ValueError('final stage index mismatch')
     return payload,root

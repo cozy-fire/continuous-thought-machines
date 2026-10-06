@@ -10,10 +10,11 @@ from .checkpoint import atomic_json,isolated_rng
 from .teachers import MazeTeacher,FourRoomsTeacher
 
 
-def visualize(checkpoint,policy_type,task,panel_index,output_dir,split='validation',device='cpu',active_key=None,teacher_diagnostics=False):
+def visualize(checkpoint,policy_type,task,panel_index,output_dir,split='validation',device='cpu',stage_key=None,teacher_diagnostics=False):
     output=Path(output_dir).resolve()
     if output.exists(): raise FileExistsError(output)
-    policy,config,manifest,root=load_for_evaluation(checkpoint,policy_type,device,active_key)
+    identity={}
+    policy,config,manifest,root=load_for_evaluation(checkpoint,policy_type,device,stage_key,identity=identity)
     specs=panels(config,manifest,task,split)
     if not 0<=panel_index<len(specs): raise ValueError('panel-index outside fixed panel')
     if teacher_diagnostics and policy_type!='active': raise ValueError('P teaching diagnostics require an Active policy')
@@ -63,7 +64,7 @@ def visualize(checkpoint,policy_type,task,panel_index,output_dir,split='validati
             with Image.open(output/'reward.png') as media: media.verify()
             atomic_json(output/'trajectory.json',{'task':task,'split':split,'panel_index':panel_index,'checkpoint':str(Path(checkpoint).resolve()),
                         'ticks':config.ctm.ticks_by_task.for_task(task),'memory_ticks':config.ctm.memory_length,
-                        'policy_type':policy_type,'active_key':active_key,'teacher_diagnostics':teacher_diagnostics,
+                        'policy_type':policy_type,'stage_key':identity['stage'],'snapshot':identity['checkpoint'],'teacher_diagnostics':teacher_diagnostics,
                         'frames':len(frames),'actions':len(rows),'success':bool(info['success']),'return':total,'rows':rows})
         finally: env.close()
     return output
@@ -72,11 +73,11 @@ def visualize(checkpoint,policy_type,task,panel_index,output_dir,split='validati
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint',required=True); parser.add_argument('--policy',choices=['kb','active'],default='kb')
-    parser.add_argument('--active-key'); parser.add_argument('--task',choices=['maze_medium','fourrooms'],required=True)
+    parser.add_argument('--stage-key'); parser.add_argument('--task',choices=['maze_medium','fourrooms'],required=True)
     parser.add_argument('--panel-index',type=int,required=True); parser.add_argument('--split',choices=['validation','test'],default='validation')
     parser.add_argument('--device',default='cpu'); parser.add_argument('--output-dir',required=True); parser.add_argument('--teacher-diagnostics',action='store_true')
     args=parser.parse_args(); torch.set_num_threads(2)
-    visualize(args.checkpoint,args.policy,args.task,args.panel_index,args.output_dir,args.split,args.device,args.active_key,args.teacher_diagnostics)
+    visualize(args.checkpoint,args.policy,args.task,args.panel_index,args.output_dir,args.split,args.device,args.stage_key,args.teacher_diagnostics)
 
 
 if __name__=='__main__': main()

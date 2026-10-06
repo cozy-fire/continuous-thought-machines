@@ -38,7 +38,7 @@ python -m tasks.continual_nav_opd.verify_smoke --device cuda:0 --output-dir scie
 python -m tasks.continual_nav_opd.profile_training --device cuda:0 --num-envs 2 --microbatch 8 --minibatches 1 --output-dir scientific-evidence/continual_nav_opd/new_profile
 ```
 
-验收入口真实运行两个 visits，首个Maze池后模拟中断并恢复、首个P后停止并恢复，检查全部12阶段、最多3152决策、18更新、完整Fisher、8份双任务validation、2份visit报告、final test、最终权重。检查 finalized 恢复不改写产物，实测 serial/subprocess 的逐episode结果，渲染两个 v0 Active 的配套旧 KB。保存环境、源码、配置、SHA清单和报告；失败非零退出，不发布通过。
+验收入口先真实运行两个 visits：首池及首 P 后中断恢复，核验12阶段、最多3152决策、18更新、完整Fisher、12份阶段权重及最终权重/索引，确认训练没有评估事件或目录。训练 finalized 后才单独评估全部阶段、比较最终 KB 的 serial/subprocess 逐episode结果、渲染两个 v0 Active，并核验整个训练目录 SHA 未变化。默认训练 CLI 同样在 finalized 后调用独立评估进程；工程验收另外比较后端和媒体，不在正式启动时重复这些检查。
 
 性能入口不运行正式预算；每任务 P/C 各2个完整窗口，F按smoke的32步/8样本测量。参数 `--num-envs`、`--minibatches`、`--microbatch` 必须满足配置校验。报告包含真实教师、环境、视觉前向、CTM tick、视觉反向、整段反向/优化器及Fisher计时、启动和首窗口开销、allocated/reserved显存。诊断同步及反向hook会增加开销，嵌套计时不能直接相加。CTM/Actor/状态图的反向残差包含未单独计时操作，不能称为纯CTM反向。吞吐不能仅根据显存占用判断。
 
@@ -48,21 +48,28 @@ python -m tasks.continual_nav_opd.profile_training --device cuda:0 --num-envs 2 
 PYTHONNOUSERSITE=1 python -u -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/remote_config.yaml --seed 0 --run-dir runs/continual_nav_opd/seed0_first_formal --resume --wandb-mode online
 ```
 
-只恢复 `checkpoints/latest.json` 指向的已提交Maze池/其他阶段边界。配置、方法/schema/时序协议、受检源码、seed、教师、地图和引用文件必须匹配。Maze P 每池保存完整Dual/Adam/课程计数及全部RNG，恢复已完成前缀、重做未完成池；末池已保存但P评估中断时只重做评估。FourRooms和C/F仍重做未提交阶段及评估，不恢复窗口。不能修改预算或源码后强行续训。最终 F 已提交但 finalization 中断时，只重做 finalization；已 finalized 不重复 test。
+只恢复 `checkpoints/latest.json` 指向的已提交Maze池/其他阶段边界。配置、方法/schema/时序协议、受检源码、seed、教师、地图和引用文件必须匹配。边界类型为 `v4_training_boundary`，旧评估耦合边界不迁移。Maze P 每池保存 Dual/Adam/课程计数及 RNG，重做未完成池；末池已保存但权重导出中断时恢复完整 P 后重新导出。FourRooms和C/F重做未提交阶段，不恢复窗口。最终 F 已提交但 finalization 中断时，只重做导出，不加载全地图；已 finalized 不改写产物。
 
 跨机器复制完整run及配套地图，保留引用相对路径，并核验文件数、大小和SHA。只有推理时可使用完整 `.pt` 加 `.sha256.json`、`.metadata.json`、metadata侧车及其引用地图manifest；单独一个 `.pt` 不构成可校验部署产物。Active保存完整旧KB、独立视觉和Adapter，不得改接后来的KB。
 
 ## 评估与行为查看
 
-每个 P 后评估完整Active，每个C后评估KB，均用两个任务各200固定validation episode。F后visit汇总复用结果，不重跑；最终KB独立test每任务200集。评估环境步另计。
+训练阶段内不评估，只保存可独立推理的权重。`snapshots/` 保存 P 的完整 Active/旧KB/Adapter 和每个 C/F 的当时 KB；`exports/stages.json` 索引全部12阶段，`exports/final.pt` 保存最终 KB。默认 `train` 在全部训练 finalized 后调用独立 `evaluate_stages`：12份阶段权重各在两任务做 validation，随后最终 KB 在两任务做 test。正式配置每任务各200固定 episode；预算和面板没有改变。默认评估输出为同级 `<run-dir>_evaluation`，`--evaluation-dir` 可指定 run 之外的目录。`--skip-evaluation` 只训练，之后在本地用同一独立入口评估。`--max-stages` 停在未完成训练时不评估。
+
+评估失败不撤销训练 finalized。独立入口核验计划、权重、metadata 和结果 SHA，重试时跳过已完成且匹配的报告。成功后生成 `summary.json`；失败记录 `status.json` 的当前报告与错误。默认训练命令会传播评估失败的退出码，训练成功与评估成功须分别检查。已 finalized 的训练 resume 不改写训练产物，但默认会继续未完成的评估；只检查训练恢复时传 `--skip-evaluation`。
 
 ```bash
-python -m tasks.continual_nav_opd.evaluate --checkpoint <run>/checkpoints/latest.json --policy kb --split test --backend subprocess --num-envs 16 --device cuda:0 --output <new-report.json>
-python -m tasks.continual_nav_opd.visualize --checkpoint <run>/checkpoints/latest.json --policy active --active-key pnc/v0/maze_medium/P --task maze_medium --panel-index 0 --device cuda:0 --teacher-diagnostics --output-dir <new-media-dir>
+python -m tasks.continual_nav_opd.evaluate_stages --stage-index <local-run>/exports/stages.json --output-dir <local-run>_evaluation --device cuda:0
+```
+
+```bash
+python -m tasks.continual_nav_opd.evaluate --checkpoint <local-run>/exports/stages.json --policy kb --stage-key pnc/v0/maze_medium/C --split validation --backend subprocess --num-envs 16 --device cuda:0 --output <new-stage-report.json>
+python -m tasks.continual_nav_opd.evaluate --checkpoint <local-run>/exports/final.pt --policy kb --split test --backend subprocess --num-envs 16 --device cuda:0 --output <new-final-report.json>
+python -m tasks.continual_nav_opd.visualize --checkpoint <local-run>/exports/stages.json --policy active --stage-key pnc/v0/maze_medium/P --task maze_medium --panel-index 0 --device cuda:0 --teacher-diagnostics --output-dir <new-media-dir>
 python -m tasks.continual_nav_opd.visualize --checkpoint <run>/exports/final.pt --policy kb --task fourrooms --panel-index 0 --device cuda:0 --output-dir <another-new-media-dir>
 ```
 
-输出目录/报告必须不存在。全局图仅展示，不进入学生输入。`steps.csv`与`trajectory.json`记录每步动作/reward，`behavior.gif`含初始帧，`reward.png`表示同一轨迹。
+输出目录/报告必须不存在。阶段索引和直接推理权重不要求训练源码哈希或恢复 checkpoint；复制权重、全部侧车、manifest 并保持相对布局，本地须有对应地图。`--policy active` 用于 P，`--policy kb` 用于 C/F；`--stage-key` 通用选择阶段，评估 JSON 保存真实权重 SHA。不加载教师做普通固定面板评估。全局图仅展示，不进入学生输入，GIF/CSV/reward 对应同一轨迹。
 
 ## 异常诊断与边界
 

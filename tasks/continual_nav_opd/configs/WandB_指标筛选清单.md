@@ -1,5 +1,7 @@
 # 当前 W&B 指标筛选清单
 
+> 2026-10-05：P/C/F训练期间不执行 validation/test，默认命令在全部训练完成后独立评估；以下白名单中的评估行仅解释历史日志，当前训练不会产生这些曲线。各阶段通过保存的 P/C/F 权重在本地独立评估，输出 JSON。Maze P 只记录整体/逐步 KL 等训练指标，不计算 `agreement`；FourRooms P 和 C 保留训练一致率。
+
 ## 已执行的最终筛选（2026-10-01）
 
 本节为当前 W&B 上传契约；后文原始清单仅作为字段解释，已被本节白名单覆盖。其他字段仍记录在本地 JSONL，不再上传 W&B。
@@ -12,7 +14,7 @@
 | P/C 行为 | `episode_mean_return` | 该区间结束的完整 episode 的 return 均值，含成功和超时 |
 | P/C 行为 | `episode_success_rate` | 该区间成功结束 episode 数 / 该区间全部结束 episode 数 |
 | P/C/F 进度 | `global_env_steps`、`stage_env_steps` | 保持原训练预算口径；F 只上传这两项 |
-| validation / final test | `episodes`、`success_rate`、`mean_return`、`mean_length`、`environment_steps`、`action_counts/0`…`/4`、`displacement_rate`、`turn_rate`、`evaluation_seconds`、`global_env_steps` | 原评估指标全部保留；不改为区间语义 |
+| validation / final test | 本地独立评估 JSON，保留成功率、return、length、每集轨迹摘要和阶段权重 SHA | 训练不执行、不上传；历史曲线不删除 |
 
 区间是配置 `logging.interval_windows` 对应的连续 rollout 区间，阶段尾不足间隔也发布。完整 episode 归入其结束时所在区间；其 return 可包含此前区间的奖励，未结束 episode 不参与均值。没有 episode 结束时，两条 episode 指标为本地 null，W&B 不上传该点，不能理解为成功率 0。每阶段环境 reset 并重新建立统计，不跨阶段保留未结束轨迹。C 的行为属于冻结双列教师。
 

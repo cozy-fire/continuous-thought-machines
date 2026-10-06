@@ -65,23 +65,14 @@ def audit_run(root: Path, config, seed: int) -> dict:
                 raise ValueError('first-step teaching or final target count is wrong')
             if windows[-1]['optimizer_updates'] != (stage.optimizer_updates or (3 if stage.phase == 'P' else 2)):
                 raise ValueError('unexpected stage optimizer count')
-    reports = {}
-    for key, entry in payload['evaluations'].items():
-        report = json.loads(verify_reference(root, entry['reference']).read_text(encoding='utf-8'))
-        if set(report['tasks']) != set(config.task_order):
-            raise ValueError('incomplete task panel')
-        for task, metrics in report['tasks'].items():
-            if metrics.get('ticks') != config.ctm.ticks_by_task.for_task(task) or metrics.get('memory_ticks') != 40:
-                raise ValueError('evaluation execution budget is wrong')
-            if len(metrics['results']) != config.evaluation.validation_episodes:
-                raise ValueError('incomplete episode panel')
-        reports[key] = {task: value['success_rate'] for task, value in report['tasks'].items()}
-    if len(reports) != 8 or len(payload['visit_reports']) != 2:
-        raise ValueError('incorrect evaluation schedule')
+    if (root/'evaluation').exists() or {'evaluations','visit_reports'} & set(payload) or any(
+            e['event'] in ('evaluation','final_test') or e.get('split') in ('validation','test') for e in events):
+        raise ValueError('training must not run evaluation')
+    if len(payload['stage_snapshots'])!=len(stages): raise ValueError('missing stage inference weights')
     policy, _, _, _ = load_for_evaluation(root/'exports/final.pt', device=config.training.device)
     if set(payload['fisher'].importance) != set(dict(policy.named_parameters())):
         raise ValueError('Fisher does not cover the complete model')
-    return {'stages': 12, 'transitions': actual, 'updates': expected_updates, 'validation': reports,
+    return {'stages': 12, 'transitions': actual, 'updates': expected_updates, 'stage_snapshots':12,'evaluations_in_training':0,
             'ticks_by_task': asdict(config.ctm.ticks_by_task),
             'memory_ticks': config.ctm.memory_length,
             'fisher_parameters': len(payload['fisher'].importance), 'finalized': True}
@@ -109,7 +100,7 @@ def verify(output_dir, device='cuda:0', seed=0, compile_mode='disabled'):
         def capture_peak():
             if device.startswith('cuda'):
                 peaks.append((torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)))
-        # Exercise a REAL P boundary resume. Already committed P/evaluation must not run again.
+        # Exercise a REAL P boundary resume. Already committed pools/stages must not run again.
         class PoolInterruption(RuntimeError): pass
         def stop_after_pool(point,stage):
             if point=='pool_complete': raise PoolInterruption('intentional pool-boundary power loss')
@@ -130,19 +121,34 @@ def verify(output_dir, device='cuda:0', seed=0, compile_mode='disabled'):
         run(config, seed, root/'run', resume=True)
         if before != file_inventory(root/'run'):
             raise ValueError('finalized resume rewrote committed artifacts')
+        training_seconds=time.perf_counter()-start
+        # Local evaluation is a separate invocation after training has finalized. Never writes into run.
+        offline=root/'offline_evaluation'; offline.mkdir()
+        stage_reports={}
+        for stage_index,stage in enumerate(expand_stages(config)):
+            identity={}
+            kind='active' if stage.phase=='P' else 'kb'
+            snapshot,_,manifest,_=load_for_evaluation(root/'run/exports/stages.json',kind,device,stage.key,identity=identity)
+            evaluation=evaluate_policy(snapshot,config,manifest,identity=identity,backend='serial')
+            if any(m['episodes']!=config.evaluation.validation_episodes for m in evaluation['tasks'].values()):
+                raise ValueError('incomplete offline panel')
+            name=f'{stage_index:03d}.json'
+            atomic_json(offline/name,evaluation)
+            stage_reports[stage.key]={task:m['success_rate'] for task,m in evaluation['tasks'].items()}
+            del snapshot
         policy, _, manifest, _ = load_for_evaluation(root/'run/exports/final.pt', device=device)
-        serial = evaluate_policy(policy, config, manifest, backend='serial')
-        parallel = evaluate_policy(policy, config, manifest, backend='subprocess')
+        serial = evaluate_policy(policy, config, manifest, split='test',backend='serial')
+        parallel = evaluate_policy(policy, config, manifest, split='test',backend='subprocess')
         for task in config.task_order:
             if serial['tasks'][task]['results'] != parallel['tasks'][task]['results']:
                 raise ValueError('serial/subprocess argmax episode divergence; inspect separately')
-        atomic_json(root/'serial.json', serial)
-        atomic_json(root/'subprocess.json', parallel)
+        atomic_json(offline/'serial.json', serial)
+        atomic_json(offline/'subprocess.json', parallel)
         for task in config.task_order:
             destination = root/f'visualization_{task}'
             key = f'pnc/v0/{task}/P'
-            visualize(root/'run/checkpoints/latest.json', 'active', task, 0, destination,
-                      device=device, active_key=key, teacher_diagnostics=True)
+            visualize(root/'run/exports/stages.json', 'active', task, 0, destination,
+                      device=device, stage_key=key, teacher_diagnostics=True)
             rows = list(csv.DictReader((destination/'steps.csv').open(encoding='utf-8', newline='')))
             trajectory = json.loads((destination/'trajectory.json').read_text(encoding='utf-8'))
             with Image.open(destination/'behavior.gif') as image:
@@ -152,9 +158,11 @@ def verify(output_dir, device='cuda:0', seed=0, compile_mode='disabled'):
             with Image.open(destination/'reward.png') as image:
                 image.verify()
         capture_peak()
+        if before!=file_inventory(root/'run'): raise ValueError('offline evaluation changed training artifacts')
         # run() resets CUDA peak counters on every resume, including a finalized no-op.
         # Preserve each real training segment's peaks BEFORE testing idempotent resume.
-        report.update(status='passed', elapsed_seconds=time.perf_counter()-start,
+        report.update(status='passed', elapsed_seconds=time.perf_counter()-start,training_seconds=training_seconds,
+                      offline_validation=stage_reports,offline_evaluation_preserved_training=True,
                       peak_allocated_bytes=max(p[0] for p in peaks) if peaks else None,
                       peak_reserved_bytes=max(p[1] for p in peaks) if peaks else None,
                       limits='Engineering smoke only; no learning-success or RTX5090 throughput claim. W&B online not tested.')

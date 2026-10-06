@@ -1,5 +1,7 @@
 # v4 OPD：W&B 路径与指标速查表
 
+> 2026-10-05：训练与评估已分离。P/C/F 训练只保存权重、恢复状态和训练指标，训练期间不运行阶段 validation 或最终 test，也不上传对应评估曲线。默认训练命令在全部训练完成后启动独立评估进程，结果写入 run 之外的 JSON。下文评估路径为历史字段说明；当前独立本地评估写 JSON 并记录阶段权重 SHA，不调用训练 W&B logger。Maze P 不计算动作一致率；FourRooms P/C 的训练一致率仍保留。
+
 > 2026-10-01 更新：本文后续为原完整事件字段的详细说明，不再表示全部上传 W&B。当前上传白名单和新增区间行为指标以同目录 `WandB_指标筛选清单.md` 的“已执行的最终筛选”为准。本地完整事件字段仍保留。W&B 不再上传元数据图、累计动作次数/奖励/成功数量及性能图；validation/final test 的原评估指标全部保留。
 
 记录日期：2026-09-30。依据提交 `ae0e3e7` 的实际日志实现；后续日志代码改变时应同步修订本表。本表描述字段语义，不将 smoke 结果视为正式训练效果证明。
@@ -203,6 +205,6 @@ Logger 当前把所有顶层数字都上传为标量，把字符串也上传为�
 
 ## Maze P课程字段
 
-主横轴为累计`global_optimizer_updates`；环境决策数按终止mask实际计数。`pool_maps`/`pool_index`识别当前嵌套池，`pool_optimizer_updates`为池内已完成更新，`optimizer_updates`为该P累计更新。`update_valid_decisions`为本次100序列的有效动作数（100至500），`eligible_target_steps`为P累计有效数。`step_kl`/`step_valid_decisions`按1至5决策分别记录，空时间步的KL为null。`kl`为本次更新有效决策均值，阶段完成统计为整个P有效决策加权均值。Maze P 不计算整体或逐步动作一致率；地图池边界只保存checkpoint，没有独立评估前向。闭环固定面板仍在完整P/C阶段末及最终test执行。
+主横轴为累计`global_optimizer_updates`；环境决策数按终止mask实际计数。`pool_maps`/`pool_index`识别当前嵌套池，`pool_optimizer_updates`为池内已完成更新，`optimizer_updates`为该P累计更新。`update_valid_decisions`为本次100序列的有效动作数（100至500），`eligible_target_steps`为P累计有效数。`step_kl`/`step_valid_decisions`按1至5决策分别记录，空时间步的KL为null。`kl`为本次更新有效决策均值，阶段完成统计为整个P有效决策加权均值。Maze P 不计算整体或逐步动作一致率；地图池边界只保存checkpoint，没有独立评估前向。闭环固定面板在全部训练完成后，由独立评估进程加载各阶段权重执行 validation 和最终 KB test。
 
 `initial_window_grad_norm`、`visual_grad_norm`和`grad_norm`为归一化后、裁剪前范数。`collect_seconds`/`replay_seconds`是本次完成更新的墙钟区间；后者含重放反向、裁剪和Adam。`state_table_bytes`、`map_cache.cache_bytes`、`maze_state_table.total_cache_bytes`为实际数组占用，单列CPU/GPU过程内存不能直接据此推断吞吐。训练序列目标到达数不是固定起点完整episode成功率。

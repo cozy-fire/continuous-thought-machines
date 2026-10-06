@@ -79,11 +79,11 @@ Maze P 使用 `data/maze_curriculum.py` 和 `learning/maze_progress.py`，不使
 
 每组有效决策 one-hot CE 求和并反传；CE 等于教师 one-hot 到学生的 KL。全部组结束后按整个更新的有效决策总数归一化梯度，检查有限值、clip0.5，Adam 一次。没有策略梯度、reward Loss 或熵正则。池扩增不重建 Active、Adapter 或 Adam。新 visit 的 P 仍按原规则从当前 KB 新建 Dual、Active/Adam 与侧向连接。
 
-每个 run 一次加载全部 50000 张 19×19 RGB 原图，数组只读、P/C/F/评估共享。P 的紧凑表仅包含训练前缀：int32 状态/转移索引、标签、距离、终止标志；不保存数百万 Python 状态字典，也不缓存全部状态的 84×84 图片。每张地图从 goal 反向 BFS，按上/下/左/右选最短动作，动态批量渲染的 nearest 缩放与原 PIL 逐像素一致。五个时间步依次推进，独立序列批量并行，无逐序列进程或异步旧策略采样。
+每个 run 一次加载全部 50000 张 19×19 RGB 原图，数组只读、P/C/F 共享；独立本地评估另行加载对应面板。P 的紧凑表仅包含训练前缀：int32 状态/转移索引、标签、距离、终止标志；不保存数百万 Python 状态字典，也不缓存全部状态的 84×84 图片。每张地图从 goal 反向 BFS，按上/下/左/右选最短动作，动态批量渲染的 nearest 缩放与原 PIL 逐像素一致。五个时间步依次推进，独立序列批量并行，无逐序列进程或异步旧策略采样。
 
 FourRooms 保留 `ProgressCollector` / `run_progress` / `update_window`：50 新观察/窗口，保存 detached 当前 rollout 起点，跨窗口继续状态，真实 episode 边界 reset。学生概率采样，教师连续窗口、软 KL、预算和 minibatch 设置保持原状。Maze C/F 使用原教师与原窗口路径。
 
-Maze 日志包含地图池、池内/P 累计 Adam 更新、有效决策数、整体与逐步 KL、初始窗口/视觉梯度、采集/重放耗时和缓存字节数。Maze P 不计算或记录动作一致率，地图池边界只提交 checkpoint，不额外运行评估。Maze P 图表主轴为 `global_optimizer_updates`；闭环成功率仍使用完整 P/C 阶段末固定面板评估，KL 不证明完整 rollout 成功。
+Maze 日志包含地图池、池内/P 累计 Adam 更新、有效决策数、整体与逐步 KL、初始窗口/视觉梯度、采集/重放耗时和缓存字节数。Maze P 不计算或记录动作一致率，地图池边界只提交 checkpoint。整个训练流程不运行 validation/test，闭环成功率后续用阶段权重在本地评估。Maze P 图表主轴为 `global_optimizer_updates`；KL 不证明完整 rollout 成功。
 
 ```powershell
 python -m unittest tests.continual_nav_opd.test_maze_curriculum -v
@@ -118,28 +118,36 @@ python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs
 python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs/smoke.yaml --device cuda:0 --seed 0 --run-dir scientific-evidence/continual_nav_opd/new_smoke --wandb-mode disabled --resume
 ```
 
-`--max-stages N` 只在完整阶段提交后停止，适合检查边界恢复。`--device` 是显式配置覆盖，进入配置哈希；恢复必须保持一致。各训练槽同步 step；评估支持 `serial` 或显式 `spawn` 的 `subprocess`，仅环境进入 worker，模型和完整双列状态始终在主进程。
+`--max-stages N` 只在完整阶段提交后停止，未完成全部训练时不触发评估。`--device` 是显式配置覆盖，进入配置哈希；恢复必须保持一致。各训练槽同步 step；评估支持 `serial` 或显式 `spawn` 的 `subprocess`，仅环境进入 worker，模型和完整双列状态始终在主进程。
 
-P 结束评估完整 Active，C 结束评估 KB，两者均覆盖两任务；评估不改训练模式、参数或 RNG。F 不额外评估。visit 报告引用已完成结果；KB 遗忘记录不混入 Active。最终 F 完成后执行 KB 独立 test，再导出 `exports/final.pt` 并标记 `finalized`。评估步独立统计，不加入训练预算。
+Runner 只执行 P→C→F。每个 P 保存完整 Active 双列推理快照，每个 C/F 保存该阶段的独立 KB 快照，共 12 份；F 不更新权重，但仍保存明确的阶段产物。最后 F 提交后导出 `exports/final.pt` 和带 SHA 的 `exports/stages.json` 权重索引，随后标记 `finalized`。训练中不运行评估。默认 `train` 命令在全部训练 finalized 后启动独立评估进程：依次对12份阶段权重执行两任务 validation，再对最终 KB 执行 test。默认输出位于同级 `<run-dir>_evaluation`，可用 `--evaluation-dir` 指定；`--skip-evaluation` 只训练和导出。评估不写训练目录或训练 W&B，恢复 checkpoint、教师/地图身份和训练日志仍保留。
 
-每阶段必须完成训练和必要评估，随后原子写 `.pt`、`.complete.json`，最后更新 `checkpoints/latest.json`。恢复检查完整配置、源码、算法教师、复制到 run 内的 FourRooms 权重、地图 manifest、引用文件的 SHA／大小、预算／更新计数和时序协议。P 的完整快照包含当时旧 KB、两套 Encoder、Actor 和 Adapter；恢复不改接新 KB。缺失或损坏的文件、旧 schema、旧序列协议都拒绝。
-
-每个 Maze 池完成后原子保存完整 Dual、Adam、下一个池索引、有效决策/更新计数和全部 Python/NumPy/Torch/CPU/CUDA/采样 RNG。latest 最后更新。中断重做未完成池，已完成池不重复训练；P 全部完成并评估后才发布 C 的 Active 快照。FourRooms 与 C/F 仍不做窗口或 Adam 中途恢复，未提交阶段完整重做；残留文件用独立 attempt 标识隔离，未提交评估不进入汇总。最后 F 已提交但 test 中断时，只重做 finalization；已 finalized 的 resume 不重复 test。`events.jsonl` 可含被中断 attempt，确认已提交进度以 `latest.json` 和 complete marker 为准。
-
-本地事件与 W&B 使用相同加权口径，W&B 名空间区分阶段、任务、策略、Active 来源、评估任务和 split。记录 KL、一致率、熵、EWC 分项、梯度、动作、真实 reward、FourRooms 位移／转向率、采集／学习／Fisher／评估耗时和显存。`disabled` 不导入 W&B、不要求登录；`online` 使用已登录环境，不在文件中保存凭据。
+独立评估入口也可在本地调用或重试；匹配本次计划且 SHA/身份/面板数量验证通过的已完成报告会跳过，不重跑训练。评估失败时命令返回失败，训练仍保持 finalized；优先独立重试评估，不必调用训练 resume。
 
 ```powershell
-python -m tasks.continual_nav_opd.evaluate --checkpoint scientific-evidence/continual_nav_opd/new_smoke/checkpoints/latest.json --policy kb --split validation --tasks maze_medium fourrooms --backend serial --num-envs 2 --device cuda:0 --output scientific-evidence/continual_nav_opd/new_eval.json
-python -m tasks.continual_nav_opd.evaluate --checkpoint scientific-evidence/continual_nav_opd/new_smoke/checkpoints/latest.json --policy active --active-key pnc/v0/maze_medium/P --split validation --device cuda:0 --output scientific-evidence/continual_nav_opd/new_active_eval.json
-python -m tasks.continual_nav_opd.visualize --checkpoint scientific-evidence/continual_nav_opd/new_smoke/exports/final.pt --policy kb --task fourrooms --panel-index 0 --device cuda:0 --output-dir scientific-evidence/continual_nav_opd/new_visualization
-python -m tasks.continual_nav_opd.visualize --checkpoint scientific-evidence/continual_nav_opd/new_smoke/checkpoints/latest.json --policy active --active-key pnc/v0/maze_medium/P --task maze_medium --panel-index 0 --teacher-diagnostics --device cuda:0 --output-dir scientific-evidence/continual_nav_opd/new_teaching_visualization
+python -m tasks.continual_nav_opd.evaluate_stages --stage-index <local-run>/exports/stages.json --output-dir <local-run>_evaluation --device cuda:0
+# To defer evaluation to another machine, append --skip-evaluation to the train command.
 ```
 
-独立评估输出必须不存在。读取推理 `.pt` 时需要其 SHA 侧车、metadata 及 metadata 侧车，以及 metadata 引用的地图 manifest。`--policy active` 拒绝单列权重。可视化的全局地图只用于展示，推理仍使用局部／规定 RGB；输出 `behavior.gif`、`steps.csv`、`reward.png` 和 `trajectory.json`，包含动作、每步 reward、累计 reward、终止信息。GIF 含初始帧，帧数必须为动作数＋1。只有显式 `--teacher-diagnostics` 的 Active 展示查询专一教师；纯 KB 部署不伪造教学目标。
+每阶段完成训练并保存带身份和 SHA 的推理权重后，原子写恢复 `.pt`、`.complete.json`，最后更新 `checkpoints/latest.json`。恢复检查完整配置、源码、教师、地图 manifest、全部阶段权重与 metadata 的 SHA／大小、预算／更新计数和时序协议。新边界身份为 `v4_training_boundary`，旧依赖评估的 `v4_stage_boundary` 不迁移。P 的快照保存当时旧 KB、两套 Encoder、Actor 和 Adapter；C/F 快照保存当时 KB，评估不会改接后来的权重。
+
+每个 Maze 池完成后原子保存完整 Dual、Adam、下一个池索引、有效决策/更新计数和全部 RNG。latest 最后更新。中断重做未完成池，已完成池不重复训练；完整 P 保存推理快照后发布给 C。FourRooms 与 C/F 仍不做窗口或 Adam 中途恢复，未提交阶段完整重做；残留文件用独立 attempt 隔离，以已提交快照列表为准。最后 F 已提交但导出中断时，只重做 finalization，不加载全地图或重做 F；已 finalized 的 resume 不改写产物。进度以 `latest.json` 和 complete marker 为准。
+
+训练事件与 W&B 保留 KL、FourRooms P/C 一致率、熵、EWC、梯度、动作、训练 reward、FourRooms 位移／转向率、采集／学习／Fisher 耗时和显存；这些训练统计不构成固定面板评估。`disabled` 不导入 W&B；`online` 使用已登录环境，不保存凭据。独立评估只写指定的新 JSON，保留两任务固定面板、argmax、连续窗口及 serial/subprocess 后端，不改权重或 RNG。
+
+```powershell
+python -m tasks.continual_nav_opd.evaluate --checkpoint scientific-evidence/continual_nav_opd/new_smoke/exports/stages.json --policy kb --stage-key pnc/v0/maze_medium/C --split validation --tasks maze_medium fourrooms --backend serial --num-envs 2 --device cuda:0 --output scientific-evidence/continual_nav_opd/new_eval.json
+python -m tasks.continual_nav_opd.evaluate --checkpoint scientific-evidence/continual_nav_opd/new_smoke/exports/stages.json --policy active --stage-key pnc/v0/maze_medium/P --split validation --device cuda:0 --output scientific-evidence/continual_nav_opd/new_active_eval.json
+python -m tasks.continual_nav_opd.evaluate --checkpoint scientific-evidence/continual_nav_opd/new_smoke/exports/final.pt --policy kb --split test --device cuda:0 --output scientific-evidence/continual_nav_opd/new_final_test.json
+python -m tasks.continual_nav_opd.visualize --checkpoint scientific-evidence/continual_nav_opd/new_smoke/exports/final.pt --policy kb --task fourrooms --panel-index 0 --device cuda:0 --output-dir scientific-evidence/continual_nav_opd/new_visualization
+python -m tasks.continual_nav_opd.visualize --checkpoint scientific-evidence/continual_nav_opd/new_smoke/exports/stages.json --policy active --stage-key pnc/v0/maze_medium/P --task maze_medium --panel-index 0 --teacher-diagnostics --device cuda:0 --output-dir scientific-evidence/continual_nav_opd/new_teaching_visualization
+```
+
+独立单报告评估输出必须不存在。`--stage-key` 可选择任意 P/C/F；索引由训练完成时生成，也可直接传阶段 `.pt`。`.pt` 需携带 SHA 侧车、metadata 及其侧车、引用的地图 manifest。索引或直接权重加载不依赖恢复 checkpoint、训练源码哈希、教师权重或 W&B，可复制到本地评估；保持相对布局和地图路径。评估 JSON 记录阶段身份与真实权重 SHA。`latest.json` 仍受严格续训源码校验，未完成 run 可直接使用已提交阶段 `.pt`。`--policy active` 拒绝单列权重。可视化仍用局部 RGB，输出 GIF/CSV/reward/trajectory；只有显式 Active `--teacher-diagnostics` 才加载教师。
 
 ## 07：集成验收与性能交接
 
-`python -m tasks.continual_nav_opd.verify_smoke --device cuda:0 --output-dir <新目录>` 实际运行两任务、两 visits 的12阶段，包含首个Maze池中断恢复、首P边界恢复、最终幂等恢复、完整产物校验、serial/subprocess对照和两任务Active媒体核验。独立单元测试仍需另行执行。
+`python -m tasks.continual_nav_opd.verify_smoke --device cuda:0 --output-dir <新目录>` 先运行两任务、两 visits 的12阶段，核验零训练评估、阶段权重与恢复；完成后独立评估全部阶段，比较最终 KB serial/subprocess，检查两任务 Active 媒体。离线评估前后训练目录 SHA 必须一致。独立单元测试仍需另行执行。最新验证见 [训练/评估分离验收](VERIFICATION_TRAINING_ONLY.md)。
 
 `python -m tasks.continual_nav_opd.profile_training --device cuda:0 --num-envs 2 --microbatch 8 --minibatches 1 --output-dir <另一新目录>` 使用真实教师测量采集、学习与逐样本Fisher，记录视觉/CTM前向、视觉反向、优化器和显存。同步诊断存在计时开销；本机结果不能代表RTX5090实测。正式启动、恢复、输入产物和异常边界见 [运行手册](RUNBOOK.md)。
 

@@ -1,6 +1,5 @@
 """Maze-pool and P/C/F commits; resume reruns only the uncommitted pool/stage."""
 from dataclasses import asdict
-import json
 from pathlib import Path
 import random
 import shutil
@@ -21,16 +20,15 @@ from .data.maze_curriculum import MazeStateTable
 from .learning.maze_progress import run_maze_progress
 from .learning.distill import run_compress_stage
 from .learning.fisher import run_fisher_stage,validate_fisher
-from .evaluate import evaluate_policy
 from .wandb_logging import EventLogger
 
 
-def export_policy(policy,path,root,manifest_ref):
+def export_policy(policy,path,root,manifest_ref,identity):
     save_snapshot(policy,path); seal_artifact(path)
     # Metadata links the inference artifact to fixed panels without external TA files.
     import os
     metadata=Path(str(path)+'.metadata.json')
-    atomic_json(metadata,{'run_root':os.path.relpath(root,path.parent),'manifest':manifest_ref})
+    atomic_json(metadata,{'run_root':os.path.relpath(root,path.parent),'manifest':manifest_ref,**identity})
     seal_artifact(metadata)
     return reference(root,path)
 
@@ -50,7 +48,7 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
         restore_rng(payload['rng'],action,minibatch,fisher_rng)
     else:
         root.mkdir(parents=True,exist_ok=False)
-        for name in ('teachers','checkpoints','snapshots','evaluation','exports','diagnostics'): (root/name).mkdir()
+        for name in ('teachers','checkpoints','snapshots','exports','diagnostics'): (root/name).mkdir()
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         config_path=root/'resolved_config.yaml'; config_path.write_text(yaml.safe_dump(resolved_dict(config),sort_keys=False),encoding='utf-8')
         manifest=build_manifest(REPO_ROOT/config.environment.maze_root,validation_count=config.evaluation.maze_validation_hashes,
@@ -66,10 +64,10 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
         refs={name:reference(root,path) for name,path in {'config':config_path,'provenance':root/'provenance.json',
               'manifest':root/'maze_manifest.json','maze_teacher':root/'teachers/maze_teacher.json','fourrooms_teacher':root/'teachers/fourrooms.pt'}.items()}
         kb=StandalonePolicy(config).to(device)
-        payload={'artifact_type':'v4_stage_boundary','schema_version':4,'method':config.method,'sequence_protocol':config.sequence_protocol,
+        payload={'artifact_type':'v4_training_boundary','schema_version':4,'method':config.method,'sequence_protocol':config.sequence_protocol,
                  'seed':seed,'config_hash':config_hash(config),'source':source,'stages':[asdict(s) for s in stages],
                  'next_index':0,'kb':kb.state_dict(),'kb_ready':False,'fisher':None,'global_env_steps':0,'optimizer_updates':0,'next_transition_id':0,
-                 'rng':rng_state(action,minibatch,fisher_rng),'references':refs,'active_snapshots':{},'evaluations':{},'visit_reports':{},'finalized':False,
+                 'rng':rng_state(action,minibatch,fisher_rng),'references':refs,'stage_snapshots':{},'finalized':False,
                  'teacher_identity':{'maze':MazeTeacher().source_snapshot_id,'fourrooms':refs['fourrooms_teacher']['sha256']},'data_hash':refs['manifest']['sha256'],
                  'stage_counters':{},'maze_progress':None}
         save_boundary(root,payload)
@@ -78,7 +76,7 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
     map_cache=None
     try:
         if payload['finalized']: failed=False; return payload
-        if config.environment.map_cache=='memory':
+        if payload['next_index']<len(stages) and config.environment.map_cache=='memory':
             entries=manifest.entries('train')+manifest.entries('validation')+manifest.entries('test')
             map_cache=MazeMapCache(REPO_ROOT/config.environment.maze_root,entries)
             logger.emit({'event':'map_cache','family':'pnc','maps':len(map_cache.indices),
@@ -88,11 +86,13 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
             raise ValueError('Maze curriculum exceeds distinct training manifest')
         if config.maze_progress.pool_sizes[-1] == 44488 and len(manifest.train) != 44488:
             raise ValueError('formal curriculum must cover the entire fixed training split')
-        maze_table=MazeStateTable(map_cache,manifest.train[:config.maze_progress.pool_sizes[-1]])
-        logger.emit({'event':'maze_state_table','maps':len(maze_table.entries),'nonterminal_positions':len(maze_table.start_ids),
-                     'table_bytes':maze_table.table_bytes,'build_seconds':maze_table.build_seconds,
-                     'process_rss_bytes':maze_table.process_rss_bytes,'rss_delta_bytes':maze_table.rss_delta_bytes,
-                     'total_cache_bytes':map_cache.images.nbytes+maze_table.table_bytes})
+        maze_table=None
+        if payload['next_index']<len(stages):
+            maze_table=MazeStateTable(map_cache,manifest.train[:config.maze_progress.pool_sizes[-1]])
+            logger.emit({'event':'maze_state_table','maps':len(maze_table.entries),'nonterminal_positions':len(maze_table.start_ids),
+                         'table_bytes':maze_table.table_bytes,'build_seconds':maze_table.build_seconds,
+                         'process_rss_bytes':maze_table.process_rss_bytes,'rss_delta_bytes':maze_table.rss_delta_bytes,
+                         'total_cache_bytes':map_cache.images.nbytes+maze_table.table_bytes})
         for index in range(payload['next_index'],len(stages)):
             stage=stages[index]; attempt=uuid.uuid4().hex; trigger('stage_start',stage)
             identity={'family':stage.family,'visit':stage.visit,'stage':stage.key,'phase':stage.phase,'task':stage.task,'attempt_id':attempt,
@@ -129,17 +129,11 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
                         if result.eligible_target_steps!=stage.env_steps: raise ValueError('P target budget mismatch')
                         del expert
                     policy=result.policy; del dual
-                    path=root/'snapshots'/f'{index:03d}_{attempt}_active.pt'
-                    ref=export_policy(policy,path,root,payload['references']['manifest'])
-                    payload['active_snapshots'][stage.key]=ref
-                    payload['references'][stage.key+'/sidecar']=reference(root,str(path)+'.sha256.json')
-                    payload['references'][stage.key+'/metadata']=reference(root,str(path)+'.metadata.json')
-                    payload['references'][stage.key+'/metadata_sidecar']=reference(root,str(path)+'.metadata.json.sha256.json')
                     transitions,updates,next_id=result.transitions,result.optimizer_updates,result.next_transition_id
                     statistics=result.statistics
                 elif stage.phase=='C':
                     pkey=stages[index-1].key
-                    teacher=load_snapshot(verify_artifact(verify_reference(root,payload['active_snapshots'][pkey])),device)
+                    teacher=load_snapshot(verify_artifact(verify_reference(root,payload['stage_snapshots'][pkey])),device)
                     result=run_compress_stage(envs,teacher,kb,payload['fisher'],config,stage.env_steps,action,minibatch,payload['next_transition_id'],log_window)
                     payload['kb_ready']=result.kb_ready; transitions,updates,next_id=result.transitions,result.optimizer_updates,result.next_transition_id
                     statistics=result.statistics; policy=kb; del teacher
@@ -147,6 +141,7 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
                     result=run_fisher_stage(envs,kb,payload['fisher'],config,stage.env_steps,action,fisher_rng,payload['next_transition_id'],stage.key)
                     payload['fisher']=result['fisher']; transitions,updates,next_id=result['transitions'],0,result['next_transition_id']
                     statistics={**result['statistics'],'scored_samples':result['scored_samples'],'selected_ids':result['selected_ids']}
+                    policy=kb
                     logger.emit({**identity,'event':'fisher','policy_type':'kb','global_env_steps':before_steps+stage.env_steps,
                                  'stage_env_steps':stage.env_steps,'scored_samples':result['scored_samples'],**result['statistics']})
             finally:
@@ -155,29 +150,18 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
             payload['stage_counters'][stage.key]={'transitions':transitions,'optimizer_updates':updates}
             payload['global_env_steps']+=transitions; payload['optimizer_updates']+=updates; payload['next_transition_id']=next_id
             trigger('training_complete',stage)
-            if policy is not None:
-                trigger('before_evaluation',stage)
-                eid=f'{index:03d}_{attempt}_validation'
-                report=evaluate_policy(policy,config,manifest,identity={**identity,'evaluation_id':eid,
-                         'policy_type':'active' if stage.phase=='P' else 'kb','active_source':stage.task if stage.phase=='P' else None,
-                         'global_env_steps':payload['global_env_steps']},map_cache=map_cache)
-                path=root/'evaluation'/f'{eid}.json'; atomic_json(path,report)
-                payload['evaluations'][stage.key]={'reference':reference(root,path),'policy_type':report['policy_type'],'visit':stage.visit,
-                                                   'task':stage.task,'success_rates':{task:r['success_rate'] for task,r in report['tasks'].items()}}
-                for task,metrics in report['tasks'].items():
-                    logger.emit({**identity,'event':'evaluation','evaluation_id':eid,'evaluation_task':task,'policy_type':report['policy_type'],
-                                 'active_source':report['active_source'],'split':'validation','global_env_steps':payload['global_env_steps'],
-                                 **{k:v for k,v in metrics.items() if k!='results'},'evaluation_seconds':report['elapsed_seconds']})
-                trigger('evaluation_complete',stage)
+            # Every phase publishes its own immutable policy, independent of later KB updates.
+            policy_type='active' if stage.phase=='P' else 'kb'
+            path=root/'snapshots'/f'{index:03d}_{attempt}_{policy_type}.pt'
+            payload['stage_snapshots'][stage.key]=export_policy(policy,path,root,payload['references']['manifest'],
+                {'stage':stage.key,'visit':stage.visit,'task':stage.task,'phase':stage.phase,'policy_type':policy_type,
+                 'stage_counters':payload['stage_counters'][stage.key],'global_env_steps':payload['global_env_steps'],
+                 'optimizer_updates':payload['optimizer_updates']})
+            for suffix,name in [('.sha256.json','sidecar'),('.metadata.json','metadata'),('.metadata.json.sha256.json','metadata_sidecar')]:
+                payload['references'][stage.key+'/'+name]=reference(root,str(path)+suffix)
+            trigger('snapshot_complete',stage)
             payload['next_index']=index+1
             payload['maze_progress']=None
-            if index+1==len(stages) or stages[index+1].visit!=stage.visit:
-                chosen={s.key:payload['evaluations'][s.key] for s in stages[:index+1] if s.visit==stage.visit and s.phase in ('P','C')}
-                last_c=next(s.key for s in reversed(stages[:index+1]) if s.phase=='C')
-                visit_path=root/'evaluation'/f'visit_{stage.visit}_{attempt}.json'
-                atomic_json(visit_path,{'visit':stage.visit,'policies':chosen,'final_kb':payload['evaluations'][last_c],
-                                       'kb_only_forgetting_rows':[v for v in payload['evaluations'].values() if v['policy_type']=='kb']})
-                payload['visit_reports'][str(stage.visit)]=reference(root,visit_path)
             payload['kb']={n:p.detach().cpu().clone() for n,p in kb.state_dict().items()}
             payload['rng']=rng_state(action,minibatch,fisher_rng)
             if device.type=='cuda':
@@ -191,19 +175,23 @@ def run(config,seed,run_dir,resume=False,wandb_mode='disabled',max_stages=None,h
             if max_stages is not None and completed>=max_stages and payload['next_index']<len(stages):
                 failed=False; return payload
         trigger('before_finalization')
-        report=evaluate_policy(kb,config,manifest,split='test',identity={'family':'pnc','visit':config.pnc.visits-1,'phase':'final',
-                    'evaluation_id':'final_test','policy_type':'kb','active_source':None,'global_env_steps':payload['global_env_steps']},map_cache=map_cache)
-        trigger('final_evaluation_complete')
-        atomic_json(root/'evaluation/final_test.json',report)
-        for task,metrics in report['tasks'].items():
-            logger.emit({'event':'final_test','family':'pnc','phase':'final','policy_type':'kb','evaluation_task':task,
-                         'split':'test','global_env_steps':payload['global_env_steps'],
-                         **{k:v for k,v in metrics.items() if k!='results'},'evaluation_seconds':report['elapsed_seconds']})
         final=root/'exports/final.pt'
         # Only uncommitted finalization files may be replaced after a failed final attempt.
         if final.exists(): final.unlink()
-        export_policy(kb,final,root,payload['references']['manifest']); verify_artifact(final)
-        for name,path in {'final_test':root/'evaluation/final_test.json','final_policy':final,'final_sidecar':Path(str(final)+'.sha256.json'),
+        export_policy(kb,final,root,payload['references']['manifest'],
+                      {'stage':None,'visit':config.pnc.visits-1,'task':None,'phase':'final','policy_type':'kb',
+                       'global_env_steps':payload['global_env_steps'],'optimizer_updates':payload['optimizer_updates']})
+        verify_artifact(final)
+        # The index is only sealed at finalization; earlier stage commits never reference a mutable index.
+        stage_index=root/'exports/stages.json'
+        atomic_json(stage_index,{'artifact_type':'v4_stage_index','schema_version':4,'run_root':'..',
+                    'config_hash':payload['config_hash'],'manifest':payload['references']['manifest'],
+                    'stages':[{**asdict(s),'policy_type':'active' if s.phase=='P' else 'kb',
+                               'counters':payload['stage_counters'][s.key],'reference':payload['stage_snapshots'][s.key]} for s in stages]})
+        seal_artifact(stage_index)
+        trigger('final_export_complete')
+        for name,path in {'final_policy':final,'final_sidecar':Path(str(final)+'.sha256.json'),
+                          'stage_index':stage_index,'stage_index_sidecar':Path(str(stage_index)+'.sha256.json'),
                           'final_metadata':Path(str(final)+'.metadata.json'),'final_metadata_sidecar':Path(str(final)+'.metadata.json.sha256.json')}.items():
             payload['references'][name]=reference(root,path)
         payload['finalized']=True; payload['rng']=rng_state(action,minibatch,fisher_rng)
