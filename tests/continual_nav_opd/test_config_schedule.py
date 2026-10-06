@@ -16,7 +16,10 @@ class ConfigTests(unittest.TestCase):
         self.full=load_config('tasks/continual_nav_opd/configs/full.yaml')
 
     def test_profiles_budgets_and_stage_order(self):
-        for profile,total,envs in [('full',56576384,8),('remote_config',56576384,32),('smoke',3152,2)]:
+        for profile,total,envs,compile_mode in [('full',26736384,8,'disabled'),
+                                              ('remote_config',26736384,32,'reduce-overhead'),
+                                              ('local32_8gb',26736384,32,'default'),
+                                              ('smoke',3152,2,'disabled')]:
             c=load_config(f'tasks/continual_nav_opd/configs/{profile}.yaml')
             stages=expand_stages(c)
             self.assertEqual(len(stages),12)
@@ -27,9 +30,11 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(c.ctm.ticks_by_task.fourrooms,2)
             self.assertEqual(c.ctm.memory_length,40)
             self.assertEqual([s.ticks for s in stages],[5]*3+[2]*3+[5]*3+[2]*3)
-            self.assertEqual(c.optimization.ctm_compile, "reduce-overhead" if profile == "remote_config" else "disabled")
+            self.assertEqual(c.optimization.ctm_compile,compile_mode)
+            for stage in stages:
+                self.assertEqual(stage.env_steps % envs,0)
             self.assertEqual([(s.visit,s.task,s.phase) for s in stages],[(v,t,p) for v in range(2) for t in ('maze_medium','fourrooms') for p in ('P','C','F')])
-        self.assertEqual(budget_summary(self.full),dict(P=42000000,C=14560000,F=16384,total=56576384,stage_count=12,env_steps_are_upper_bounds=True,maze_P_updates_per_visit=12000,maze_P_updates=24000))
+        self.assertEqual(budget_summary(self.full),dict(P=21600000,C=5120000,F=16384,total=26736384,stage_count=12,env_steps_are_upper_bounds=True,maze_P_updates_per_visit=12000,maze_P_updates=24000))
         self.assertEqual(self.full.maze_progress.pool_sizes,(10,40,160,640,2560,10240,44488))
         self.assertEqual(self.full.maze_progress.pool_updates,(2000,2000,2000,1500,1500,1500,1500))
         self.assertEqual(sum(s.optimizer_updates for s in expand_stages(self.full)),24000)
@@ -37,13 +42,44 @@ class ConfigTests(unittest.TestCase):
 
     def test_remote_update_budget(self):
         from math import ceil
-        c=load_config('tasks/continual_nav_opd/configs/remote_config.yaml')
-        self.assertEqual(c.optimization.minibatches,4)
-        self.assertEqual(c.optimization.encoder_microbatch_images,200)
-        self.assertEqual(c.optimization.learning_steps,50)
-        updates=sum(s.optimizer_updates or ceil(s.env_steps/(c.training.num_envs*c.optimization.learning_steps))*
-                    c.optimization.minibatches for s in expand_stages(c) if s.phase in ('P','C'))
-        self.assertEqual(updates,135400)
+        for profile in ('remote_config','local32_8gb'):
+            with self.subTest(profile=profile):
+                c=load_config(f'tasks/continual_nav_opd/configs/{profile}.yaml')
+                self.assertEqual(c.training.num_envs,32)
+                self.assertEqual(c.optimization.minibatches,4)
+                self.assertEqual(c.optimization.encoder_microbatch_images,200)
+                self.assertEqual(c.optimization.learning_steps,50)
+                self.assertEqual(c.optimization.update_epochs,1)
+                stages=expand_stages(c)
+                updates=[]
+                for stage in stages:
+                    if stage.phase=='F':
+                        self.assertEqual((stage.env_steps,c.fisher.scored_samples),(4096,1024))
+                        continue
+                    count=stage.optimizer_updates or ceil(stage.env_steps/(c.training.num_envs*c.optimization.learning_steps))*c.optimization.minibatches
+                    self.assertEqual(count,12000 if stage.phase=='P' else 3200)
+                    self.assertEqual(stage.env_steps,6000000 if stage.task=='maze_medium' and stage.phase=='P'
+                                     else 4800000 if stage.phase=='P' else 1280000)
+                    updates.append(count)
+                self.assertEqual(sum(updates),60800)
+
+    def test_full_eight_slot_budget_is_not_update_aligned(self):
+        from math import ceil
+        c=self.full
+        self.assertEqual(c.training.num_envs,8)
+        updates=[]
+        for stage in expand_stages(c):
+            if stage.phase=='F': continue
+            count=stage.optimizer_updates or ceil(stage.env_steps/(c.training.num_envs*c.optimization.learning_steps))*c.optimization.minibatches
+            self.assertEqual(count,12000 if stage.task=='maze_medium' and stage.phase=='P'
+                             else 48000 if stage.phase=='P' else 12800)
+            updates.append(count)
+        self.assertEqual(sum(updates),171200)
+
+    def test_fourrooms_budget_changes_configuration_identity(self):
+        previous=resolved_dict(self.full)
+        previous['pnc']['task_budgets']['fourrooms'].update(progress_steps=15000000,compress_steps=6000000)
+        self.assertNotEqual(config_hash(parse_config(previous)),config_hash(self.full))
 
     def test_strict_fields_types_and_protocol(self):
         for path,value in [('ctm.ticks_by_task.maze_medium',0),('ctm.ticks_by_task.fourrooms',-1),('ctm.ticks_by_task.maze_medium',True),('ctm.ticks_by_task.fourrooms',2.5),('ctm.memory_length',20),('training.num_envs',3),('pnc.visits',0),('optimization.minibatches',3),('optimization.learning_steps',0),('schema_version',2),('sequence_protocol','other'),('distill.temperature',2),('teachers.maze_medium.type','neural'),('teachers.maze_medium.tie_break_order',[3,2,1,0]),('training.seed',True),('optimization.optimizer.lr',float('nan'))]:
@@ -99,7 +135,7 @@ class ConfigTests(unittest.TestCase):
             cmd=[sys.executable,'-m','tasks.continual_nav_opd.train','--config',str(path)]
             result=subprocess.run([*cmd,'--dry-run'],capture_output=True,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
-            self.assertIn('56576384',result.stdout)
+            self.assertIn('26736384',result.stdout)
             result=subprocess.run(cmd,capture_output=True,text=True)
             self.assertNotEqual(result.returncode,0)
 

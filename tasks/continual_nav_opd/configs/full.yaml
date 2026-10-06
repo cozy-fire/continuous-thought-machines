@@ -51,8 +51,9 @@ pnc:
     maze_medium:
       compress_steps: 1280000
     fourrooms:
-      progress_steps: 15000000
-      compress_steps: 6000000
+      # At 32 slots/50 observations/4 groups: match Maze's 12000 P and 3200 C updates per visit.
+      progress_steps: 4800000
+      compress_steps: 1280000
 maze_progress:
   pool_sizes: [10, 40, 160, 640, 2560, 10240, 44488]
   pool_updates: [2000, 2000, 2000, 1500, 1500, 1500, 1500]

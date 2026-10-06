@@ -4,6 +4,6 @@ training:
   num_envs: 32
 optimization:
   ctm_compile: reduce-overhead
-  # Keep 400 samples per update; 32 slots/4 groups yield 127400 total P/C updates.
+  # FourRooms/C use 400 samples per update; both visits yield 60800 total P/C updates.
   minibatches: 4
   encoder_microbatch_images: 200

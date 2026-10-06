@@ -15,9 +15,11 @@ python -m tasks.continual_nav_opd.train --config tasks/continual_nav_opd/configs
 
 `full.yaml` 与 `remote_config.yaml` 展开为两个 visits、12 个 P/C/F 阶段。Maze 每次 P 在内部依次训练 10/40/160/640/2560/10240/44488 张地图；前三池各 2000 次、后四池各 1500 次 Adam，共 12000 次/visit、24000 次/两 visits。跳过 40960。Maze P 不接受环境步预算；`TaskBudget.progress_steps` 只供 FourRooms 使用。
 
-`maze_progress.pool_sizes/pool_updates` 是课程的配置来源。每次更新为 100 条独立五步序列，microbatch5。正式 P 的最多有效决策数为 6000000/visit，终止 mask 使实际数减少。所有阶段合计最多 56576384 个训练决策；`budget_summary.env_steps_are_upper_bounds` 明确标识容量。smoke 显式用 2/4 张地图、各 1 次更新，仍保持 100/5 批次，两 visits 共 18 次 Adam、最多 3152 个决策。
+`maze_progress.pool_sizes/pool_updates` 是课程的配置来源。每次更新为 100 条独立五步序列，microbatch5。正式 P 的最多有效决策数为 6000000/visit，终止 mask 使实际数减少。所有阶段合计最多 26736384 个训练决策：P=21600000、C=5120000、F=16384；`budget_summary.env_steps_are_upper_bounds` 明确标识容量。smoke 显式用 2/4 张地图、各 1 次更新，仍保持 100/5 批次，两 visits 共 18 次 Adam、最多 3152 个决策。
 
-Maze ticks=5、M=40 固定；FourRooms ticks=2，原 P/C/F 预算不变。dry-run 不加载地图或教师、不创建 run；它输出容量、Maze Adam 预算和完整阶段表。schema v3、旧序列协议、旧 Maze 环境步字段值和旧产物直接拒绝，没有迁移。
+FourRooms 每 visit 的 P 决策预算为 4800000、C 为 1280000；Maze C 同为 1280000。`remote_config.yaml` 与 `local32_8gb.yaml` 使用 32 槽、50 步观察窗口、4 个更新分组，每组 400 个决策：两任务每 visit 的 P 均为 12000 次 Adam、C 均为 3200 次，两 visits 合计 60800 次。Maze P 的每次更新最多 500 个有效决策，因此对齐的是更新次数，决策数并不相同。默认 `full.yaml` 仍用 8 槽，每组 100 个决策；FourRooms P 为 48000 次/visit、两任务 C 各 12800 次/visit，Maze P 仍为 12000 次/visit，合计 171200 次，不宣称与 Maze 对齐。F 每阶段仍为 4096 个决策、1024 个评分样本，不执行 Adam 更新。
+
+Maze ticks=5、M=40 固定；FourRooms ticks=2，采样、50 步窗口、Loss 与优化器保持现状。dry-run 不加载地图或教师、不创建 run；它输出容量、Maze Adam 预算和完整阶段表。新预算产生不同配置哈希，旧预算训练产物不能用于新预算续训；checkpoint schema 仍为 v4，没有兼容迁移。schema v3、旧序列协议和旧 Maze 环境步字段值直接拒绝。
 
 ## 02：环境与专一教师
 
