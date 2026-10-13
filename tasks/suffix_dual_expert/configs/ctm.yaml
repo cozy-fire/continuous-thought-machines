@@ -1,0 +1,2 @@
+# Model profile. Shared curriculum, assets and optimizer defaults live in Config.
+model_type: ctm

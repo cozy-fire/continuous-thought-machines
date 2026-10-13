@@ -1,0 +1,4 @@
+# Online visual LSTM; the training/Loss/budget defaults are shared with CTM.
+model_type: lstm
+lstm_hidden: 512
+lstm_layers: 2

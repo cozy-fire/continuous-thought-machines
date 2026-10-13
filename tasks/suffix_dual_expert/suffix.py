@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 from .config import Config
-from .model import Policy, select
+from .models import VisualPolicy as Policy, select
 
 
 class PrefixSamplingExhausted(RuntimeError):
@@ -89,7 +89,7 @@ def replay(policy: Policy, images: Tensor, labels: Tensor, ids: Tensor, mask: Te
     length,batch = ids.shape
     starts = torch.zeros(length,batch,dtype=torch.bool,device=images.device)
     starts[0] = True
-    # Batch the independent CNN evaluations across time. CTM recursion and its
+    # Batch the independent CNN evaluations across time. Model recursion and its
     # prefix gradient remain connected through the complete sequence.
     logits,_ = policy.sequence(images[ids],policy.initial_state(batch),starts,task='maze_medium')
     losses = F.cross_entropy(logits[-5:].flatten(0,1),labels[ids[-5:]].flatten(),reduction='none')

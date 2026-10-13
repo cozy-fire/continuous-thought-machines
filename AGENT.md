@@ -4,7 +4,7 @@
 
 ## 当前方案
 
-唯一维护的跨任务方案为 [suffix_dual_expert](tasks/suffix_dual_expert/README.md)：随机单列CTM严格前缀课程 → Maze Fisher → 双专家Compress → 独立配对评估。模型、教学Loss、任务状态、预算、checkpoint和EWC消融契约均以该目录代码及说明为准。
+唯一维护的跨任务方案为 [suffix_dual_expert](tasks/suffix_dual_expert/README.md)：随机单列CTM或视觉LSTM严格前缀课程 → Maze Fisher → 双专家Compress → 独立配对评估。`models/ctm`与`models/lstm`区分学生架构，`models/common`及根训练流程共用；外部FourRooms教师固定为完整CTM Dual。模型、教学Loss、任务状态、预算、checkpoint和EWC消融契约均以该目录代码及说明为准。
 
 当前代码不依赖已删除的旧方案包。上游通用模型和原始任务作为基础组件或参考保留。实验报告与图像位于 [方案报告目录](tasks/suffix_dual_expert/reports/README.md)，旧接口文档位于 [文档归档](docs/archive/README.md)，历史实验harness可能使用独立冻结实现和协议；不得以当前默认配置改写其身份或结果。
 

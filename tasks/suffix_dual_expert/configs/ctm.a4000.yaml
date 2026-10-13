@@ -1,0 +1,6 @@
+# Existing CTM execution profile, not a measurement on a new device.
+model_type: ctm
+suffix_microbatch: 20
+encoder_chunk: 32
+checkpoint_encoder: false
+compress_microbatch: 4

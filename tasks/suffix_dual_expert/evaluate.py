@@ -10,18 +10,34 @@ import numpy as np
 import torch
 from .config import Config, path
 from .envs import MapCache, MazeEnv, FourRoomsEnv, evaluation_entries, file_sha
-from .model import Policy, load_teacher
+from .models import VisualPolicy as Policy, build_policy, load_teacher, state_kind
 from .checkpoint import atomic_json, model_hash, seed_everything
 
 
-def load_policy(file: Path, device: str) -> Policy:
-    artifact = torch.load(file,map_location='cpu',weights_only=True)
-    if artifact.get('schema') != 'suffix_dual_expert_policy_v1' or artifact.get('model') != 'single':
+def policy_config(artifact: dict) -> Config:
+    schema = artifact.get('schema')
+    if schema not in ('suffix_dual_expert_policy_v1','suffix_dual_expert_policy_v2') or artifact.get('model') != 'single':
         raise ValueError('not a single-column inference snapshot')
     config = Config(**{k:tuple(v) if k in ('lengths','pool_sizes','first_updates','suffix_updates','betas') else v
                        for k,v in artifact['config'].items()})
-    model = Policy(config.encoder_chunk,config.checkpoint_encoder)
+    if schema == 'suffix_dual_expert_policy_v1':
+        if config.model_type != 'ctm' or artifact.get('model_type','ctm') != 'ctm':
+            raise ValueError('legacy snapshots support CTM only')
+    elif artifact.get('model_type') != config.model_type or artifact.get('model_spec') != config.model_spec():
+        raise ValueError('snapshot model architecture/spec mismatch')
+    return config
+
+
+def load_policy(file: Path, device: str, expected_config: Config | None = None) -> Policy:
+    artifact = torch.load(file,map_location='cpu',weights_only=True)
+    config = policy_config(artifact)
+    if expected_config is not None and (config.model_type != expected_config.model_type
+                                        or config.model_spec() != expected_config.model_spec()):
+        raise ValueError('evaluation model architecture/spec mismatch')
+    model = build_policy(config)
     model.load_state_dict(artifact['state_dict'],strict=True)
+    if any(not torch.isfinite(p).all() for p in model.parameters()):
+        raise ValueError('nonfinite policy weights')
     return model.to(device).eval().requires_grad_(False)
 
 
@@ -103,7 +119,8 @@ def rollout(policy, task: str, panel: list, cache: MapCache | None, output: Path
     if model_hash(policy) != before:
         raise RuntimeError('evaluation changed weights')
     successes = sum(e['success'] for e in episodes)
-    result = dict(episodes=episodes,episode_count=len(episodes),successes=successes,
+    result = dict(model_type=state_kind(policy).replace('_dual',''),
+                  episodes=episodes,episode_count=len(episodes),successes=successes,
                   success_rate=successes/len(episodes),wilson95=wilson(successes,len(episodes)),weights_unchanged=True)
     atomic_json(output/'summary.json',result)
     return result
@@ -117,6 +134,10 @@ def evaluate(run: Path, device: str | None = None, episodes: int | None = None) 
         raise ValueError('training is not verified complete')
     raw = protocol['identity']['config']
     config = Config(**{k:tuple(v) if k in ('lengths','pool_sizes','first_updates','suffix_updates','betas') else v for k,v in raw.items()})
+    if protocol.get('schema') == 'suffix_dual_expert_v2' and (
+        protocol.get('model_type') != config.model_type or protocol.get('model') != config.model_spec()
+        or training.get('model_type') != config.model_type or training.get('model_spec') != config.model_spec()):
+        raise ValueError('training model architecture/spec mismatch')
     if training['budget'] != config.budget() or training['maze_adam_updates'] != config.budget()['maze_adam'] or training['compress_adam_updates'] != config.budget()['compress_adam']:
         raise ValueError('training budget mismatch')
     device = device or config.device
@@ -143,14 +164,15 @@ def evaluate(run: Path, device: str | None = None, episodes: int | None = None) 
         hashes[name] = ref['sha256']
     if file_sha(path(config.teacher_checkpoint)) != config.teacher_sha256:
         raise ValueError('teacher changed since training')
-    atomic_json(output/'protocol.json',dict(maps=entries,fourrooms_seeds=seeds,checkpoint_sha256=hashes,
+    atomic_json(output/'protocol.json',dict(model_type=config.model_type,model_spec=config.model_spec(),
+        maps=entries,fourrooms_seeds=seeds,checkpoint_sha256=hashes,
         teacher_sha256=config.teacher_sha256,actions='argmax',recurrent=True,prefix_filter=False,max_steps=300,
         precision='FP32',batch=config.eval_batch,diagnostic_subset=episodes is not None))
     try:
-        before = load_policy(run/'snapshots'/training['snapshots']['maze_before_compress']['path'],device)
+        before = load_policy(run/'snapshots'/training['snapshots']['maze_before_compress']['path'],device,config)
         maze_before = rollout(before,'maze_medium',entries,cache,output/'maze_before',config.eval_batch)
         del before
-        after = load_policy(run/'snapshots'/training['snapshots']['final_kb']['path'],device)
+        after = load_policy(run/'snapshots'/training['snapshots']['final_kb']['path'],device,config)
         maze_after = rollout(after,'maze_medium',entries,cache,output/'maze_after',config.eval_batch)
         rooms_after = rollout(after,'fourrooms',seeds,None,output/'fourrooms_after',config.eval_batch)
         del after
@@ -158,7 +180,8 @@ def evaluate(run: Path, device: str | None = None, episodes: int | None = None) 
         rooms_teacher = rollout(teacher,'fourrooms',seeds,None,output/'fourrooms_teacher',config.eval_batch)
         comparisons = dict(maze_recurrent=paired(maze_before,maze_after),fourrooms=paired(rooms_teacher,rooms_after))
         holm(comparisons)
-        summary = dict(status='complete',episodes=2*(maze_count+rooms_count),comparison=comparisons,
+        summary = dict(status='complete',model_type=config.model_type,model_spec=config.model_spec(),
+                       episodes=2*(maze_count+rooms_count),comparison=comparisons,
                        weights_unchanged=True,elapsed_seconds=time.perf_counter()-begin,
                        maze_before=maze_before['success_rate'],maze_after=maze_after['success_rate'],
                        fourrooms_teacher=rooms_teacher['success_rate'],fourrooms_after=rooms_after['success_rate'])
@@ -183,8 +206,7 @@ def main() -> None:
         if args.run or not args.out:
             parser.error('individual checkpoint testing requires --out and no --run')
         artifact = torch.load(args.checkpoint,map_location='cpu',weights_only=True)
-        config = Config(**{k:tuple(v) if k in ('lengths','pool_sizes','first_updates','suffix_updates','betas') else v
-                           for k,v in artifact['config'].items()})
+        config = policy_config(artifact)
         seed_everything(config.seed)
         count = args.episodes or config.eval_maze
         if not 1 <= count <= config.eval_maze:

@@ -5,7 +5,8 @@ import torch
 from torch import Tensor
 from .config import Config
 from .envs import BatchEnv
-from .model import Policy, DualTeacher, State, detached, select, pack_state, unpack_state
+from .models import VisualPolicy as Policy, DualTeacher, State, detached, select, pack_state, unpack_state
+from .models.common.state import state_map
 from .fisher import ewc_loss
 
 
@@ -60,10 +61,20 @@ class Collector:
                     state=pack_state(self.state),teacher_state=pack_state(self.teacher_state))
 
     def restore(self, value: dict) -> None:
+        student_kind = pack_state(self.state)['kind']
+        teacher_kind = pack_state(self.teacher_state)['kind']
+        student_state = unpack_state(value['state'],self.device,student_kind)
+        teacher_state = unpack_state(value['teacher_state'],self.device,teacher_kind)
+        # Check dimensions before changing the environment or collector state.
+        expected,actual = [],[]
+        for state,shapes in ((self.state,expected),(self.teacher_state,expected),
+                             (student_state,actual),(teacher_state,actual)):
+            state_map(state,lambda t:shapes.append((t.shape,t.dtype)) or t)
+        if expected != actual:
+            raise ValueError('recurrent state shape/dtype mismatch')
         self.obs = self.envs.restore(value['envs'])
         self.starts = np.asarray(value['starts'],dtype=bool)
-        self.state = unpack_state(value['state'],self.device)
-        self.teacher_state = unpack_state(value['teacher_state'],self.device)
+        self.state,self.teacher_state = student_state,teacher_state
 
 
 def kl_divergence(logits: Tensor, targets: Tensor) -> Tensor:

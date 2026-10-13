@@ -1,6 +1,6 @@
 # CTM跨任务学习
 
-当前唯一维护方案是 [suffix_dual_expert](tasks/suffix_dual_expert/README.md)：随机单列CTM → Maze medium严格前缀课程 → Maze Fisher → Maze与FourRooms双专家Compress → 单列KB独立配对评估。
+当前唯一维护方案是 [suffix_dual_expert](tasks/suffix_dual_expert/README.md)：随机单列CTM或视觉LSTM → Maze medium严格前缀课程 → Maze Fisher → Maze与FourRooms双专家Compress → 单列KB独立配对评估。两种学生的模型目录分开，训练与Loss流程共用。
 
 基于[CTM上游实现](https://github.com/SakanaAI/continuous-thought-machines)。输入为RGB `3×84×84`，输出为五动作；Maze每决策5个内部tick，FourRooms为2个，CTM历史窗口40。任务仅选择tick数，不作为神经输入或任务专属head。训练中不评估；策略性能、泛化和保留以独立固定面板结果判断。
 
@@ -22,13 +22,13 @@ Python环境安装仓库依赖：`pip install -r requirements.txt`。运行前�
 
 ```powershell
 # 只读检查配置、资产、课程与精确预算
-python -m tasks.suffix_dual_expert.train --config tasks/suffix_dual_expert/config.yaml --dry-run
+python -m tasks.suffix_dual_expert.train --config tasks/suffix_dual_expert/configs/ctm.yaml --dry-run
 
 # 新训练；使用独立输出目录
-python -m tasks.suffix_dual_expert.train --config tasks/suffix_dual_expert/config.yaml --out runs/suffix_dual_expert_seed0
+python -m tasks.suffix_dual_expert.train --config tasks/suffix_dual_expert/configs/ctm.yaml --out runs/suffix_dual_expert/ctm/seed0
 
 # 训练complete后单独评估
-python -m tasks.suffix_dual_expert.evaluate --run runs/suffix_dual_expert_seed0
+python -m tasks.suffix_dual_expert.evaluate --run runs/suffix_dual_expert/ctm/seed0
 
 # 可视化；默认权重路径在visualize/config.yaml中配置
 python -m tasks.suffix_dual_expert.visualize

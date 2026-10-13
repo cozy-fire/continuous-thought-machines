@@ -1,1 +1,1 @@
-"""Strict Maze suffix learning followed by single-KB dual-expert compression."""
+"""Shared strict Maze suffix -> Fisher -> dual-expert compression for CTM/LSTM."""

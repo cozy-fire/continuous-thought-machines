@@ -9,7 +9,9 @@ import torch
 from ..checkpoint import model_hash, seed_everything
 from ..config import TICKS
 from ..envs import MapCache, MazeEnv, FourRoomsEnv, file_sha
-from ..model import Policy, detached, rotate
+from ..models.ctm.policy import Policy
+from ..models.common.state import detached
+from ..models.common.vision import rotate
 
 
 def collect(config: dict, root: Path, out: Path, panel: list) -> dict:
@@ -19,6 +21,8 @@ def collect(config: dict, root: Path, out: Path, panel: list) -> dict:
     checkpoint_hash = file_sha(checkpoint)
     policy = Policy(checkpoint_encoder=False).to(device).eval().requires_grad_(False)
     artifact = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    if artifact.get('model_type',artifact.get('config',{}).get('model_type','ctm')) != 'ctm':
+        raise ValueError('this neuron visualisation supports CTM only; use evaluate for LSTM trajectories')
     policy.load_state_dict(artifact['state_dict'], strict=True)
     del artifact
     before = model_hash(policy)

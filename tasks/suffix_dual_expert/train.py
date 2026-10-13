@@ -10,9 +10,9 @@ from importlib.metadata import version
 
 import numpy as np
 import torch
-from .config import Config, MODEL_SPEC, load_config, path
+from .config import Config, CTM_MODEL_SPEC, load_config, path
 from .envs import MapCache, MazeEnv, FourRoomsEnv, BatchEnv, training_entries, evaluation_entries, file_sha
-from .model import Policy, frozen_copy, load_teacher
+from .models import VisualPolicy as Policy, build_policy, frozen_copy, load_teacher
 from .suffix import update as suffix_update
 from .fisher import estimate, validate_fisher, fisher_hash, on_device
 from .compress import Collector, update_pair
@@ -31,13 +31,14 @@ def preflight(config: Config) -> tuple[dict,list[dict],MapCache]:
     artifact = torch.load(teacher,map_location='cpu',weights_only=True)
     teacher_config = json.loads(json.dumps(artifact['config']))
     if artifact.get('policy_type') != 'dual' or not bool(artifact['state_dict'].get('kb_ready',False)) or any(
-        teacher_config.get(k) != v for k,v in MODEL_SPEC.items()):
+        teacher_config.get(k) != v for k,v in CTM_MODEL_SPEC.items()):
         raise ValueError('incompatible complete Dual teacher')
     entries = training_entries(path(config.maze_root),config.pool_sizes[-1])
     tests = evaluation_entries(path(config.test_manifest),config.eval_maze,entries)
     cache = MapCache(path(config.maze_root),entries)
     MapCache(path(config.maze_root),tests)  # Decode and verify the fixed test identities too.
-    identity = dict(config=config.resolved(),source=source_hashes(),train_maps=entries,
+    identity = dict(config=config.resolved(),model_type=config.model_type,model_spec=config.model_spec(),
+                    source=source_hashes(),train_maps=entries,
                     test_manifest_sha256=file_sha(path(config.test_manifest)),teacher_sha256=file_sha(teacher),
                     dependencies={name:version(name) for name in ('torch','numpy','Pillow','PyYAML','gymnasium','minigrid')})
     return identity,entries,cache
@@ -101,7 +102,7 @@ def fork_compress_boundary(config: Config, output: Path | None, source: Path, id
     anchor_weights = torch.load(snapshot_root/anchor['path'],map_location='cpu',weights_only=True)['state_dict']
     if tensor_hash(anchor_weights) != tensor_hash(saved['student']):
         raise ValueError('source student differs from the F-completed KB snapshot')
-    origin = dict(source_run=str(source),boundary_sha256=ref['sha256'],boundary_file=ref['path'],
+    origin = dict(model_type=config.model_type,source_run=str(source),boundary_sha256=ref['sha256'],boundary_file=ref['path'],
                   source_ewc_enabled=original_ewc,ewc_enabled=config.ewc_enabled,
                   student_sha256=model_hash(student),fisher_sha256=fisher_hash(saved['fisher']),
                   maze_anchor_sha256=anchor['sha256'],reused_maze_adam=saved['maze_updates'],
@@ -131,7 +132,7 @@ def run(config: Config, output: Path, resume: bool = False, stop_after_boundarie
         raise RuntimeError('CUDA is required by this configuration')
     output = output.resolve()
     seed_everything(config.seed)
-    student = Policy(config.encoder_chunk,config.checkpoint_encoder).to(config.device).train()
+    student = build_policy(config).to(config.device).train()
     streams = dict(prefix=np.random.default_rng(config.seed),action=torch.Generator().manual_seed(config.seed+101),
                    mini=np.random.default_rng(config.seed+102),fisher=np.random.default_rng(config.seed+103))
     if resume:
@@ -146,15 +147,21 @@ def run(config: Config, output: Path, resume: bool = False, stop_after_boundarie
         else:
             output.mkdir(parents=True,exist_ok=False)
             (output/'snapshots').mkdir()
-            saved = dict(schema='suffix_dual_expert_v1',identity=identity,phase='maze',stage_index=0,
+            saved = dict(schema='suffix_dual_expert_v2',identity=identity,
+                         model_type=config.model_type,model_spec=config.model_spec(),phase='maze',stage_index=0,
                          maze_updates=0,windows=0,completed_stages=[],suffix_decisions=0,candidates=0,
                          fisher=None,fisher_statistics=None,snapshots={},collectors=None,optimizer=None)
-        atomic_json(output/'protocol.json',dict(schema='suffix_dual_expert_v1',identity=identity,model=MODEL_SPEC,
+        atomic_json(output/'protocol.json',dict(schema='suffix_dual_expert_v2',identity=identity,
+                    model_type=config.model_type,model=config.model_spec(),teacher_model=CTM_MODEL_SPEC,
+                    parameter_counts={name:sum(p.numel() for p in module.parameters())
+                                      for name,module in (('total',student),('encoder',student.encoder),
+                                                          ('controller',student.controller),('actor',student.actor))},
                     stages=config.schedule(),budget=config.budget(),prefix='argmax_equals_single_bfs_label',
                     suffix='last5_full_bptt',compress=('0.5_mean_kl_each_task_plus_ewc_once'
                         if config.ewc_enabled else '0.5_mean_kl_each_task'),ewc_enabled=config.ewc_enabled,
                     ewc_lambda=config.ewc_lambda if config.ewc_enabled else 0.,
-                    evaluation='independent_recurrent_argmax_max300',formal= config.resolved() == Config().resolved(),
+                    evaluation='independent_recurrent_argmax_max300',
+                    formal=config.resolved() == Config(model_type=config.model_type).resolved(),
                     compress_origin=saved.get('compress_origin')))
     committed = 0
 
@@ -166,7 +173,7 @@ def run(config: Config, output: Path, resume: bool = False, stop_after_boundarie
         committed += 1
         paused = stop_after_boundaries is not None and committed >= stop_after_boundaries and saved['phase'] != 'complete'
         atomic_json(output/'status.json',dict(status='paused_at_boundary' if paused else 'training',
-                    phase=saved['phase'],maze_updates=saved['maze_updates'],windows=saved['windows']))
+                    model_type=config.model_type,phase=saved['phase'],maze_updates=saved['maze_updates'],windows=saved['windows']))
         return paused
 
     if not resume and from_fisher is None:
@@ -187,7 +194,8 @@ def run(config: Config, output: Path, resume: bool = False, stop_after_boundarie
                         stats = suffix_update(student,optimizer,tables,streams['prefix'],pool_states,stage['length'],config)
                         saved['maze_updates'] += 1
                         saved['suffix_decisions'] += stats['valid_suffix_decisions']; saved['candidates'] += stats['candidates']
-                        row = dict(phase='maze',**stage,pool_update=update,maze_update=saved['maze_updates'],**stats)
+                        row = dict(model_type=config.model_type,phase='maze',**stage,pool_update=update,
+                                   maze_update=saved['maze_updates'],**stats)
                         log.write(json.dumps(row,allow_nan=False)+'\n'); log.flush()
                         if update == 1 or update % 50 == 0:
                             print('MAZE',json.dumps(row),flush=True)
@@ -243,7 +251,7 @@ def run(config: Config, output: Path, resume: bool = False, stop_after_boundarie
                         for collector in collectors:
                             collector.truncate()
                         saved['windows'] = index+1
-                        row = dict(phase='compress',window=index+1,compress_adam=(index+1)*config.groups,
+                        row = dict(model_type=config.model_type,phase='compress',window=index+1,compress_adam=(index+1)*config.groups,
                                    decisions=(index+1)*2*config.slots_per_task*config.window,
                                    maze_decisions=(index+1)*config.slots_per_task*config.window,
                                    fourrooms_decisions=(index+1)*config.slots_per_task*config.window,
@@ -270,7 +278,8 @@ def run(config: Config, output: Path, resume: bool = False, stop_after_boundarie
                     for collector in collectors:
                         collector.envs.close()
             verify_counters(saved,config)
-            summary = dict(status='complete',budget=config.budget(),maze_adam_updates=saved['maze_updates'],
+            summary = dict(status='complete',model_type=config.model_type,model_spec=config.model_spec(),
+                           budget=config.budget(),maze_adam_updates=saved['maze_updates'],
                            compress_origin=saved.get('compress_origin'),
                            ewc_enabled=config.ewc_enabled,ewc_lambda=config.ewc_lambda if config.ewc_enabled else 0.,
                            compress_adam_updates=config.groups*saved['windows'],windows=saved['windows'],
@@ -279,11 +288,11 @@ def run(config: Config, output: Path, resume: bool = False, stop_after_boundarie
                            snapshots=saved['snapshots'],teacher_unchanged=saved['teacher_unchanged'],
                            maze_teacher_unchanged=saved['maze_teacher_unchanged'],fisher_unchanged=saved['fisher_unchanged'])
             atomic_json(output/'summary.json',summary)
-            atomic_json(output/'status.json',dict(status='complete',phase='complete'))
+            atomic_json(output/'status.json',dict(status='complete',model_type=config.model_type,phase='complete'))
             print('ALL_COMPLETE',json.dumps(config.budget()),flush=True)
             return summary
     except BaseException as error:
-        atomic_json(output/'status.json',dict(status='failed',phase=saved['phase'],error=repr(error),
+        atomic_json(output/'status.json',dict(status='failed',model_type=config.model_type,phase=saved['phase'],error=repr(error),
                     maze_updates=saved['maze_updates'],windows=saved['windows']))
         raise
 
@@ -307,8 +316,9 @@ def main() -> None:
         origin = None
         if args.from_fisher is not None:
             origin = fork_compress_boundary(config,None,args.from_fisher,identity,
-                Policy(config.encoder_chunk,config.checkpoint_encoder))['compress_origin']
-        print(json.dumps(dict(config=config.resolved(),stages=config.schedule(),budget=config.budget(),
+                build_policy(config))['compress_origin']
+        print(json.dumps(dict(config=config.resolved(),model_type=config.model_type,model_spec=config.model_spec(),
+                              stages=config.schedule(),budget=config.budget(),
                               teacher_sha256=identity['teacher_sha256'],training_maps=len(entries),compress_origin=origin),indent=2))
         return
     if args.out is None or args.stop_after_boundaries is not None and args.stop_after_boundaries < 1:

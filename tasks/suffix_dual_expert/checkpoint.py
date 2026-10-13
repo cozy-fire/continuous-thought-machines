@@ -8,7 +8,7 @@ import uuid
 
 import numpy as np
 import torch
-from .config import PACKAGE, ROOT
+from .config import Config, PACKAGE, ROOT
 from .envs import file_sha
 
 
@@ -54,6 +54,7 @@ def model_hash(model) -> str:
 
 def source_hashes() -> dict:
     files = list(PACKAGE.glob('*.py'))
+    files += list((PACKAGE/'models').rglob('*.py'))
     files += [ROOT/'models'/name for name in ('resnet.py','modules.py','utils.py')]
     return {p.relative_to(ROOT).as_posix():file_sha(p) for p in sorted(files)}
 
@@ -119,15 +120,22 @@ def load_boundary(run: Path, identity: dict) -> dict:
     if not file.is_relative_to(directory.resolve()) or file_sha(file) != ref['sha256']:
         raise ValueError('invalid checkpoint reference or SHA')
     payload = torch.load(file,map_location='cpu',weights_only=True)
-    if payload.get('identity') != identity or payload.get('schema') != 'suffix_dual_expert_v1':
+    if payload.get('identity') != identity or payload.get('schema') != 'suffix_dual_expert_v2':
         raise ValueError('resume config/source/data/teacher mismatch')
+    config = Config(**{k:tuple(v) if k in ('lengths','pool_sizes','first_updates','suffix_updates','betas') else v
+                       for k,v in identity['config'].items()})
+    if payload.get('model_type') != config.model_type or payload.get('model_spec') != config.model_spec():
+        raise ValueError('resume model architecture/spec mismatch')
     if payload['phase'] != ref['phase'] or payload['maze_updates'] != ref['maze_updates'] or payload['windows'] != ref['windows']:
         raise ValueError('boundary marker counters differ')
     return payload
 
 
 def snapshot(file: Path, model, config: dict, **metadata) -> dict:
-    atomic_torch(file,dict(schema='suffix_dual_expert_policy_v1',model='single',
+    settings = Config(**{k:tuple(v) if k in ('lengths','pool_sizes','first_updates','suffix_updates','betas') else v
+                         for k,v in config.items()})
+    atomic_torch(file,dict(schema='suffix_dual_expert_policy_v2',model='single',
+                           model_type=settings.model_type,model_spec=settings.model_spec(),
                            config=config,state_dict=tensor_state(model),**metadata))
     return {'path':file.name,'sha256':file_sha(file)}
 

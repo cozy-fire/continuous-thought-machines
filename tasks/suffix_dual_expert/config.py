@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = Path(__file__).resolve().parent
 TEACHER_SHA = 'd76c748579b2c1eeaa089ae0d41570d091490d355d970cb7628c08dbc5f0461c'
 TICKS = {'maze_medium': 5, 'fourrooms': 2}
-MODEL_SPEC = {
+CTM_MODEL_SPEC = {
     'observation': {'shape': [3, 84, 84], 'scale': 'uint8_to_float_div255', 'actions': 5},
     'vision': {'backbone': 'resnet34-2', 'pretrained': False, 'norm': 'groupnorm32'},
     'ctm': {'d_model': 512, 'd_input': 128, 'ticks_by_task': TICKS, 'memory_length': 40,
@@ -18,10 +18,15 @@ MODEL_SPEC = {
             'n_action': 32, 'dropout': 0.0},
     'attention': {'heads': 4, 'rope_theta': 10000.0, 'query_position': [10, 10]},
 }
+# Historical teacher and CTM-tooling imports retain this fixed specification.
+MODEL_SPEC = CTM_MODEL_SPEC
 
 
 @dataclass(frozen=True)
 class Config:
+    model_type: str = 'ctm'
+    lstm_hidden: int = 512
+    lstm_layers: int = 2
     maze_root: str = 'data/mazes/medium'
     teacher_checkpoint: str = 'tasks/suffix_dual_expert/assets/fourrooms_teacher.pt'
     teacher_sha256: str = TEACHER_SHA
@@ -57,6 +62,10 @@ class Config:
     eval_batch: int = 32
 
     def __post_init__(self) -> None:
+        if self.model_type not in ('ctm','lstm'):
+            raise ValueError('model_type must be ctm or lstm')
+        if any(type(v) is not int or v < 1 for v in (self.lstm_hidden,self.lstm_layers)):
+            raise ValueError('LSTM hidden and layers must be positive integers')
         if not self.lengths or any(v not in (5, 10, 15, 20, 25, 30) for v in self.lengths):
             raise ValueError('lengths must be an ordered subset of 5/10/15/20/25/30')
         if tuple(sorted(set(self.lengths))) != self.lengths or self.lengths[0] != 5:
@@ -106,6 +115,16 @@ class Config:
 
     def resolved(self) -> dict:
         return json.loads(json.dumps(asdict(self)))
+
+    def model_spec(self) -> dict:
+        base = json.loads(json.dumps(CTM_MODEL_SPEC))
+        if self.model_type == 'ctm':
+            return base
+        return dict(observation=base['observation'],vision=base['vision'],attention=base['attention'],
+                    lstm=dict(d_model=self.lstm_hidden,d_input=128,layers=self.lstm_layers,
+                              ticks_by_task=TICKS,dropout=0.,learned_initial_state=True,
+                              continuous_state=True,query='top_layer_hidden',
+                              actor_hidden=[64,64],state_layout='batch_layers_hidden'))
 
 
 def path(value: str) -> Path:

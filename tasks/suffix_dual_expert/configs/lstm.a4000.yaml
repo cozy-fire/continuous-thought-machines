@@ -1,0 +1,8 @@
+# Conservative starting profile; no A4000 LSTM memory/runtime claim.
+model_type: lstm
+lstm_hidden: 512
+lstm_layers: 2
+suffix_microbatch: 25
+encoder_chunk: 32
+checkpoint_encoder: true
+compress_microbatch: 4

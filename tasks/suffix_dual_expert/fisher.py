@@ -3,7 +3,7 @@ import time
 import numpy as np
 import torch
 from .config import Config
-from .model import Policy, detached, select
+from .models import VisualPolicy as Policy, detached, select
 from .envs import BatchEnv
 from .checkpoint import model_hash, tensor_hash
 
