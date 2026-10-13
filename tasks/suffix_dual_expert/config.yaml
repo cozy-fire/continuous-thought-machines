@@ -1,0 +1,27 @@
+maze_root: data/mazes/medium
+teacher_checkpoint: tasks/suffix_dual_expert/assets/fourrooms_teacher.pt
+test_manifest: tasks/suffix_dual_expert/assets/maze_test800.json
+lengths: [5, 10, 15, 20, 25, 30]
+pool_sizes: [5, 10, 20, 40, 80, 160, 320]
+first_updates: [2000, 2000, 1000, 1000, 1000, 1000, 1000]
+suffix_updates: [200, 200, 500, 500, 500, 500, 500]
+sequences: 100
+suffix_microbatch: 25
+candidate_batch: 100
+max_candidates: 100000
+checkpoint_encoder: true
+fisher_steps: 4096
+fisher_samples: 1024
+slots_per_task: 16
+window: 50
+groups: 4
+compress_microbatch: 4
+compress_windows: 800
+save_windows: 10
+ewc_enabled: true
+ewc_lambda: 250.0
+seed: 0
+device: cuda:0
+eval_maze: 800
+eval_fourrooms: 800
+eval_batch: 32

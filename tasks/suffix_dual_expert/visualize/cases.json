@@ -1,0 +1,312 @@
+[
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 142,
+      "path": "test/0/142.png",
+      "sha256": "274d47eaff9b0ba93989b8eda2be4e194dc9b32428f5b773a1b9cda1ab360241"
+    },
+    "bfs": 92,
+    "initial_position": [
+      15,
+      7
+    ],
+    "goal": [
+      5,
+      5
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 25,
+      "path": "test/0/25.png",
+      "sha256": "20d34a0c6ec96b3d8693f1064e9af36e32a4a3d88aecc0b02722545c20b5cbfd"
+    },
+    "bfs": 80,
+    "initial_position": [
+      15,
+      5
+    ],
+    "goal": [
+      9,
+      7
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 165,
+      "path": "test/0/165.png",
+      "sha256": "70e2b59e58a40bb2a6501bc9b052684d37e6c5686af5bfbe1783bf1be1f172c9"
+    },
+    "bfs": 68,
+    "initial_position": [
+      15,
+      5
+    ],
+    "goal": [
+      1,
+      11
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 105,
+      "path": "test/0/105.png",
+      "sha256": "3bfedda325dceeff368715bcd4c81c57b054dcdb74c8a0d1b5b0bdcb02b2809c"
+    },
+    "bfs": 66,
+    "initial_position": [
+      3,
+      7
+    ],
+    "goal": [
+      17,
+      3
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 156,
+      "path": "test/0/156.png",
+      "sha256": "a7af0a8a86c25eecd03cca8126d27ad2a6fe88f2efc93d8573fe9a219927608e"
+    },
+    "bfs": 54,
+    "initial_position": [
+      13,
+      7
+    ],
+    "goal": [
+      1,
+      13
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 78,
+      "path": "test/0/78.png",
+      "sha256": "d0cc139f642ca9af70acf981856dc5938fcf8ed3f714ed968dc6e5723ce3da2b"
+    },
+    "bfs": 52,
+    "initial_position": [
+      5,
+      7
+    ],
+    "goal": [
+      7,
+      17
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 171,
+      "path": "test/0/171.png",
+      "sha256": "e7a96d8bb613e770f7269c5e598daff29a5f81cadab0c164b77ed5ff8d7ed815"
+    },
+    "bfs": 50,
+    "initial_position": [
+      7,
+      9
+    ],
+    "goal": [
+      3,
+      7
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 193,
+      "path": "test/0/193.png",
+      "sha256": "6e4852263510a3621fabc73b9b7b716cdcf4f608213a22ab3ba309e73d09a5be"
+    },
+    "bfs": 48,
+    "initial_position": [
+      3,
+      11
+    ],
+    "goal": [
+      17,
+      5
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 134,
+      "path": "test/0/134.png",
+      "sha256": "9eb6ee031c96fdab9b77cb72dc0676ce2522c96e12f29932da9f756646bd0496"
+    },
+    "bfs": 46,
+    "initial_position": [
+      1,
+      7
+    ],
+    "goal": [
+      7,
+      3
+    ]
+  },
+  {
+    "task": "maze_medium",
+    "entry": {
+      "map_id": 137,
+      "path": "test/0/137.png",
+      "sha256": "a19ceca89a214b6aa5c0dd0d34214e120e8bb1c9846c5009e70d47e4161d8151"
+    },
+    "bfs": 42,
+    "initial_position": [
+      11,
+      3
+    ],
+    "goal": [
+      9,
+      15
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000081,
+    "bfs": 33,
+    "initial_position": [
+      14,
+      17
+    ],
+    "direction": 0,
+    "goal": [
+      1,
+      1
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000107,
+    "bfs": 33,
+    "initial_position": [
+      1,
+      1
+    ],
+    "direction": 2,
+    "goal": [
+      16,
+      16
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000001,
+    "bfs": 30,
+    "initial_position": [
+      1,
+      1
+    ],
+    "direction": 2,
+    "goal": [
+      13,
+      12
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000009,
+    "bfs": 30,
+    "initial_position": [
+      2,
+      16
+    ],
+    "direction": 0,
+    "goal": [
+      14,
+      2
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000039,
+    "bfs": 30,
+    "initial_position": [
+      16,
+      12
+    ],
+    "direction": 2,
+    "goal": [
+      1,
+      10
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000105,
+    "bfs": 30,
+    "initial_position": [
+      1,
+      6
+    ],
+    "direction": 2,
+    "goal": [
+      16,
+      16
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000008,
+    "bfs": 29,
+    "initial_position": [
+      7,
+      5
+    ],
+    "direction": 1,
+    "goal": [
+      16,
+      15
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000056,
+    "bfs": 29,
+    "initial_position": [
+      16,
+      16
+    ],
+    "direction": 2,
+    "goal": [
+      8,
+      4
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000141,
+    "bfs": 29,
+    "initial_position": [
+      1,
+      7
+    ],
+    "direction": 3,
+    "goal": [
+      15,
+      14
+    ]
+  },
+  {
+    "task": "fourrooms",
+    "seed": 3000035,
+    "bfs": 28,
+    "initial_position": [
+      15,
+      14
+    ],
+    "direction": 2,
+    "goal": [
+      1,
+      5
+    ]
+  }
+]

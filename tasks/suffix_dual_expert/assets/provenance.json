@@ -1,0 +1,6 @@
+{
+  "teacher_sha256": "d76c748579b2c1eeaa089ae0d41570d091490d355d970cb7628c08dbc5f0461c",
+  "teacher_source": "scientific-evidence\\direct_kb_fourrooms_20261009\\dual_teacher_replay_20261010\\sources\\v0_fourrooms_teacher.pt",
+  "test800_source_sha256": "cecea2dc4f6dc9a02d765c454f7dedb98b65405eb372e7993b68a6117aa7c1ca",
+  "test800_sha256": "859774d091d2ef453220ac50cab911b10b63bb8d565ad21f1c5c4e77c8b4971f"
+}

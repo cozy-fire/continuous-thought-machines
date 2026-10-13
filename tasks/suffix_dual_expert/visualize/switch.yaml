@@ -1,0 +1,4 @@
+# Inherits config.yaml; uses the first Maze case as the shared history source.
+mode: switch
+output: runs/visualize_switch
+port: 8769

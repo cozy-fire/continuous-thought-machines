@@ -1,0 +1,11 @@
+# Paths are relative to the CTM repository root, except cases (relative to this directory).
+checkpoint: scientific-evidence/ctm_maze_to_fourrooms_20261013/source_reference/final_kb.pt
+maze_root: data/mazes/medium
+cases: cases.json
+mode: baseline
+output: runs/visualize_baseline
+device: cuda:0
+max_actions: 300
+switch_after_actions: 48
+probe_actions: 20
+port: 8768

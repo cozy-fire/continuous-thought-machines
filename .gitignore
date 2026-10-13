@@ -36,3 +36,16 @@ utils/hugging_face/
 *.tar
 *.tar.gz
 *.zip
+
+# Private deployment notes
+/ignore/
+
+# Publish only reports and associated figures in this directory.
+/tasks/suffix_dual_expert/reports/**
+!/tasks/suffix_dual_expert/reports/**/
+!/tasks/suffix_dual_expert/reports/**/*.md
+!/tasks/suffix_dual_expert/reports/**/*.docx
+!/tasks/suffix_dual_expert/reports/**/*.png
+!/tasks/suffix_dual_expert/reports/**/*.jpg
+!/tasks/suffix_dual_expert/reports/**/*.jpeg
+!/tasks/suffix_dual_expert/reports/**/*.svg

@@ -1,0 +1,8 @@
+# Execution overrides; all curriculum, assets and budgets use Config defaults.
+# 16GiB candidate: measure on the target GPU before selecting for a new run.
+# The 30-step no-recompute memory estimate is about 12.3GiB allocated at micro20;
+# this is extrapolated from local micro5, not an A4000 runtime measurement.
+suffix_microbatch: 20
+encoder_chunk: 32
+checkpoint_encoder: false
+compress_microbatch: 4

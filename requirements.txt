@@ -15,3 +15,5 @@ datasets
 autoclip
 huggingface_hub
 safetensors
+PyYAML
+Pillow

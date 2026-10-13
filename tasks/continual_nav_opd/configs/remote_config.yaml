@@ -1,9 +1,0 @@
-# Hardware-independent remote profile; budgets remain inherited from full.yaml.
-extends: full.yaml
-training:
-  num_envs: 32
-optimization:
-  ctm_compile: reduce-overhead
-  # FourRooms/C use 400 samples per update; both visits yield 60800 total P/C updates.
-  minibatches: 4
-  encoder_microbatch_images: 200
